@@ -294,6 +294,127 @@ theorem restore_tx_state_writes_exact (current snapshot : TransactionState) :
     r.storageReads = current.storageReads := by
   simp [restore_tx_state]
 
+/-- `get_code` (`state_tracker.py:224-249`):
+Look up bytecode length / content by `codeHash` (`txState.codeWrites -> parent.codeWrites -> preState.codes`). -/
+def get_code (txState : TransactionState) (codeHash : Hash32) : Nat :=
+  if codeHash == EMPTY_CODE_HASH then 0
+  else
+    match txState.codeWrites.find? (fun p => p.1 == codeHash) with
+    | some (_, len) => len
+    | none =>
+      match txState.parent.codeWrites.find? (fun p => p.1 == codeHash) with
+      | some (_, len) => len
+      | none =>
+        match txState.parent.preState.codes.find? (fun p => p.1 == codeHash) with
+        | some (_, len) => len
+        | none => 0
+
+/-- `set_transient_storage` (`state_tracker.py:565-588`). -/
+def set_transient_storage (txState : TransactionState) (addr : Address) (key : StorageKey) (val : StorageVal) :
+    TransactionState :=
+  { txState with
+    transientStorage := ((addr, key), val) :: txState.transientStorage.filter (fun p => p.1 != (addr, key)) }
+
+/-- `set_account_balance_tx` (`state_tracker.py:606-625`):
+Note that in `execution-specs` (`state_tracker.py:624-625`), `set_account_balance` calls
+`set_account` directly WITHOUT `modify_state` (so setting `balance := 0` on an account with
+`nonce = 0` and `codeHash = EMPTY_CODE_HASH` writes `some EMPTY_ACCOUNT` into `txState.accountWrites`!). -/
+def set_account_balance_tx (txState : TransactionState) (addr : Address) (newBalance : Nat) :
+    TransactionState :=
+  let acc := get_account txState addr
+  set_account txState addr (some { acc with balance := newBalance })
+
+/-- `increment_nonce` (`state_tracker.py:628-643`). -/
+def increment_nonce (txState : TransactionState) (addr : Address) : TransactionState :=
+  modify_state txState addr (fun acc => { acc with nonce := acc.nonce + 1 })
+
+/-- `set_code` (`state_tracker.py:646-672`). -/
+def set_code (txState : TransactionState) (addr : Address) (codeHash : Hash32) (codeLen : Nat) :
+    TransactionState :=
+  let acc := get_account txState addr
+  let s1 := set_account txState addr
+    (some { acc with codeHash := codeHash, codeEmpty := (codeHash == EMPTY_CODE_HASH) })
+  { s1 with codeWrites := (codeHash, codeLen) :: s1.codeWrites.filter (fun p => p.1 != codeHash) }
+
+/-- `create_ether` (`state_tracker.py:694-707`). -/
+def create_ether (txState : TransactionState) (recipient : Address) (amount : Nat) : TransactionState :=
+  modify_state txState recipient (fun acc => { acc with balance := acc.balance + amount })
+
+/-- `move_ether_tx` (`state_tracker.py:710-731`). -/
+def move_ether_tx (txState : TransactionState) (sender recipient : Address) (amount : Nat) :
+    Option TransactionState :=
+  let senderAcc := get_account txState sender
+  if senderAcc.balance < amount then
+    none
+  else
+    let s1 := modify_state txState sender (fun acc => { acc with balance := acc.balance - amount })
+    some (modify_state s1 recipient (fun acc => { acc with balance := acc.balance + amount }))
+
+/-- `incorporate_tx_into_block` (`state_tracker.py:793-846`):
+Merge `txState` into `txState.parent` (`BlockState`). Crucially (`lines 827-829`), for each
+`addr ∈ txState.storageClears`, any prior `parent.storageWrites` for `addr` are removed and
+`addr` is added to `parent.storageClears` before applying `txState.storageWrites`. -/
+def incorporate_tx_into_block (txState : TransactionState) : BlockState :=
+  let p := txState.parent
+  let mergedAccountWrites :=
+    txState.accountWrites ++
+      p.accountWrites.filter (fun pair => !txState.accountWrites.any (fun w => w.1 == pair.1))
+  let clearedParentStorageWrites :=
+    p.storageWrites.filter (fun pair => !txState.storageClears.contains pair.1.1)
+  let mergedStorageClears :=
+    txState.storageClears ++
+      p.storageClears.filter (fun a => !txState.storageClears.contains a)
+  let mergedStorageWrites :=
+    txState.storageWrites ++
+      clearedParentStorageWrites.filter (fun pair => !txState.storageWrites.any (fun w => w.1 == pair.1))
+  let mergedCodeWrites :=
+    txState.codeWrites ++
+      p.codeWrites.filter (fun pair => !txState.codeWrites.any (fun w => w.1 == pair.1))
+  { preState := p.preState
+    accountReads := txState.accountReads ++ p.accountReads
+    accountWrites := mergedAccountWrites
+    storageReads := txState.storageReads ++ p.storageReads
+    storageWrites := mergedStorageWrites
+    codeWrites := mergedCodeWrites
+    storageClears := mergedStorageClears }
+
+/-- Look up the effective storage value of `(addr, key)` in `BlockState` (`state_tracker.py:276-285`). -/
+def get_block_storage (blockState : BlockState) (addr : Address) (key : StorageKey) : StorageVal :=
+  match blockState.storageWrites.find? (fun p => p.1 == (addr, key)) with
+  | some (_, v) => v
+  | none =>
+    if blockState.storageClears.contains addr then 0
+    else blockState.preState.getStorage addr key
+
+/-- Well-formedness predicate on `TransactionState`: no entry in `accountWrites`, `parent.accountWrites`,
+or `parent.preState.accounts` stores `some acc` with `acc.isEmpty = true` (canonical post-EIP-161 /
+EIP-7523 invariant). -/
+def NoEmptyAccountLeaves (txState : TransactionState) (addr : Address) : Prop :=
+  ∀ acc, get_account_optional txState addr = some acc → acc.isEmpty = false
+
+/-- Theorem: Under `NoEmptyAccountLeaves`, `account_exists` and `is_account_alive` are identical,
+whereas whenever `get_account_optional txState addr = some acc` with `acc.isEmpty = true`
+(e.g. produced by `set_account_balance_tx txState addr 0` on an empty EOA, or an EEST pre-state leaf),
+`account_exists` is `true` while `is_account_alive` is `false`! -/
+theorem account_exists_iff_alive_of_no_empty_leaves (txState : TransactionState) (addr : Address)
+    (h_wf : NoEmptyAccountLeaves txState addr) :
+    account_exists txState addr = is_account_alive txState addr := by
+  dsimp only [account_exists, is_account_alive]
+  cases h_opt : get_account_optional txState addr with
+  | none => rfl
+  | some acc =>
+    have h_ne := h_wf acc h_opt
+    simp only [Option.isSome_some, h_ne, Bool.not_false]
+
+theorem set_account_balance_zero_creates_empty_leaf (txState : TransactionState) (addr : Address)
+    (h_nonce : (get_account txState addr).nonce = 0)
+    (h_code : (get_account txState addr).codeHash = EMPTY_CODE_HASH)
+    (h_empty : (get_account txState addr).codeEmpty = true) :
+    let post := set_account_balance_tx txState addr 0
+    account_exists post addr = true ∧ is_account_alive post addr = false := by
+  dsimp only [set_account_balance_tx, account_exists, is_account_alive, get_account_optional, set_account]
+  simp [Account.isEmpty, h_nonce, h_code, h_empty, EMPTY_CODE_HASH]
+
 /-! ### Layer-0b Equation Lemmas for `TransactionState` Read/Write Operations -/
 
 @[simp]
@@ -637,6 +758,91 @@ theorem repay_state_gas_spill_invariant (m : GasMeter) :
   · by_cases h : m.stateGasLeft ≤ m.stateGasSpilled
     · left; omega
     · right; omega
+
+/-- `check_gas` (`vm/gas.py:363-376`): True iff `m.gasLeft ≥ amount`. -/
+@[simp]
+def check_gas (m : GasMeter) (amount : Nat) : Bool :=
+  decide (m.gasLeft ≥ amount)
+
+/-- `GasMeter` Spill Invariant (`vm/gas.py:298-303`): at least one of `stateGasLeft` or
+`stateGasSpilled` is `0` at all times during normal execution. -/
+def GasMeter.SpillInvariant (m : GasMeter) : Prop :=
+  m.stateGasLeft = 0 ∨ m.stateGasSpilled = 0
+
+/-- Theorem: Every single `GasMeter` transition (`charge_gas_from_meter`, `charge_state_gas_from_meter`,
+`credit_state_gas_refund`, `commit_state_gas`, `restore_state_gas`, `repay_state_gas_spill`)
+preserves `GasMeter.SpillInvariant`. -/
+theorem spill_invariant_preserved_by_meter_ops (m post : GasMeter) (amount : Nat)
+    (h_inv : m.SpillInvariant) :
+    (charge_gas_from_meter m amount = some post → post.SpillInvariant) ∧
+    (charge_state_gas_from_meter m amount = some post → post.SpillInvariant) ∧
+    (credit_state_gas_refund m amount).SpillInvariant ∧
+    (commit_state_gas m).SpillInvariant ∧
+    (restore_state_gas m).SpillInvariant ∧
+    (repay_state_gas_spill m).SpillInvariant := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, (repay_state_gas_spill_invariant m).2⟩
+  · intro h
+    unfold charge_gas_from_meter at h
+    split at h
+    · contradiction
+    · simp only [Option.some.injEq] at h
+      subst h
+      exact h_inv
+  · intro h
+    unfold charge_state_gas_from_meter at h
+    split at h
+    · simp only [Option.some.injEq] at h
+      subst h
+      unfold GasMeter.SpillInvariant at *
+      rcases h_inv with h0 | h0 <;> simp_all
+    · split at h
+      · simp only [Option.some.injEq] at h
+        subst h
+        left; rfl
+      · contradiction
+  · unfold credit_state_gas_refund GasMeter.SpillInvariant
+    dsimp only
+    rcases h_inv with h0 | h0
+    · by_cases h_le : amount ≤ m.stateGasSpilled
+      · left; omega
+      · right; omega
+    · right; omega
+  · right; rfl
+  · right; rfl
+
+/-- Multi-frame EVM execution state (`vm/__init__.py:124-245` & `vm/interpreter.py:235-392`)
+pairing `TransactionState`, `GasMeter`, and the frame-local `accountsToDelete` list. -/
+structure EvmFrame where
+  txState : TransactionState
+  gasMeter : GasMeter
+  accountsToDelete : List Address := []
+  deriving Repr, DecidableEq, BEq
+
+/-- `incorporate_child` on `EvmFrame` (`vm/__init__.py:188-245` & `vm/interpreter.py:377-392`):
+- On child success (`childError = false`), merges `child.accountsToDelete` into `parent.accountsToDelete`,
+  adopts `child.txState`, and merges `child.gasMeter` with `repay_state_gas_spill`.
+- On child error/revert (`childError = true`), discards `child.accountsToDelete`, restores
+  `parent.txState` write maps via `restore_tx_state`, and merges the restored `child.gasMeter`. -/
+def incorporate_child_frame (parentSnapshot child : EvmFrame) (childError : Bool) : EvmFrame :=
+  if !childError then
+    { txState := child.txState
+      gasMeter := incorporate_child_meter parentSnapshot.gasMeter child.gasMeter false
+      accountsToDelete := parentSnapshot.accountsToDelete ++ child.accountsToDelete }
+  else
+    { txState := restore_tx_state child.txState parentSnapshot.txState
+      gasMeter := incorporate_child_meter parentSnapshot.gasMeter child.gasMeter true
+      accountsToDelete := parentSnapshot.accountsToDelete }
+
+/-- Theorem: When a child frame reverts or halts (`childError = true`), `incorporate_child_frame`
+discards any `SELFDESTRUCT` registrations (`child.accountsToDelete`) and restores all 5 mutable
+write maps of `parentSnapshot.txState`. -/
+theorem incorporate_child_frame_revert_discards_deletes (parentSnapshot child : EvmFrame) :
+    let post := incorporate_child_frame parentSnapshot child true
+    post.accountsToDelete = parentSnapshot.accountsToDelete ∧
+    post.txState.accountWrites = parentSnapshot.txState.accountWrites ∧
+    post.txState.storageWrites = parentSnapshot.txState.storageWrites ∧
+    post.txState.storageClears = parentSnapshot.txState.storageClears := by
+  simp [incorporate_child_frame, restore_tx_state]
 
 /-- Theorem: `restore_state_gas_to_entry` after `commit_state_gas` and any sequence of state-gas
 charges restores the exact total gas (`gasLeft + stateGasLeft`) to the pre-charge sum whenever

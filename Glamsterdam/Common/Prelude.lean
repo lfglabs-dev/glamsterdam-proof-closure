@@ -16,12 +16,14 @@ formal specifications:
    vacuously true), `Result.err e s'` preserves the exact mutated state `s'` at the raise site
    until an explicit catch handler (`restore_tx_state`, `restore_state_gas`, etc.) runs.
 2. **Checked and Bounded Numeric Primitives**:
-   - `U256` (`2^256` bound) with explicit `checkedSub?`, `checkedAdd?`, `wrappingAdd`, `wrappingSub`.
-   - `Gwei` / `U64` (`2^64` bound) with explicit `checkedAdd?`, `checkedSub?`, and `saturatingSub`.
-   - `ceil32` word-rounding helper matching `ethereum.utils.numeric.ceil32`.
+   - `U64_MOD` (`2^64`), `U64_MAX` (`2^64 - 1`), `U256_MOD` (`2^256`) bounds with explicit
+     `checkedSub?`, `checkedAddU64?`, `checkedAddU256?`, and `saturatingSub`.
+   - `ceil32` word-rounding helper matching `ethereum.utils.numeric.ceil32` with its exact
+     specification theorem `ceil32_spec`.
 3. **Explicit Cryptographic & Trie Oracle Parameterization (`CryptoOracle`)**:
    Zero custom axioms; cryptographic primitives (`keccak256`, `blsVerify`, `hashTreeRoot`) are
-   passed explicitly and instantiated by deterministic table-backed oracles on test vectors.
+   bundled in `CryptoOracle` and passed explicitly or instantiated by deterministic table-backed
+   oracles on test vectors.
 -/
 
 namespace Glamsterdam.Common.Prelude
@@ -139,6 +141,15 @@ def U64_MOD : Nat := 18446744073709551616
 /-- Upper bound for 64-bit max value (`2^64 - 1`). -/
 def U64_MAX : Nat := 18446744073709551615
 
+/-- Upper bound for 256-bit unsigned integers (`2^256`). -/
+def U256_MOD : Nat := 2 ^ 256
+
+/-- Explicit cryptographic oracle bundle (zero custom axioms). -/
+structure CryptoOracle where
+  keccak256 : List UInt8 → Nat
+  blsVerify : Nat → Nat → Nat → Bool
+  hashTreeRoot : List Nat → Nat
+
 /-- Checked subtraction on natural numbers: returns `none` on underflow (`a < b`),
 never silently truncating to `0`. -/
 @[inline, simp]
@@ -155,11 +166,29 @@ def saturatingSub (a b : Nat) : Nat :=
 def checkedAddU64? (a b : Nat) : Option Nat :=
   if a + b < U64_MOD then some (a + b) else none
 
+/-- Checked 256-bit addition (`execution-specs` `U256` `+`). -/
+@[inline, simp]
+def checkedAddU256? (a b : Nat) : Option Nat :=
+  if a + b < U256_MOD then some (a + b) else none
+
 /-- Round `x` up to the smallest multiple of 32 (`ethereum.utils.numeric.ceil32`). -/
 @[inline, simp]
 def ceil32 (x : Nat) : Nat :=
   let rem := x % 32
   if rem == 0 then x else x + 32 - rem
+
+/-- Specification of `ceil32`: `ceil32 x` is a multiple of 32 satisfying `x ≤ ceil32 x < x + 32`. -/
+theorem ceil32_spec (x : Nat) :
+    x ≤ ceil32 x ∧ ceil32 x < x + 32 ∧ ceil32 x % 32 = 0 := by
+  unfold ceil32
+  dsimp only
+  cases h : (x % 32 == 0)
+  · simp only [Bool.false_eq_true, ↓reduceIte]
+    rw [beq_eq_false_iff_ne] at h
+    omega
+  · simp only [↓reduceIte]
+    rw [beq_iff_eq] at h
+    omega
 
 theorem checkedSub?_eq_some_iff (a b c : Nat) :
     checkedSub? a b = some c ↔ b ≤ a ∧ c = a - b := by
@@ -175,5 +204,10 @@ theorem saturatingSub_le (a b : Nat) :
     saturatingSub a b ≤ a := by
   unfold saturatingSub
   split <;> omega
+
+theorem checkedAddU64?_eq_some_iff (a b c : Nat) :
+    checkedAddU64? a b = some c ↔ a + b < U64_MOD ∧ c = a + b := by
+  unfold checkedAddU64?
+  split <;> simp_all <;> omega
 
 end Glamsterdam.Common.Prelude

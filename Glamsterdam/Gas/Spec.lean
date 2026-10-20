@@ -97,6 +97,37 @@ theorem t_8037_reservoir_roundtrip_error (parent child : EvmGasFrame) :
     (incorporate_child_on_error { parent with stateGasReservoir := 0 } child).stateGasReservoir =
       child.stateGasReservoir := rfl
 
+/-- Exact 6-field `GasMeter` roundtrip theorem (`vm/gas.py:689-710, 493-517` & `vm/__init__.py:188-245`):
+When a parent drains its `stateGasLeft` into a child (`drain_state_gas_reservoir`), the child
+executes an arbitrary state-gas charge `childStateCharge` (possibly spilling out of the reservoir
+into `child.gasLeft`!), and the child then reverts (`restore_state_gas` followed by
+`incorporate_child_meter parentAfterDrain childRestored true`), the parent's `stateGasLeft` is
+restored to `parent.stateGasLeft` and all spilled execution gas is returned to `gasLeft`! -/
+theorem t_8037_meter_reservoir_roundtrip_on_revert
+    (parent childAfterCharge : GasMeter) (childGrant childStateCharge : Nat)
+    (h_withhold : childGrant ≤ parent.gasLeft)
+    (h_charge :
+      charge_state_gas_from_meter
+        { gasLeft := childGrant
+          stateGasLeft := parent.stateGasLeft
+          stateGasBaseline := parent.stateGasLeft }
+        childStateCharge = some childAfterCharge) :
+    let (_, parentAfterDrain) := drain_state_gas_reservoir { parent with gasLeft := parent.gasLeft - childGrant }
+    let childRestored := restore_state_gas childAfterCharge
+    let parentFinal := incorporate_child_meter parentAfterDrain childRestored true
+    parentFinal.stateGasLeft = parent.stateGasLeft ∧
+    parentFinal.gasLeft = parent.gasLeft ∧
+    parentFinal.stateGasSpilled = parent.stateGasSpilled ∧
+    parentFinal.refundCounter = parent.refundCounter := by
+  dsimp only [charge_state_gas_from_meter] at h_charge
+  split at h_charge <;> (try split at h_charge) <;> try contradiction
+  all_goals
+    simp only [Option.some.injEq] at h_charge
+    subst h_charge
+    simp only [drain_state_gas_reservoir, restore_state_gas, incorporate_child_meter,
+      Bool.not_true, Bool.false_eq_true, ↓reduceIte]
+    refine ⟨by omega, by omega, by omega, by omega⟩
+
 /-! ## 3. Exact `CREATE*` and `CALL*` Child Gas Grant (`vm/gas.py:801-883` & `system.py:107-127`) -/
 
 /-- Exact `init_code_cost` (`vm/gas.py:864-883`):
@@ -128,17 +159,25 @@ def calculate_message_call_gas
     ⟨cappedGas + extraGas, cappedGas + stipend⟩
 
 /-- Theorem: Whenever `gasLeft ≥ extraGas + memoryCost`, `calculate_message_call_gas` guarantees
-that `cost + memoryCost ≤ gasLeft` (the parent never underflows `gasLeft` when withholding the
-sub-call execution grant). -/
+that `cost + memoryCost ≤ gasLeft`, and whenever `gasLeft < extraGas + memoryCost`,
+`calculate_message_call_gas` returns `cost = gas + extraGas` (so `cost + memoryCost > gasLeft` and
+the subsequent `charge_gas_from_meter` deterministically raises `OutOfGasError`). -/
 theorem calculate_message_call_gas_affordable
-    (value gas gasLeft memoryCost extraGas stipend : Nat)
-    (h_afford : extraGas + memoryCost ≤ gasLeft) :
-    (calculate_message_call_gas value gas gasLeft memoryCost extraGas stipend).cost + memoryCost ≤
-      gasLeft := by
+    (value gas gasLeft memoryCost extraGas stipend : Nat) :
+    (extraGas + memoryCost ≤ gasLeft →
+      (calculate_message_call_gas value gas gasLeft memoryCost extraGas stipend).cost + memoryCost ≤
+        gasLeft) ∧
+    (gasLeft < extraGas + memoryCost →
+      (calculate_message_call_gas value gas gasLeft memoryCost extraGas stipend).cost =
+        gas + extraGas) := by
   unfold calculate_message_call_gas max_message_call_gas
-  have h_not_lt : ¬ (gasLeft < extraGas + memoryCost) := by omega
-  simp [h_not_lt]
-  omega
+  constructor
+  · intro h_afford
+    have h_not_lt : ¬ (gasLeft < extraGas + memoryCost) := by omega
+    simp [h_not_lt]
+    omega
+  · intro h_lt
+    simp [h_lt]
 
 /-- EIP-8037 CREATE / CREATE2 gas sequence (`system.py:107-113`): deduct `stateGas`
 (`120 * CPSB = 183,600`) + `regularGas` BEFORE computing `withhold_create_gas` (`63/64` cap). -/
@@ -410,7 +449,7 @@ def sstore_dirty_reset_settlement_v16898000 (baseTxExecGas : Nat) : TxGasSettlem
   let p2 := price_sstore false 0 1 0
   let totalExecCharged := baseTxExecGas + p1.execGasCost + p2.execGasCost
   let netStateGas := p1.stateGasCost - p2.stateGasRefundCredited
-  let refundCounter := p1.refundDelta.toNat + p2.refundDelta.toNat
+  let refundCounter := (p1.refundDelta + p2.refundDelta).toNat
   settle_transaction_gas totalExecCharged 0 0 0 refundCounter netStateGas
 
 /-- EIP-7778 compliant dirty-reset settlement where `STORAGE_WRITE` (`10,000`) on a `0 -> X -> 0`
@@ -466,6 +505,94 @@ def f_8037_7702_delegation_exists_vs_alive_refuter :
   killWitness := (
     { parent := { preState := { accounts := [(0xdead, EMPTY_ACCOUNT)] } } },
     0xdead
+  )
+  mutant_refuted := by decide
+
+/-! ## 7. Formalization of Findings `F-8037-SYS-TX-GAS-LIMIT-INVARIANT` (2.5) and
+    `F-2780-7928-SET-DELEGATION-OOG-OMITS-RECIPIENT-READ` (2.6) -/
+
+/-- `process_unchecked_system_transaction` (`fork.py:749-755` @ `16898000`):
+Passes `SYS_TX_GAS_LIMIT = 30,000,000` directly into `GasMeter(gas_left=tx_gas_limit, state_gas_left=0)`,
+bypassing `allocate_evm_gas` (which caps `execution_gas` at `TX_MAX_GAS_LIMIT = 16,777,216` and places
+the remainder in `state_gas_reservoir`). -/
+def SYS_TX_GAS_LIMIT : Nat := 30000000
+
+def sys_tx_initial_meter_v16898000 : GasMeter :=
+  { gasLeft := SYS_TX_GAS_LIMIT, stateGasLeft := 0, stateGasBaseline := 0 }
+
+def sys_tx_initial_meter_allocated : GasMeter :=
+  let alloc := allocate_evm_gas SYS_TX_GAS_LIMIT ⟨0, 0⟩
+  { gasLeft := alloc.executionGas
+    stateGasLeft := alloc.stateGasReservoir
+    stateGasBaseline := alloc.stateGasReservoir }
+
+def f_8037_sys_tx_gas_limit_invariant_refuter :
+    WitnessRefuter Unit GasMeter
+      (fun _ m => m.gasLeft ≤ TX_MAX_GAS_LIMIT ∧ m.gasLeft + m.stateGasLeft = SYS_TX_GAS_LIMIT) where
+  reference := fun _ => sys_tx_initial_meter_allocated
+  mutant := fun _ => sys_tx_initial_meter_v16898000
+  ref_sound := fun _ => by decide
+  killWitness := ()
+  mutant_refuted := by decide
+
+/-- Stateful `SpecM` model of top-level `set_delegation` + recipient cold-access ordering
+(`vm/interpreter.py:258-277` @ `16898000`):
+- In `v16898000`, `set_delegation` charges `NEW_ACCOUNT` state gas (`183,600`) at line 259 BEFORE
+  `get_account(tx_state, message.current_target)` is called at line 277!
+- When `set_delegation` raises `OutOfGasError` (`SpecM.throw`), `process_top_level` returns the
+  exception while `incorporate_tx_into_block` still commits `txState.accountReads` into the BAL,
+  so `recipient` is missing from `accountReads` despite `3,000` `COLD_ACCOUNT_ACCESS` having been
+  paid upfront in `calculate_intrinsic_cost`. -/
+structure TopLevelDelegationState where
+  meter : GasMeter
+  accountReads : List Address
+  deriving Repr, DecidableEq, BEq
+
+def top_level_delegation_v16898000 (authority recipient : Address) (newAccountCharge : Nat) :
+    SpecM TopLevelDelegationState Unit Unit :=
+  fun s =>
+    let s1 := { s with accountReads := authority :: s.accountReads }
+    match charge_state_gas_from_meter s1.meter newAccountCharge with
+    | none => .err () s1
+    | some m' => .ok () { meter := m', accountReads := recipient :: s1.accountReads }
+
+def top_level_delegation_patched (authority recipient : Address) (newAccountCharge : Nat) :
+    SpecM TopLevelDelegationState Unit Unit :=
+  fun s =>
+    let s1 := { s with accountReads := recipient :: authority :: s.accountReads }
+    match charge_state_gas_from_meter s1.meter newAccountCharge with
+    | none => .err () s1
+    | some m' => .ok () { s1 with meter := m' }
+
+def f_2780_7928_set_delegation_oog_omits_recipient_refuter :
+    WitnessRefuter (TopLevelDelegationState × Address × Address × Nat) (Result Unit TopLevelDelegationState Unit)
+      (fun ⟨s0, _, recipient, charge⟩ res =>
+        res.state.accountReads.contains recipient = true ∧
+        (res.isErr = true ↔ s0.meter.stateGasLeft + s0.meter.gasLeft < charge)) where
+  reference := fun ⟨s0, auth, recp, chg⟩ => top_level_delegation_patched auth recp chg s0
+  mutant := fun ⟨s0, auth, recp, chg⟩ => top_level_delegation_v16898000 auth recp chg s0
+  ref_sound := by
+    intro ⟨s0, auth, recp, chg⟩
+    dsimp only [top_level_delegation_patched]
+    cases hc : charge_state_gas_from_meter s0.meter chg with
+    | none =>
+      dsimp only [charge_state_gas_from_meter] at hc
+      split at hc <;> (try split at hc) <;> try contradiction
+      simp only [Result.state, List.contains_cons, beq_self_eq_true, Bool.true_or, Result.isErr,
+        true_iff, true_and]
+      omega
+    | some m' =>
+      dsimp only [charge_state_gas_from_meter] at hc
+      split at hc <;> (try split at hc) <;> try contradiction
+      all_goals
+        simp only [Result.state, List.contains_cons, beq_self_eq_true, Bool.true_or, Result.isErr,
+          Bool.false_eq_true, false_iff, true_and]
+        omega
+  killWitness := (
+    { meter := { gasLeft := 10000, stateGasLeft := 0, stateGasBaseline := 0 }, accountReads := [] },
+    0xaa,
+    0xbb,
+    STATE_GAS_NEW_ACCOUNT
   )
   mutant_refuted := by decide
 

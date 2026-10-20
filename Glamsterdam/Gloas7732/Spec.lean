@@ -208,6 +208,87 @@ def f_7732_slashed_payment_resurrection_refuter :
   }
   mutant_refuted := by decide
 
+/-- Multi-step operational trace of `process_execution_payload_bid` -> `slash_validator` ->
+`2x process_builder_pending_payments` -> `apply_parent_execution_payload` (`beacon-chain.md:1579-1581`,
+`1719-1732`, `1784-1831`):
+1. At parent slot in `parentEpoch`, `process_execution_payload_bid` records `latestBidValue := bidValue`
+   and populates `secondEpochPayments[slotIdx]` with `amount := bidValue, proposerIndex := headerProposer`.
+2. In the same parent block's `process_operations` (or before epoch rotation), `slash_validator` runs on
+   `slashedIndex`. In `v1.7.0-beta.4` (`lines 1579-1581`), `slash_validator` checks
+   `if slashed_index == state.latest_block_header.proposer_index:`, clearing `secondEpochPayments[slotIdx]`
+   to `{}` while leaving `latestBidValue` untouched!
+3. Two epoch boundaries pass without a block (`process_builder_pending_payments` runs twice, rotating
+   and clearing both halves of `builder_pending_payments`).
+4. Child block arrives at `currentEpoch ≥ parentEpoch + 2` and runs `apply_parent_execution_payload`,
+   which enters the `else` branch (`parent_epoch < previous_epoch`) and appends `latestBidValue` to
+   `builder_pending_withdrawals`! -/
+def trace_bid_slash_rotate_apply_v170_beta4
+    (bidValue feeRecipient builderIdx headerProposer slashedIdx : Nat) :
+    List BuilderPendingWithdrawal :=
+  let paymentAfterBid : BuilderPendingPayment :=
+    { weight := 0
+      withdrawal := ⟨feeRecipient, bidValue, builderIdx⟩
+      proposerIndex := headerProposer }
+  -- Step 2: `slash_validator` (`beacon-chain.md:1579-1581`)
+  let paymentAfterSlash : BuilderPendingPayment :=
+    if slashedIdx == headerProposer then {} else paymentAfterBid
+  let latestBidAfterSlash : Nat := bidValue -- BUG: `latest_execution_payload_bid.value` is NOT zeroed!
+  -- Step 3: Two epoch boundaries (`process_builder_pending_payments` with quorum = 600,000,000,000)
+  let (first1, second1, w1) := process_builder_pending_payments 1 [paymentAfterSlash] [{}] []
+  let (_, _, w2) := process_builder_pending_payments 1 first1 second1 w1
+  -- Step 4: `apply_parent_execution_payload` at `parentEpoch = 4, currentEpoch = 6`
+  let s : GloasParentPaymentState := {
+    parentEpoch := 4
+    currentEpoch := 6
+    parentProposerSlashed := (slashedIdx == headerProposer)
+    latestBidValue := latestBidAfterSlash
+    latestBidFeeRecipient := feeRecipient
+    latestBidBuilderIndex := builderIdx
+    pendingPaymentSlotAmount := 0
+    pendingWithdrawals := w2
+    builderBalance := MIN_DEPOSIT_AMOUNT + bidValue
+    builderWithdrawableEpoch := FAR_FUTURE_EPOCH
+    untouchedCl := ⟨1, 2, 3⟩
+  }
+  (apply_parent_payment_v170_beta4_buggy s).pendingWithdrawals
+
+theorem t_7732_composed_trace_resurrects_slashed_payment :
+    trace_bid_slash_rotate_apply_v170_beta4 1000000 0xab 0 42 42 = [⟨0xab, 1000000, 0⟩] := by
+  decide
+
+/-- Finding 1.5 (`F-7732-EARLIER-SLOT-PROPOSER-SLASHING-NOT-CLEARED`, `beacon-chain.md:1579-1581`):
+When proposer `P1` proposes at slot `s1` (`payment1.proposerIndex = P1`), and at a later slot `s2 > s1`
+in the same epoch proposer `P2 ≠ P1` includes a `ProposerSlashing` or `AttesterSlashing` against `P1`,
+`state.latest_block_header.proposer_index` is already `P2` (updated in `process_block_header` before
+`process_operations`).
+- Unpatched `slash_validator` checks `if slashed_index == state.latest_block_header.proposer_index:`
+  (`P1 == P2`, which is `false`!) and leaves `P1`'s pending payment intact in `builder_pending_payments`.
+- Patched `slash_validator` scans `builder_pending_payments` for any entry with
+  `payment.proposerIndex == slashedIndex` and clears it to `{}`. -/
+def slash_pending_payment_v170_beta4_buggy
+    (latestHeaderProposer slashedIndex : Nat) (payment : BuilderPendingPayment) :
+    BuilderPendingPayment :=
+  if slashedIndex == latestHeaderProposer && payment.proposerIndex == latestHeaderProposer then
+    {}
+  else
+    payment
+
+def slash_pending_payment_patched
+    (_latestHeaderProposer slashedIndex : Nat) (payment : BuilderPendingPayment) :
+    BuilderPendingPayment :=
+  if payment.proposerIndex == slashedIndex then {} else payment
+
+def f_7732_earlier_slot_proposer_slashing_refuter :
+    WitnessRefuter (Nat × Nat × BuilderPendingPayment) BuilderPendingPayment
+      (fun ⟨_, slashedIdx, p⟩ post => p.proposerIndex = slashedIdx → post.withdrawal.amount = 0) where
+  reference := fun ⟨hdr, sl, p⟩ => slash_pending_payment_patched hdr sl p
+  mutant := fun ⟨hdr, sl, p⟩ => slash_pending_payment_v170_beta4_buggy hdr sl p
+  ref_sound := by
+    intro ⟨hdr, sl, p⟩ h_eq
+    simp [slash_pending_payment_patched, h_eq]
+  killWitness := (99, 42, { weight := 100, withdrawal := ⟨0xaa, 1000000, 0⟩, proposerIndex := 42 })
+  mutant_refuted := by decide
+
 /-! ## 2. Builder Solvency (`T-7732-BUILDER-SOLVENCY`), Pending Balance Accounting, and Exit Safety (`T-7732-EXIT-SAFETY`) -/
 
 /-- Exact `get_pending_balance_to_withdraw_for_builder` (`beacon-chain.md:1168-1179`). -/
@@ -390,52 +471,142 @@ def f_8282_topup_credential_prefix_drop_refuter :
   }
   mutant_refuted := by decide
 
-/-! ## 6. `F-7732-FORK-SLOT-AVAILABILITY-BIT-HIGH` & `F-7732-AVAILABILITY-RING-BUFFER-CLOBBER` -/
+/-! ## 6. `F-7732-FORK-ONBOARD-CROSS-CREDENTIAL` (1.6), `F-7732-FORK-SLOT-AVAILABILITY-BIT-HIGH` (1.2),
+    and `F-7732-AVAILABILITY-RING-BUFFER-CLOBBER` (1.3) -/
 
-/-- Unpatched `upgrade_to_gloas` (`specs/gloas/fork.md:198-200`): initializes all bits of
-`execution_payload_availability` to `true` (`0b1`), including `s_fork % SLOTS_PER_HISTORICAL_ROOT`.
-When `block_0` at `s_fork` has an EMPTY payload (`isForkBlockFull = false`), its availability
-bit remains `true` instead of `false`! -/
+/-- Finding 1.6 (`F-7732-FORK-ONBOARD-CROSS-CREDENTIAL`, `fork.md:70-120` vs `beacon-chain.md:2336`):
+In `onboard_builders_from_pending_deposits` (`fork.md:92-118`), a pending deposit with
+`is_builder_withdrawal_credential == false` (e.g., `0x01`) Whose `pubkey` is already in `builder_pubkeys`
+(registered by an earlier `0xB0` deposit in the same queue) enters the `else` branch at line 94 and
+is credited to `state.builders[builder_index].balance` instead of remaining in `state.pending_deposits`
+for validator processing (whereas `process_builder_deposit_request` in `beacon-chain.md:2336` checks
+`is_builder_withdrawal_credential` first). -/
+def onboard_pending_deposit_fork_v170_beta4 (s : BuilderDepositStep) : Bool × Nat :=
+  if s.pubkeyRegistered then
+    (true, s.currentBalance + s.depositAmount)
+  else if s.credentialPrefix == BUILDER_WITHDRAWAL_PREFIX then
+    if s.signatureValid then (true, s.depositAmount) else (true, s.currentBalance)
+  else
+    (false, s.currentBalance)
+
+def onboard_pending_deposit_credential_routed (s : BuilderDepositStep) : Bool × Nat :=
+  if s.credentialPrefix != BUILDER_WITHDRAWAL_PREFIX then
+    (false, s.currentBalance)
+  else if s.pubkeyRegistered then
+    (true, s.currentBalance + s.depositAmount)
+  else if s.signatureValid then
+    (true, s.depositAmount)
+  else
+    (true, s.currentBalance)
+
+def f_7732_fork_onboard_cross_credential_refuter :
+    WitnessRefuter BuilderDepositStep (Bool × Nat)
+      (fun s out =>
+        s.credentialPrefix ≠ BUILDER_WITHDRAWAL_PREFIX → out.1 = false) where
+  reference := onboard_pending_deposit_credential_routed
+  mutant := onboard_pending_deposit_fork_v170_beta4
+  ref_sound := by
+    intro s h_ne
+    dsimp [onboard_pending_deposit_credential_routed]
+    have h_bne : (s.credentialPrefix != BUILDER_WITHDRAWAL_PREFIX) = true := by
+      rw [bne_iff_ne]; exact h_ne
+    simp [h_bne]
+  killWitness := {
+    pubkeyRegistered := true
+    credentialPrefix := 0x01
+    signatureValid := true
+    currentBalance := MIN_DEPOSIT_AMOUNT
+    depositAmount := 32000000000
+  }
+  mutant_refuted := by decide
+
+/-- Genuine Ring-Buffer State Model for `state.execution_payload_availability`
+(`Bitvector[SLOTS_PER_HISTORICAL_ROOT]`, `fork.md:198-200`, `beacon-chain.md:1620-1622, 1829`). -/
+structure AvailabilityRing where
+  size : Nat
+  bits : List (Nat × Bool) := []
+  deriving Repr, DecidableEq, BEq
+
+def AvailabilityRing.getBit (r : AvailabilityRing) (slot : Nat) : Bool :=
+  let idx := slot % r.size
+  match r.bits.find? (fun p => p.1 == idx) with
+  | some (_, b) => b
+  | none => true -- initialized to `0b1` at `upgrade_to_gloas` (`fork.md:199`)
+
+def AvailabilityRing.setBit (r : AvailabilityRing) (slot : Nat) (val : Bool) : AvailabilityRing :=
+  let idx := slot % r.size
+  { r with bits := (idx, val) :: r.bits.filter (fun p => p.1 != idx) }
+
+/-- `process_slot` (`beacon-chain.md:1620-1622`):
+At the end of `process_slot(state)` (just before `state.slot += 1` in `process_slots`),
+sets `state.execution_payload_availability[(state.slot + 1) % SLOTS_PER_HISTORICAL_ROOT] = 0b0`. -/
+def process_slot_ring (r : AvailabilityRing) (currentSlot : Nat) : AvailabilityRing :=
+  r.setBit (currentSlot + 1) false
+
+/-- `apply_parent_execution_payload` (`beacon-chain.md:1829`):
+When the child block confirms that the parent block at `parentSlot` had a full payload
+(`isParentFull = true`), sets `state.execution_payload_availability[parentSlot % size] = 0b1`. -/
+def apply_parent_payload_ring (r : AvailabilityRing) (parentSlot : Nat) (isParentFull : Bool) :
+    AvailabilityRing :=
+  if isParentFull then r.setBit parentSlot true else r
+
+/-- Finding 1.2 (`F-7732-FORK-SLOT-AVAILABILITY-BIT-HIGH`, `fork.md:198-200`):
+At `s_fork`, `upgrade_to_gloas` runs AFTER `process_slots(state, s_fork)` has already completed,
+initializing all bits of `execution_payload_availability` to `true` (`0b1`), including `s_fork % size`.
+When the fork block at `s_fork` has its payload withheld (`isForkBlockFull = false`), and the next
+block at `s_fork + 1` builds on the empty parent (`apply_parent_payload_ring _ s_fork false`),
+`getBit s_fork` remains `true` instead of `false`! -/
 def fork_slot_availability_v170_beta4_buggy (isForkBlockFull : Bool) : Bool :=
-  if isForkBlockFull then true else true
+  let r0 : AvailabilityRing := { size := 64, bits := [] } -- all bits `true` after `upgrade_to_gloas`
+  let r1 := process_slot_ring r0 64                       -- clears slot `65`, NOT `64` (`s_fork`)!
+  let r2 := apply_parent_payload_ring r1 64 isForkBlockFull
+  r2.getBit 64
 
-/-- Patched `upgrade_to_gloas`: clears `s_fork % SLOTS_PER_HISTORICAL_ROOT` to `false` at fork
-initialization so it only becomes `true` if `block_0`'s payload is confirmed. -/
+/-- Patched `upgrade_to_gloas`: clears `s_fork % SLOTS_PER_HISTORICAL_ROOT` to `false` during
+`upgrade_to_gloas` so `s_fork`'s bit becomes `true` iff `s_fork`'s payload is confirmed. -/
 def fork_slot_availability_patched (isForkBlockFull : Bool) : Bool :=
-  isForkBlockFull
+  let r0 : AvailabilityRing := ({ size := 64, bits := [] } : AvailabilityRing).setBit 64 false
+  let r1 := process_slot_ring r0 64
+  let r2 := apply_parent_payload_ring r1 64 isForkBlockFull
+  r2.getBit 64
 
 def f_7732_fork_slot_availability_refuter :
     WitnessRefuter Bool Bool (fun isFull bit => bit = isFull) where
   reference := fork_slot_availability_patched
   mutant := fork_slot_availability_v170_beta4_buggy
-  ref_sound := fun _ => rfl
+  ref_sound := by
+    intro isFull
+    cases isFull <;> decide
   killWitness := false
   mutant_refuted := by decide
 
-/-- Ring-buffer clobber scenario (`F-7732-AVAILABILITY-RING-BUFFER-CLOBBER`,
+/-- Ring-buffer clobber scenario on `AvailabilityRing` (`F-7732-AVAILABILITY-RING-BUFFER-CLOBBER`,
 `beacon-chain.md:1620-1622` vs `1829`):
-During `state_transition` from `parentSlot` to `childSlot` (`childSlot > parentSlot`):
-1. `process_slots(state, childSlot)` runs `process_slot` at `childSlot - 1`, which sets
-   `execution_payload_availability[childSlot % SLOTS_PER_HISTORICAL_ROOT] = false`.
-2. Next, `process_block` runs `apply_parent_execution_payload` (when the parent payload was full),
-   which sets `execution_payload_availability[parentSlot % SLOTS_PER_HISTORICAL_ROOT] = true`.
-When `childSlot % SLOTS_PER_HISTORICAL_ROOT == parentSlot % SLOTS_PER_HISTORICAL_ROOT`
-(i.e. `childSlot - parentSlot = k * SLOTS_PER_HISTORICAL_ROOT`, e.g. 64 skipped slots in `minimal`),
-Step 2 overwrites `childSlot`'s own availability bit back to `true` before `childSlot`'s payload
-is ever revealed! -/
+1. `process_slots` advances to `childSlot` by running `process_slot_ring` at `childSlot - 1`,
+   which sets `childSlot % size` to `false`.
+2. Next, `process_block` at `childSlot` runs `apply_parent_payload_ring` for `parentSlot`.
+When `childSlot - parentSlot = k * size` (`parentSlot % size == childSlot % size`) and
+`isParentFull = true`, Step 2 overwrites `childSlot`'s own availability bit back to `true`! -/
 def child_slot_availability_after_parent_apply_v170_beta4_buggy
     (slotsPerHistoricalRoot parentSlot childSlot : Nat) (isParentFull : Bool) : Bool :=
-  let clearedAtProcessSlots := false
-  if isParentFull && (parentSlot % slotsPerHistoricalRoot == childSlot % slotsPerHistoricalRoot) then
-    true
-  else
-    clearedAtProcessSlots
+  let r0 : AvailabilityRing := { size := slotsPerHistoricalRoot }
+  let rAfterProcessSlots := process_slot_ring r0 (childSlot - 1)
+  let rAfterParentApply := apply_parent_payload_ring rAfterProcessSlots parentSlot isParentFull
+  rAfterParentApply.getBit childSlot
 
-/-- Patched ring-buffer update: `childSlot`'s own availability bit must be `false` immediately
-after `process_parent_execution_payload` (before any child block can confirm `childSlot`'s payload). -/
+/-- Patched ring-buffer update: skips writing `parentSlot % size = true` when
+`childSlot - parentSlot ≥ slotsPerHistoricalRoot` (or clears `childSlot % size` after parent apply),
+so `childSlot`'s own availability bit is always `false` before `childSlot`'s child block arrives. -/
 def child_slot_availability_after_parent_apply_patched
-    (_slotsPerHistoricalRoot _parentSlot _childSlot : Nat) (_isParentFull : Bool) : Bool :=
-  false
+    (slotsPerHistoricalRoot parentSlot childSlot : Nat) (isParentFull : Bool) : Bool :=
+  let r0 : AvailabilityRing := { size := slotsPerHistoricalRoot }
+  let rAfterParentApply :=
+    if childSlot - parentSlot < slotsPerHistoricalRoot then
+      apply_parent_payload_ring r0 parentSlot isParentFull
+    else
+      r0
+  let rAfterSlotClear := (rAfterParentApply).setBit childSlot false
+  rAfterSlotClear.getBit childSlot
 
 /-- Explicit `WitnessRefuter` for `F-7732-AVAILABILITY-RING-BUFFER-CLOBBER`:
 With `slotsPerHistoricalRoot = 64` (`minimal` preset), `parentSlot = 10`, `childSlot = 74`,
@@ -443,10 +614,13 @@ and `isParentFull = true`, `child_slot_availability_after_parent_apply_v170_beta
 clobbers `childSlot`'s availability bit to `true`! -/
 def f_7732_availability_ring_buffer_clobber_refuter :
     WitnessRefuter (Nat × Nat × Nat × Bool) Bool
-      (fun _ childBitAfterParentApply => childBitAfterParentApply = false) where
+      (fun ⟨n, _, _, _⟩ childBitAfterParentApply => n > 0 → childBitAfterParentApply = false) where
   reference := fun ⟨n, p, c, f⟩ => child_slot_availability_after_parent_apply_patched n p c f
   mutant := fun ⟨n, p, c, f⟩ => child_slot_availability_after_parent_apply_v170_beta4_buggy n p c f
-  ref_sound := fun _ => rfl
+  ref_sound := by
+    intro ⟨n, p, c, f⟩ _
+    dsimp [child_slot_availability_after_parent_apply_patched, AvailabilityRing.getBit, AvailabilityRing.setBit]
+    simp
   killWitness := (64, 10, 74, true)
   mutant_refuted := by decide
 

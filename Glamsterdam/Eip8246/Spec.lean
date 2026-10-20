@@ -129,10 +129,69 @@ theorem t_8246_selfdestruct_conservation (s : SelfdestructStep) :
 /-- Under EIP-8246 + EIP-8037, same-tx `SELFDESTRUCT` grants zero state-gas refund. -/
 def selfdestruct_state_gas_refund (_createdInTx _markedToDelete : Bool) : Nat := 0
 
-/-- T-8246-NO-STATE-GAS-REFUND: Same-tx `CREATE` + `SELFDESTRUCT` does not refund
-the 120-byte account creation state gas (`CPSB * 120 = 183,600`). -/
-theorem t_8246_no_state_gas_refund (createdInTx markedToDelete : Bool) :
-    selfdestruct_state_gas_refund createdInTx markedToDelete = 0 := rfl
+/-- Two-step `GasMeter` trace for same-tx `CREATE` (charging `183,600` `NEW_ACCOUNT` state gas)
+followed by `exec_selfdestruct` (`system.py:725-775`): unlike `SSTORE` dirty resets,
+`exec_selfdestruct` never calls `credit_state_gas_refund`, so `tx_state_gas_used` retains the full
+`183,600` creation state gas plus any beneficiary creation state gas. -/
+def create_and_selfdestruct_meter (m0 : GasMeter) (s : SelfdestructStep) : Option GasMeter :=
+  match charge_state_gas_from_meter m0 183600 with
+  | none => none
+  | some mAfterCreate =>
+    match charge_gas_from_meter mAfterCreate (exec_selfdestruct s).execGasCharged with
+    | none => none
+    | some mAfterExec =>
+      charge_state_gas_from_meter mAfterExec (exec_selfdestruct s).stateGasCharged
+
+theorem charge_state_gas_from_meter_accounting (m post : GasMeter) (amount reservoir : Nat)
+    (h : charge_state_gas_from_meter m amount = some post) :
+    post.refundCounter = m.refundCounter ∧
+    tx_state_gas_used post reservoir = tx_state_gas_used m reservoir + amount := by
+  dsimp only [charge_state_gas_from_meter] at h
+  split at h <;> (try split at h) <;> try contradiction
+  all_goals
+    simp only [Option.some.injEq] at h
+    subst h
+    dsimp only [tx_state_gas_used]
+    refine ⟨rfl, by omega⟩
+
+theorem charge_gas_from_meter_accounting (m post : GasMeter) (amount reservoir : Nat)
+    (h : charge_gas_from_meter m amount = some post) :
+    post.refundCounter = m.refundCounter ∧
+    tx_state_gas_used post reservoir = tx_state_gas_used m reservoir := by
+  dsimp only [charge_gas_from_meter] at h
+  split at h
+  · contradiction
+  · simp only [Option.some.injEq] at h
+    subst h
+    dsimp only [tx_state_gas_used]
+    exact ⟨rfl, rfl⟩
+
+/-- T-8246-NO-STATE-GAS-REFUND: Same-tx `CREATE` + `SELFDESTRUCT` on `GasMeter` consumes the full
+`183,600` (`CPSB * 120`) state gas from the `GasMeter` without any state-gas refund or `refundCounter`
+credit (`post.refundCounter = m0.refundCounter` and `tx_state_gas_used post reservoir = 183600 + stateGasCharged`). -/
+theorem t_8246_no_state_gas_refund (m0 post : GasMeter) (s : SelfdestructStep)
+    (h_entry : m0.stateGasSpilled = 0 ∧ m0.stateGasCommittedSpill = 0)
+    (h_step : create_and_selfdestruct_meter m0 s = some post) :
+    post.refundCounter = m0.refundCounter ∧
+    tx_state_gas_used post m0.stateGasLeft = 183600 + (exec_selfdestruct s).stateGasCharged := by
+  unfold create_and_selfdestruct_meter at h_step
+  rcases h_entry with ⟨h_sp, h_cm⟩
+  cases h1 : charge_state_gas_from_meter m0 183600 with
+  | none => rw [h1] at h_step; contradiction
+  | some m1 =>
+    rw [h1] at h_step
+    dsimp only at h_step
+    cases h2 : charge_gas_from_meter m1 (exec_selfdestruct s).execGasCharged with
+    | none => rw [h2] at h_step; contradiction
+    | some m2 =>
+      rw [h2] at h_step
+      dsimp only at h_step
+      have a1 := charge_state_gas_from_meter_accounting m0 m1 183600 m0.stateGasLeft h1
+      have a2 := charge_gas_from_meter_accounting m1 m2 (exec_selfdestruct s).execGasCharged m0.stateGasLeft h2
+      have a3 := charge_state_gas_from_meter_accounting m2 post (exec_selfdestruct s).stateGasCharged m0.stateGasLeft h_step
+      have h_init : tx_state_gas_used m0 m0.stateGasLeft = 0 := by
+        simp [tx_state_gas_used, h_sp, h_cm]
+      omega
 
 /-! ## 3. Order-Independence of End-of-Transaction Account Clearing (`fork.py:1088-1089`) -/
 
@@ -342,6 +401,72 @@ def f_8246_bal_storage_clears_ignored_refuter :
   mutant_refuted := by
     unfold bal_storage_consistent actual_block_post_storage bal_recorded_post_val_buggy
     decide
+
+/-- Two-Transaction Cross-Block BAL vs `BlockState` Desynchronization Theorem on `TransactionState`
+and `BlockState` (`state_tracker.py:827-835` vs `block_access_lists.py:813-825`):
+- In `Tx1`, contract `addr` is created (`CREATE2`), writes slot `slot := val` (`val ≠ 0`), and
+  commits (`b1 := incorporate_tx_into_block tx1`).
+- In `Tx2`, `addr` is destroyed or cleared via `destroy_storage_tx` (`b2 := incorporate_tx_into_block tx2`).
+- Then `get_block_storage b2 addr slot = 0` (the post-block state has wiped the slot to `0`),
+  whereas `tx2.storageWrites` has no entry for `(addr, slot)` because `destroy_storage_tx` moved
+  all keys to `storageReads` and recorded `addr` only in `tx2.storageClears`, leaving `Tx1`'s
+  non-zero `val` as the final value in the Block Access List! -/
+theorem t_8246_bal_tx_block_state_desync (pre : PreState) (addr : Address) (slot : StorageKey) (val : StorageVal) :
+    let b0 : BlockState := { preState := pre }
+    let tx1 : TransactionState := set_storage { parent := b0 } addr slot val
+    let b1 : BlockState := incorporate_tx_into_block tx1
+    let tx2 : TransactionState := destroy_storage_tx { parent := b1 } addr
+    let b2 : BlockState := incorporate_tx_into_block tx2
+    get_block_storage b1 addr slot = val ∧
+    get_block_storage b2 addr slot = 0 ∧
+    tx2.storageWrites.find? (fun p => p.1 == (addr, slot)) = none ∧
+    tx2.storageClears.contains addr = true := by
+  simp [set_storage, incorporate_tx_into_block, destroy_storage_tx, get_block_storage]
+
+/-- Unchecked system transaction (`fork.py:724-780`, `process_unchecked_system_transaction` @ `16898000`):
+Executes `process_top_level` and calls `incorporate_tx_into_block(tx_state)`, completely dropping
+`tx_output.accounts_to_delete` (whereas `process_transaction` at `fork.py:1088-1089` runs
+`clear_account_preserving_balance(tx_state, addr)` for each `addr ∈ tx_output.accounts_to_delete`
+before `incorporate_tx_into_block`). -/
+def finalize_unchecked_sys_tx_v16898000 (frame : EvmFrame) (target : Address) : TransactionState :=
+  let _ := target
+  frame.txState
+
+/-- Patched `process_unchecked_system_transaction` (`fork.py:766-768`): clears `target` via
+`clear_account_preserving_balance_tx` whenever `target ∈ frame.accountsToDelete`. -/
+def finalize_unchecked_sys_tx_patched (frame : EvmFrame) (target : Address) : TransactionState :=
+  if frame.accountsToDelete.contains target then
+    clear_account_preserving_balance_tx frame.txState target
+  else
+    frame.txState
+
+/-- Explicit `WitnessRefuter` for `F-8246-UNCHECKED-SYS-TX-DROPS-ACCOUNTS-TO-DELETE`:
+When a system call spawns a child contract `0xbeef` that self-destructs in the same transaction
+(`0xbeef ∈ frame.accountsToDelete`), `finalize_unchecked_sys_tx_v16898000` leaves `0xbeef`'s code
+and storage intact instead of clearing them while preserving balance. -/
+def f_8246_unchecked_sys_tx_drops_deletes_refuter :
+    WitnessRefuter (EvmFrame × Address) TransactionState
+      (fun ⟨pre, addr⟩ post =>
+        pre.accountsToDelete.contains addr = true →
+          (get_account post addr).codeHash = EMPTY_CODE_HASH ∧
+          (get_account post addr).nonce = 0 ∧
+          (get_account post addr).balance = (get_account pre.txState addr).balance) where
+  reference := fun ⟨pre, addr⟩ => finalize_unchecked_sys_tx_patched pre addr
+  mutant := fun ⟨pre, addr⟩ => finalize_unchecked_sys_tx_v16898000 pre addr
+  ref_sound := by
+    intro ⟨pre, addr⟩ h_mem
+    dsimp [finalize_unchecked_sys_tx_patched]
+    rw [h_mem]
+    simp only [↓reduceIte]
+    have h_clear := t_8246_tx_state_clear_exact pre.txState addr 0
+    exact ⟨h_clear.2.2.1, h_clear.2.1, h_clear.1⟩
+  killWitness := (
+    { txState := set_account {} 0xbeef (some { nonce := 1, balance := 777, codeHash := 0x1234, codeEmpty := false })
+      gasMeter := { gasLeft := 0, stateGasLeft := 0, stateGasBaseline := 0 }
+      accountsToDelete := [0xbeef] },
+    0xbeef
+  )
+  mutant_refuted := by decide
 
 @[inline, export glamsterdam_eip8246_eth_conservation_cabi]
 def eip8246_eth_conservation_cabi (preSum withdrawals feesBurned postSum : UInt64) : Bool :=

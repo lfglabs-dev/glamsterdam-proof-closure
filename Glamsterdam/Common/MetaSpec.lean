@@ -104,11 +104,15 @@ theorem WitnessRefuter.mutant_ne_reference {Input Output : Type}
   exact W.mutant_refuted h_valid
 
 /-- `MutantKillBundle` groups an arithmetic mutant, a field-omission mutant, and an ordering
-mutant against a single reference function and specification predicate. -/
+mutant against a single shared `reference` function and specification predicate. -/
 structure MutantKillBundle (Input Output : Type) (Valid : Input → Output → Prop) where
+  reference : Input → Output
   arithMutant : WitnessRefuter Input Output Valid
   fieldMutant : WitnessRefuter Input Output Valid
   orderMutant : WitnessRefuter Input Output Valid
+  arith_ref_eq : arithMutant.reference = reference := by rfl
+  field_ref_eq : fieldMutant.reference = reference := by rfl
+  order_ref_eq : orderMutant.reference = reference := by rfl
 
 /-! ## 4. Anti-Vacuity (`NonVacuousSpec`), Error Partition (`OutcomePartitionSpec`),
     and Scoped Accounting (`AccountingBoundarySpec`) -/
@@ -170,5 +174,23 @@ theorem OrderIndependence.dedup_pair {State Elem : Type} {f : State → Elem →
     (O : OrderIndependence State Elem f) (s : State) (x : Elem) :
     [x, x].foldl f s = [x].foldl f s :=
   O.idempotent s x
+
+/-- Commutativity of a single element insertion across an arbitrary list fold (`List.foldl`). -/
+theorem OrderIndependence.foldl_comm_single {State Elem : Type} {f : State → Elem → State}
+    (O : OrderIndependence State Elem f) (s : State) (x : Elem) (xs : List Elem) :
+    xs.foldl f (f s x) = f (xs.foldl f s) x := by
+  induction xs generalizing s with
+  | nil => rfl
+  | cons y ys ih =>
+    dsimp [List.foldl]
+    rw [O.commutative s x y]
+    exact ih (f s y)
+
+/-- Adjacent transposition invariance inside an arbitrary list fold (`prefix ++ [x, y] ++ suffix`). -/
+theorem OrderIndependence.foldl_swap_adjacent {State Elem : Type} {f : State → Elem → State}
+    (O : OrderIndependence State Elem f) (s : State) (pre suf : List Elem) (x y : Elem) :
+    (pre ++ x :: y :: suf).foldl f s = (pre ++ y :: x :: suf).foldl f s := by
+  simp only [List.foldl_append, List.foldl]
+  rw [O.commutative (pre.foldl f s) x y]
 
 end Glamsterdam.Common.MetaSpec

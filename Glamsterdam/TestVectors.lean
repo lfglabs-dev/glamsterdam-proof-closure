@@ -63,6 +63,8 @@ theorem tv_elcore_gas_meter_spill_and_lifo_refund :
     let m1 := charge_state_gas_from_meter m0 80000
     let m2 := m1.map (fun m => credit_state_gas_refund m 80000)
     let m3 := m1.map (fun m => repay_state_gas_spill { m with stateGasLeft := 20000 })
+    let m4 := m1.map commit_state_gas
+    let m5 := m1.map restore_state_gas
     m1 = some {
       gasLeft := 70000
       stateGasLeft := 0
@@ -79,13 +81,23 @@ theorem tv_elcore_gas_meter_spill_and_lifo_refund :
       refundCounter := 0
       stateGasSpilled := 10000
       stateGasCommittedSpill := 0
-    } := by
+    } ∧
+    m4 = some {
+      gasLeft := 70000
+      stateGasLeft := 0
+      stateGasBaseline := 0
+      refundCounter := 0
+      stateGasSpilled := 0
+      stateGasCommittedSpill := 30000
+    } ∧
+    m5 = some m0 := by
   decide
 
 /-! ## 2. `Eip8246.Spec` (`SELFDESTRUCT` & BAL Clear) Test Vectors -/
 
 /-- Test Vector 3: `exec_selfdestruct` on distinct beneficiary (dead vs alive) and self-beneficiary
-(`originator = beneficiary`, preserving balance without self-burn). -/
+(`originator = beneficiary`, preserving balance without self-burn), plus `incorporate_child_frame`
+on revert (`childError = true`, discarding `accountsToDelete`) vs success (`childError = false`). -/
 theorem tv_eip8246_selfdestruct_vectors :
     let sdSelf : SelfdestructStep := {
       originator := 0xaa
@@ -105,6 +117,16 @@ theorem tv_eip8246_selfdestruct_vectors :
       beneficiaryCold := true
       originatorCreatedInTx := false
     }
+    let parentFrame : EvmFrame := {
+      txState := {}
+      gasMeter := { gasLeft := 50000, stateGasLeft := 0, stateGasBaseline := 0 }
+      accountsToDelete := [0x11]
+    }
+    let childFrame : EvmFrame := {
+      txState := set_storage {} 0xaa 1 99
+      gasMeter := { gasLeft := 10000, stateGasLeft := 0, stateGasBaseline := 0 }
+      accountsToDelete := [0x22]
+    }
     exec_selfdestruct sdSelf = {
       execGasCharged := 5000
       stateGasCharged := 0
@@ -118,13 +140,15 @@ theorem tv_eip8246_selfdestruct_vectors :
       postOriginatorBalance := 0
       postBeneficiaryBalance := 1000
       scheduledForClear := false
-    } := by
+    } ∧
+    (incorporate_child_frame parentFrame childFrame true).accountsToDelete = [0x11] ∧
+    (incorporate_child_frame parentFrame childFrame false).accountsToDelete = [0x11, 0x22] := by
   decide
 
 /-! ## 3. `Gas.Spec` (`EIP-8037`, `EIP-8038`, `EIP-2780`, `EIP-7778`) Test Vectors -/
 
 /-- Test Vector 4: `calculate_intrinsic_cost` across EOA transfer, self-transfer, contract creation,
-access list surcharge (`EIP-7981`), and `SetCodeTransaction` authorizations (`EIP-7702`). -/
+access list surcharge (`EIP-7981`), and `SetCodeTransaction` authorizations (`EIP-7702`, `authCount = 2`). -/
 theorem tv_gas_intrinsic_cost_vectors :
     let simpleTransfer : TxIntrinsicInput := {
       zeroDataBytes := 0
@@ -156,20 +180,35 @@ theorem tv_gas_intrinsic_cost_vectors :
       accessListStorageKeys := 2
       authCount := 0
     }
+    let setCodeTx : TxIntrinsicInput := {
+      zeroDataBytes := 0
+      nonZeroDataBytes := 0
+      isCreate := false
+      isSelfTransfer := false
+      hasPositiveValue := false
+      accessListAddresses := 0
+      accessListStorageKeys := 0
+      authCount := 2
+    }
     calculate_intrinsic_cost simpleTransfer = ⟨21000, 21000⟩ ∧
     calculate_intrinsic_cost selfTransfer = ⟨12000, 12000⟩ ∧
-    calculate_intrinsic_cost createTx = ⟨36670, 31424⟩ := by
+    calculate_intrinsic_cost createTx = ⟨36670, 31424⟩ ∧
+    calculate_intrinsic_cost setCodeTx = ⟨30632, 15000⟩ := by
   decide
 
 /-- Test Vector 5: `allocate_evm_gas`, `settle_transaction_gas`, and `price_sstore` across
 cold zero->nonzero creation (`0 -> 42`), warm modification (`42 -> 99`), and dirty reset (`42 -> 0`). -/
 theorem tv_gas_allocate_settle_and_sstore_vectors :
     let alloc := allocate_evm_gas 20000000 ⟨21000, 21000⟩
+    let settled := settle_transaction_gas 100000 21000 40000 0 15000 20000
     let s1 := price_sstore true 0 0 42
+    let sMod := price_sstore false 0 42 99
     let s2 := price_sstore false 0 42 0
     let sClear := price_sstore true 10 10 0
     alloc = ⟨16756216, 3222784⟩ ∧
+    settled = ⟨48000, 40000, 20000, 40000⟩ ∧
     s1 = ⟨12100, 97920, 0, 0⟩ ∧
+    sMod = ⟨100, 0, 0, 0⟩ ∧
     s2 = ⟨100, 0, 10000, 97920⟩ ∧
     sClear = ⟨12100, 0, 11616, 0⟩ := by
   decide
@@ -182,11 +221,22 @@ theorem tv_gloas7732_builder_and_quorum_vectors :
     let quorum := get_builder_payment_quorum_threshold 32000000000000 32
     let p1 : BuilderPendingPayment := ⟨600000000000, ⟨0xaa, 5000000, 0⟩, 7⟩
     let p2 : BuilderPendingPayment := ⟨599999999999, ⟨0xbb, 4000000, 1⟩, 8⟩
+    let (clearedP1, directSettled) := settle_builder_payment p1 []
     let (_, _, settled) := process_builder_pending_payments quorum [p1, p2] [p1, p2] []
+    let topupBal := process_builder_deposit_eip8282_patched {
+      pubkeyRegistered := true
+      credentialPrefix := 0x00
+      signatureValid := false
+      currentBalance := 1000000000
+      depositAmount := 500000000
+    }
     quorum = 600000000000 ∧
     can_builder_cover_bid 2000000000 500000000 500000000 = true ∧
     can_builder_cover_bid 2000000000 500000000 500000001 = false ∧
-    settled = [⟨0xaa, 5000000, 0⟩] := by
+    clearedP1 = {} ∧
+    directSettled = [⟨0xaa, 5000000, 0⟩] ∧
+    settled = [⟨0xaa, 5000000, 0⟩] ∧
+    topupBal = 1500000000 := by
   decide
 
 end Glamsterdam.TestVectors
