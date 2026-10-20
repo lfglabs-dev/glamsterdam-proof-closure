@@ -11,6 +11,24 @@ namespace Glamsterdam.Gas.Spec
 open Glamsterdam.Common.MetaSpec
 open Glamsterdam.Common.ElCore
 
+/-! ### Exact Pinned Gas Constants (`el_vm_gas.py:39-163` @ `16898000`) -/
+
+def COST_PER_STATE_BYTE : Nat := 1530
+def STATE_BYTES_PER_NEW_ACCOUNT : Nat := 120
+def STATE_BYTES_PER_STORAGE_SET : Nat := 64
+def STATE_BYTES_PER_AUTH_BASE : Nat := 23
+
+def STATE_GAS_NEW_ACCOUNT : Nat := STATE_BYTES_PER_NEW_ACCOUNT * COST_PER_STATE_BYTE -- 183,600
+def STATE_GAS_STORAGE_SET : Nat := STATE_BYTES_PER_STORAGE_SET * COST_PER_STATE_BYTE -- 97,920
+def STATE_GAS_AUTH_BASE : Nat := STATE_BYTES_PER_AUTH_BASE * COST_PER_STATE_BYTE     -- 35,190
+
+def GAS_WARM_ACCESS : Nat := 100
+def GAS_COLD_STORAGE_ACCESS : Nat := 2100
+def GAS_COLD_ACCOUNT_ACCESS : Nat := 3000
+def GAS_ACCOUNT_WRITE : Nat := 9000
+def GAS_STORAGE_WRITE : Nat := 10000
+def GAS_CREATE_ACCESS : Nat := GAS_ACCOUNT_WRITE + GAS_COLD_ACCOUNT_ACCESS -- 12,000
+
 /-- T-8037-CHARGE-GAS-SOUND: Whenever `charge_gas frame regularGas stateGas = some post`,
     the combined gas (`gasLeft + stateGasReservoir`) decreases by exactly `regularGas + stateGas`,
     and `post.gasLeft ≤ frame.gasLeft` and `post.stateGasReservoir ≤ frame.stateGasReservoir`. -/
@@ -38,7 +56,7 @@ theorem t_8037_reservoir_roundtrip_error (parent child : EvmGasFrame) :
     (incorporate_child_on_error { parent with stateGasReservoir := 0 } child).stateGasReservoir =
       child.stateGasReservoir := rfl
 
-/-- EIP-8037 CREATE / CREATE2 gas sequence: deduct `stateGas` (136 * CPSB) + `regularGas`
+/-- EIP-8037 CREATE / CREATE2 gas sequence: deduct `stateGas` (`120 * CPSB = 183,600`) + `regularGas`
     BEFORE computing the `63/64` (`L(gasLeft)`) child execution gas cap. -/
 def create_child_gas_cap (frame : EvmGasFrame) (regularCreateGas stateCreateGas : Nat) : Option (Nat × EvmGasFrame) :=
   match charge_gas frame regularCreateGas stateCreateGas with
@@ -78,39 +96,48 @@ def m_8037_1_refuter : WitnessRefuter (EvmGasFrame × Nat × Nat) (Option (Nat �
   killWitness := (⟨1000, 0, 0⟩, 0, 640)
   mutant_refuted := by decide
 
-/-- T-7778-NO-REFUND: Under EIP-7778, transaction gas settlement ignores `refundCounter`;
-    `receiptGasUsed = txGas - gasAvailable` and `blockStateGasUsed = txStateGasUsed`. -/
-def settle_tx_gas_eip7778 (txGas gasLeft stateGasReservoir initialReservoir : Nat) : Nat × Nat × Nat :=
-  let gasAvailable := gasLeft + stateGasReservoir
-  let receiptGasUsed := txGas - gasAvailable
-  let txStateGasUsed := (initialReservoir + txGas) - (stateGasReservoir + txGas)
-  let txRegularGasUsed := receiptGasUsed - txStateGasUsed
-  let blockRegularGasAdded := max txRegularGasUsed txStateGasUsed
-  (receiptGasUsed, txStateGasUsed, blockRegularGasAdded)
+/-- Exact `settle_transaction_gas` (`el_vm_gas.py:1163-1228` @ `16898000`):
+    - Sender/receipt `gas_used` applies the `1/5` refund cap (`min(gas_used_before_refund / 5, refund_counter)`)
+      and `calldata_floor`.
+    - Block `execution_gas_used` (`EIP-7778`) ignores `refund_counter` and takes
+      `max(gas_used_before_refund - state_gas_used, calldata_floor)`. -/
+structure TxGasSettlement where
+  gasUsed : Nat
+  executionGasUsed : Nat
+  stateGasUsed : Nat
+  blockBottleneckGas : Nat
+  deriving Repr, DecidableEq, BEq
 
-/-- T-7778-8037-DUAL-CAP: Block gas bottleneck `max(txRegularGasUsed, txStateGasUsed)`
-    always upper-bounds both dimensions while receipt gas equals `txRegularGasUsed + txStateGasUsed`. -/
-theorem t_7778_8037_dual_cap (txRegularGasUsed txStateGasUsed : Nat) :
-    txRegularGasUsed ≤ max txRegularGasUsed txStateGasUsed ∧
-    txStateGasUsed ≤ max txRegularGasUsed txStateGasUsed := by
-  constructor <;> omega
+def settle_transaction_gas (txGas calldataFloor gasLeft stateGasLeft refundCounter stateGasUsed : Nat) :
+    TxGasSettlement :=
+  let gasUsedBeforeRefund := txGas - gasLeft - stateGasLeft
+  let gasRefund := min (gasUsedBeforeRefund / 5) refundCounter
+  let gasUsedAfterRefund := gasUsedBeforeRefund - gasRefund
+  let gasUsed := max gasUsedAfterRefund calldataFloor
+  let executionGasUsed := max (gasUsedBeforeRefund - stateGasUsed) calldataFloor
+  let blockBottleneckGas := max executionGasUsed stateGasUsed
+  ⟨gasUsed, executionGasUsed, stateGasUsed, blockBottleneckGas⟩
 
-/-- EIP-2780 + EIP-8038 warm/cold state-access constants. -/
-def GAS_TX_BASE : Nat := 4500
-def GAS_COLD_ACCOUNT_ACCESS : Nat := 2600
-def GAS_COLD_ACCOUNT_NOCODE_ACCESS : Nat := 500
-def GAS_COLD_STORAGE_ACCESS : Nat := 2100
-def GAS_WARM_ACCESS : Nat := 150
-def GAS_NEW_ACCOUNT : Nat := 25000
+/-- T-7778-8037-DUAL-CAP: Block gas bottleneck `max(executionGasUsed, stateGasUsed)`
+    always upper-bounds both dimensions, and block `executionGasUsed` is invariant with
+    respect to `refundCounter`. -/
+theorem t_7778_8037_dual_cap (txGas floor gasLeft stateGasLeft r1 r2 stateGasUsed : Nat) :
+    let s1 := settle_transaction_gas txGas floor gasLeft stateGasLeft r1 stateGasUsed
+    let s2 := settle_transaction_gas txGas floor gasLeft stateGasLeft r2 stateGasUsed
+    s1.executionGasUsed ≤ s1.blockBottleneckGas ∧
+    s1.stateGasUsed ≤ s1.blockBottleneckGas ∧
+    s1.executionGasUsed = s2.executionGasUsed := by
+  dsimp only [settle_transaction_gas]
+  refine ⟨?_, ?_, rfl⟩ <;> omega
 
-/-- T-2780-INTRINSIC-SPLIT & T-8038-2780-WARM-COLD: Cold account/storage accesses strictly
-    exceed warm access (`150`), and empty-code EOA transfer receives the `2100` cold-nocode
-    discount (`2600 - 2100 = 500`). -/
+/-- T-8038-2780-WARM-COLD: Pinned warm/cold access and write gas bounds (`el_vm_gas.py:47-90`). -/
 theorem t_8038_2780_warm_cold_bounds :
-    GAS_WARM_ACCESS < GAS_COLD_ACCOUNT_NOCODE_ACCESS ∧
-    GAS_COLD_ACCOUNT_NOCODE_ACCESS < GAS_COLD_STORAGE_ACCESS ∧
+    GAS_WARM_ACCESS < GAS_COLD_STORAGE_ACCESS ∧
     GAS_COLD_STORAGE_ACCESS < GAS_COLD_ACCOUNT_ACCESS ∧
-    GAS_COLD_ACCOUNT_ACCESS - GAS_COLD_STORAGE_ACCESS = GAS_COLD_ACCOUNT_NOCODE_ACCESS := by
+    GAS_COLD_ACCOUNT_ACCESS < GAS_ACCOUNT_WRITE ∧
+    GAS_CREATE_ACCESS = GAS_ACCOUNT_WRITE + GAS_COLD_ACCOUNT_ACCESS ∧
+    STATE_GAS_NEW_ACCOUNT = 183600 ∧
+    STATE_GAS_STORAGE_SET = 97920 := by
   decide
 
 @[inline, export glamsterdam_gas_dual_cap_cabi]

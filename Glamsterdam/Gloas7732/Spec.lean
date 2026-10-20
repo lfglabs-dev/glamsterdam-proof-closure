@@ -227,6 +227,28 @@ theorem t_8282_7732_queue_safety (isParentFull requestsEmpty : Bool)
   unfold valid_parent_execution_requests at h
   cases isParentFull <;> simp_all
 
+/-! ### 6. `F-7732-FORK-SLOT-AVAILABILITY-BIT-HIGH` & `F-7732-AVAILABILITY-RING-BUFFER-CLOBBER` -/
+
+/-- Unpatched `upgrade_to_gloas` (`specs/gloas/fork.md:198-200`): initializes all bits of
+    `execution_payload_availability` to `true` (`0b1`), including `s_fork % SLOTS_PER_HISTORICAL_ROOT`.
+    When `block_0` at `s_fork` has an EMPTY payload (`isForkBlockFull = false`), its availability
+    bit remains `true` instead of `false`! -/
+def fork_slot_availability_v170_beta4_buggy (isForkBlockFull : Bool) : Bool :=
+  if isForkBlockFull then true else true
+
+/-- Patched `upgrade_to_gloas`: clears `s_fork % SLOTS_PER_HISTORICAL_ROOT` to `false` at fork
+    initialization so it only becomes `true` if `block_0`'s payload is confirmed. -/
+def fork_slot_availability_patched (isForkBlockFull : Bool) : Bool :=
+  isForkBlockFull
+
+def f_7732_fork_slot_availability_refuter :
+    WitnessRefuter Bool Bool (fun isFull bit => bit = isFull) where
+  reference := fork_slot_availability_patched
+  mutant := fork_slot_availability_v170_beta4_buggy
+  ref_sound := fun _ => rfl
+  killWitness := false
+  mutant_refuted := by decide
+
 @[inline, export glamsterdam_eip7732_can_cover_bid_cabi]
 def eip7732_can_cover_bid_cabi (builderBalance pendingToWithdraw bidAmount : UInt64) : Bool :=
   can_builder_cover_bid builderBalance.toNat pendingToWithdraw.toNat bidAmount.toNat
