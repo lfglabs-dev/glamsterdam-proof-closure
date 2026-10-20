@@ -1,0 +1,32 @@
+name: Glamsterdam Proof Closure CI (turbo-lean)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  prove:
+    name: Verify Lean 4.31 Proofs & Audit Metadata (turbo-lean)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify Lean 4.31 proofs with turbo-lean
+        uses: Th0rgal/turbo-lean@main
+        with:
+          project-dir: "."
+          command: ${{ github.event_name == 'pull_request' && 'pr-verify' || 'ci-verify' }}
+          mode: "auto"
+          receipt-path: "/tmp/glamsterdam-receipt.json"
+
+      - name: Run turbo-lean spec audit on all audit domains
+        run: |
+          turbo-lean --json audit-spec Glamsterdam/Common/ElCore.lean
+          turbo-lean --json audit-spec Glamsterdam/Eip8246/Spec.lean
+          turbo-lean --json audit-spec Glamsterdam/Gas/Spec.lean
+          turbo-lean --json audit-spec Glamsterdam/Gloas7732/Spec.lean
+
+      - name: Verify audit metadata and source-map pinning
+        run: python3 scripts/audit_metadata.py

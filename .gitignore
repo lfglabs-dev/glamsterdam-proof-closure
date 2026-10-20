@@ -1,0 +1,6 @@
+.lake/
+.turbo-cache/
+.turbo-pack/
+__pycache__/
+*.pyc
+/tmp/

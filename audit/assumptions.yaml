@@ -1,0 +1,18 @@
+schema_version: 1
+assumptions:
+  - id: "A-NO-PRE-EXISTING-STORAGE-ON-CREATE"
+    domain: "EIP-8246"
+    description: "Target address of CREATE/CREATE2 has empty storage prior to account creation (nonce == 0, code == b'', storage == {}). Pre-Spurious Dragon storage-only collision accounts are addressed separately by EIP-8253 (Hegota)."
+  - id: "A-CRYPTO-PRIMITIVES"
+    domain: "All"
+    description: "Keccak-256, SHA-256, secp256k1 ECDSA, and BLS12-381 signature/hash primitives behave as collision-resistant mathematical functions."
+exclusions:
+  - id: "X-GLOAS-FORK-CHOICE"
+    domain: "Gloas EIP-7732"
+    description: "specs/gloas/fork-choice.md (LMD-GHOST payload tree, PTC payload timeliness tie-breaking) is out of scope per agreement with Potuz (EF)."
+  - id: "X-GLOAS-P2P-GOSSIP"
+    domain: "Gloas EIP-7732"
+    description: "specs/gloas/p2p-interface.md and libp2p GossipSub topics for execution payload bids and envelopes are out of scope."
+  - id: "X-EIP-8253-COLLISION-WIPE"
+    domain: "EIP-8246"
+    description: "EIP-8253 storage wipe on deployment collision (scheduled for Hegota) is excluded from EIP-8246 scope per Paweł Bylica."
