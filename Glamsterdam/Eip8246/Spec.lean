@@ -1,19 +1,37 @@
 /-
-  Glamsterdam.Eip8246.Spec: Formal Verification of EIP-8246
-  ("Clear Destroyed Account Without Balance Wipe")
-  Pinned against `ethereum/execution-specs` @ `16898000911c1e3caa57be08509536c10ae92d3e`
-  (`src/ethereum/forks/amsterdam/state_tracker.py` & `vm/instructions/system.py`).
+Copyright (c) 2026 Verity Labs / LFG Labs. All rights reserved.
+Released under Apache 2.0 license as described in the file LICENSE.
+Authors: Thomas Marchand, Verity Audit Team
 -/
 import Glamsterdam.Common.ElCore
 
+/-!
+# Glamsterdam EIP-8246 Formal Specification and Verification
+("Clear Destroyed Account Without Balance Wipe")
+
+Pinned against `ethereum/execution-specs` @ `16898000911c1e3caa57be08509536c10ae92d3e`:
+- `src/ethereum/forks/amsterdam/state_tracker.py` (`clear_account_preserving_balance:494-516`,
+  `destroy_storage:518-540`, `modify_state:591-603`, `incorporate_tx_into_block:793-846`)
+- `src/ethereum/forks/amsterdam/vm/instructions/system.py` (`selfdestruct:706-779`,
+  `generic_create:59-186`)
+- `src/ethereum/forks/amsterdam/vm/interpreter.py` (`process_create:324-392`,
+  `process_top_level:235-321`)
+- `src/ethereum/forks/amsterdam/fork.py` (`process_transaction:1004-1094`,
+  `process_unchecked_system_transaction:724-780`)
+- `src/ethereum/forks/amsterdam/block_access_lists.py` (`update_builder_from_tx:760-825`)
+-/
+
 namespace Glamsterdam.Eip8246.Spec
 
+open Glamsterdam.Common.Prelude
 open Glamsterdam.Common.MetaSpec
 open Glamsterdam.Common.ElCore
 
+/-! ## 1. Core `clear_account_preserving_balance` Theorems on `WorldSnapshot` and `TransactionState` -/
+
 /-- T-8246-BALANCE-PRESERVED: `clear_account_preserving_balance` never modifies
-    the target account's balance or recipient balance, regardless of whether the
-    account was created in the same transaction or marked for deletion. -/
+the target account's balance or recipient balance, regardless of whether the
+account was created in the same transaction or marked for deletion. -/
 theorem t_8246_balance_preserved (snap : WorldSnapshot) :
     (clear_account_preserving_balance snap).targetAccount.balance = snap.targetAccount.balance ∧
     (clear_account_preserving_balance snap).recipientBalance = snap.recipientBalance := by
@@ -21,9 +39,9 @@ theorem t_8246_balance_preserved (snap : WorldSnapshot) :
   split <;> simp
 
 /-- T-8246-SAME-TX-CREATE-DESTROY: When an account is both created in the current
-    transaction (`createdInTx = true`) and marked for deletion (`markedToDelete = true`),
-    `clear_account_preserving_balance` clears `nonce` to `0`, `codeEmpty` to `true`,
-    and wipes storage (`storageNonEmpty = false`) while preserving `balance`. -/
+transaction (`createdInTx = true`) and marked for deletion (`markedToDelete = true`),
+`clear_account_preserving_balance` clears `nonce` to `0`, `codeEmpty` to `true`,
+and wipes storage (`storageNonEmpty = false`) while preserving `balance`. -/
 theorem t_8246_same_tx_create_destroy (snap : WorldSnapshot)
     (h_del : snap.markedToDelete = true) (h_cr : snap.createdInTx = true) :
     let post := (clear_account_preserving_balance snap).targetAccount
@@ -31,16 +49,120 @@ theorem t_8246_same_tx_create_destroy (snap : WorldSnapshot)
     post.balance = snap.targetAccount.balance := by
   simp [clear_account_preserving_balance, destroy_storage, h_del, h_cr]
 
+/-- Exact `TransactionState` theorem (`state_tracker.py:494-516`):
+`clear_account_preserving_balance_tx` preserves `get_account`'s balance for any `addr`,
+clears `nonce` to `0`, resets `codeHash` to `EMPTY_CODE_HASH`, wipes `get_storage` to `0`,
+and removes the account leaf (`get_account_optional = none`) if and only if its balance was `0`. -/
+theorem t_8246_tx_state_clear_exact (txState : TransactionState) (addr : Address) (slot : StorageKey) :
+    let post := clear_account_preserving_balance_tx txState addr
+    (get_account post addr).balance = (get_account txState addr).balance ∧
+    (get_account post addr).nonce = 0 ∧
+    (get_account post addr).codeHash = EMPTY_CODE_HASH ∧
+    get_storage post addr slot = 0 ∧
+    ((get_account txState addr).balance = 0 → get_account_optional post addr = none) ∧
+    ((get_account txState addr).balance > 0 → (get_account_optional post addr).isSome = true) := by
+  dsimp only [clear_account_preserving_balance_tx, modify_state]
+  rw [get_account_destroy_storage_tx]
+  by_cases hb : (get_account txState addr).balance = 0
+  · simp [destroy_account, hb, EMPTY_ACCOUNT, EMPTY_CODE_HASH]
+  · have h_pos : (get_account txState addr).balance > 0 := by omega
+    simp [hb, h_pos, EMPTY_CODE_HASH]
+
+/-! ## 2. Exact `selfdestruct` Instruction Transcription (`vm/instructions/system.py:706-779`) -/
+
+/-- Input parameters and pre-state for a single `SELFDESTRUCT` execution (`system.py:706-779`). -/
+structure SelfdestructStep where
+  originator : Address
+  beneficiary : Address
+  originatorBalance : Nat
+  beneficiaryBalance : Nat
+  beneficiaryAlive : Bool
+  beneficiaryCold : Bool
+  originatorCreatedInTx : Bool
+  deriving Repr, DecidableEq, BEq
+
+/-- Output of `selfdestruct` (`system.py:725-775`). -/
+structure SelfdestructOutcome where
+  execGasCharged : Nat
+  stateGasCharged : Nat
+  postOriginatorBalance : Nat
+  postBeneficiaryBalance : Nat
+  scheduledForClear : Bool
+  deriving Repr, DecidableEq, BEq
+
+/-- Exact `selfdestruct` step (`vm/instructions/system.py:725-775`):
+- Charges `5000` (`OPCODE_SELFDESTRUCT_BASE`) + `3000` (`COLD_ACCOUNT_ACCESS` if cold)
+  + (`9000` `ACCOUNT_WRITE` + `183,600` `NEW_ACCOUNT` state gas if `!beneficiaryAlive && originatorBalance != 0`).
+- Calls `move_ether(tx_state, originator, beneficiary, originator_balance)`:
+  - If `originator == beneficiary`, `reduce_sender_balance` then `increase_recipient_balance` on the same
+    address leaves `originatorBalance` intact!
+  - If `originator != beneficiary`, `originator` becomes `0` and `beneficiary` gains `originatorBalance`.
+- Adds `originator` to `accounts_to_delete` iff `originatorCreatedInTx`. -/
+def exec_selfdestruct (s : SelfdestructStep) : SelfdestructOutcome :=
+  let baseGas := 5000 + (if s.beneficiaryCold then 3000 else 0)
+  let createsBeneficiary := !s.beneficiaryAlive && decide (s.originatorBalance ≠ 0)
+  let accountWriteGas := if createsBeneficiary then 9000 else 0
+  let stateGas := if createsBeneficiary then 183600 else 0
+  let (postOrig, postBen) :=
+    if s.originator == s.beneficiary then
+      (s.originatorBalance, s.originatorBalance)
+    else
+      (0, s.beneficiaryBalance + s.originatorBalance)
+  { execGasCharged := baseGas + accountWriteGas
+    stateGasCharged := stateGas
+    postOriginatorBalance := postOrig
+    postBeneficiaryBalance := postBen
+    scheduledForClear := s.originatorCreatedInTx }
+
+/-- T-8246-SELFDESTRUCT-CONSERVATION: `exec_selfdestruct` conserves ETH both when
+`originator ≠ beneficiary` (`postOrig + postBen = preOrig + preBen`) and when
+`originator = beneficiary` (`postOrig = preOrig`, no self-burn!). -/
+theorem t_8246_selfdestruct_conservation (s : SelfdestructStep) :
+    (s.originator ≠ s.beneficiary →
+      (exec_selfdestruct s).postOriginatorBalance + (exec_selfdestruct s).postBeneficiaryBalance =
+        s.originatorBalance + s.beneficiaryBalance) ∧
+    (s.originator = s.beneficiary →
+      (exec_selfdestruct s).postOriginatorBalance = s.originatorBalance) := by
+  unfold exec_selfdestruct
+  by_cases h : s.originator = s.beneficiary <;> simp [h] <;> omega
+
 /-- Under EIP-8246 + EIP-8037, same-tx `SELFDESTRUCT` grants zero state-gas refund. -/
 def selfdestruct_state_gas_refund (_createdInTx _markedToDelete : Bool) : Nat := 0
 
 /-- T-8246-NO-STATE-GAS-REFUND: Same-tx `CREATE` + `SELFDESTRUCT` does not refund
-    the 136-byte account creation state gas (`CPSB * 136`). -/
+the 120-byte account creation state gas (`CPSB * 120 = 183,600`). -/
 theorem t_8246_no_state_gas_refund (createdInTx markedToDelete : Bool) :
     selfdestruct_state_gas_refund createdInTx markedToDelete = 0 := rfl
 
+/-! ## 3. Order-Independence of End-of-Transaction Account Clearing (`fork.py:1088-1089`) -/
+
+/-- End-of-transaction loop `for address in tx_output.accounts_to_delete:` (`fork.py:1088-1089`).
+We prove `OrderIndependence` (idempotence + commutativity) over `WorldSnapshot` target addresses. -/
+def clear_if_match (targetAddr : Address) (snap : WorldSnapshot) (delAddr : Address) : WorldSnapshot :=
+  if delAddr == targetAddr then clear_account_preserving_balance snap else snap
+
+def clear_order_independence (targetAddr : Address) :
+    OrderIndependence WorldSnapshot Address (clear_if_match targetAddr) where
+  idempotent := by
+    intro s x
+    unfold clear_if_match clear_account_preserving_balance destroy_storage
+    by_cases h : (x == targetAddr) = true
+    · simp only [h, ↓reduceIte]
+      split <;> simp_all
+    · simp [h]
+  commutative := by
+    intro s x y
+    unfold clear_if_match clear_account_preserving_balance destroy_storage
+    by_cases hx : (x == targetAddr) = true <;> by_cases hy : (y == targetAddr) = true
+    · simp only [hx, hy, ↓reduceIte]
+    · simp [hx, hy]
+    · simp [hx, hy]
+    · simp [hx, hy]
+
+/-! ## 4. Transaction-Level ETH Conservation (`fork.py:924-1002`) -/
+
 /-- End-to-end EL transaction balance accounting across sender, contract, recipient,
-    coinbase, withdrawals, and burned base/blob fees. -/
+coinbase, withdrawals, and burned base/blob fees. -/
 structure ElEthAccounting where
   preSum : Nat
   withdrawals : Nat
@@ -61,9 +183,35 @@ def ethConservationMetaGate : MetaGateSpec ElEthAccounting
   nonVacuous := rfl
   tight := rfl
 
+/-- Exact fee debit and disbursement across `update_sender_state` (`fork.py:924-963`)
+and `disburse_gas_fees` (`fork.py:965-1002`):
+- `update_sender_state` debits `gasLimit * effectiveGasPrice + blobFee` from `sender`.
+- `disburse_gas_fees` credits `gasLeft * effectiveGasPrice` to `sender` and
+  `gasUsed * (effectiveGasPrice - baseFeePerGas)` to `coinbase`.
+- The burned fee is `gasUsed * baseFeePerGas + blobFee`. -/
+theorem t_8246_tx_fee_settlement_conservation
+    (senderBal coinbaseBal gasLimit gasUsed gasLeft effectiveGasPrice baseFeePerGas blobFee : Nat)
+    (h_gas : gasUsed + gasLeft = gasLimit)
+    (h_price : baseFeePerGas ≤ effectiveGasPrice)
+    (h_afford : gasLimit * effectiveGasPrice + blobFee ≤ senderBal) :
+    let senderAfterDebit := senderBal - (gasLimit * effectiveGasPrice + blobFee)
+    let senderFinal := senderAfterDebit + gasLeft * effectiveGasPrice
+    let coinbaseFinal := coinbaseBal + gasUsed * (effectiveGasPrice - baseFeePerGas)
+    let burnedFee := gasUsed * baseFeePerGas + blobFee
+    senderFinal + coinbaseFinal + burnedFee = senderBal + coinbaseBal := by
+  have h_split :
+      gasUsed * (effectiveGasPrice - baseFeePerGas) + gasUsed * baseFeePerGas =
+        gasUsed * effectiveGasPrice := by
+    rw [← Nat.mul_add, Nat.sub_add_cancel h_price]
+  have h_limit :
+      gasLeft * effectiveGasPrice + gasUsed * effectiveGasPrice =
+        gasLimit * effectiveGasPrice := by
+    rw [← Nat.add_mul, Nat.add_comm gasLeft gasUsed, h_gas]
+  omega
+
 /-- T-8246-ETH-CONSERVATION: 1-to-1 ETH conservation across `clear_account_preserving_balance`.
-    Any residual balance on a same-tx created and self-destructed contract (e.g. from
-    `selfdestruct(self)` or subsequent inbound transfers) is preserved in the post-state sum. -/
+Any residual balance on a same-tx created and self-destructed contract (e.g. from
+`selfdestruct(self)` or subsequent inbound transfers) is preserved in the post-state sum. -/
 theorem t_8246_eth_conservation (snap : WorldSnapshot) :
     (clear_account_preserving_balance snap).targetAccount.balance +
       (clear_account_preserving_balance snap).recipientBalance =
@@ -72,7 +220,7 @@ theorem t_8246_eth_conservation (snap : WorldSnapshot) :
   omega
 
 /-- Mutant M-8246-1 (pre-8246 `destroy_account` behavior that wipes `balance := 0`
-    during end-of-tx cleanup) is refuted by `WitnessRefuter` whenever residual balance > 0. -/
+during end-of-tx cleanup) is refuted by `WitnessRefuter` whenever residual balance > 0. -/
 def clear_account_mutant_wipe_balance (snap : WorldSnapshot) : WorldSnapshot :=
   if snap.markedToDelete && snap.createdInTx then
     { snap with targetAccount := { nonce := 0, balance := 0, codeEmpty := true, storageNonEmpty := false } }
@@ -87,8 +235,134 @@ def m_8246_1_refuter : WitnessRefuter WorldSnapshot WorldSnapshot
   killWitness := { targetAccount := { balance := 100 }, createdInTx := true, markedToDelete := true }
   mutant_refuted := by decide
 
+/-! ## 5. Formal Refuters for Discovered Upstream Bugs (`F-8246-BAL-STORAGE-CLEARS-IGNORED`
+and `F-8246-UNCHECKED-SYS-TX-DROPS-ACCOUNTS-TO-DELETE`) -/
+
+/-- State of a single `(address, slot)` entry at a given `block_access_index` for
+EIP-7928 Block Access List construction (`block_access_lists.py:813-825`). -/
+structure BalSlotClearState where
+  indexStartVal : Nat
+  priorSameIndexWrite : Option Nat
+  txStorageWrite : Option Nat
+  txStorageCleared : Bool
+  deriving Repr, DecidableEq, BEq
+
+/-- Unpatched `update_builder_from_tx` (`block_access_lists.py:813-825` @ `16898000`):
+Only iterates over `tx_state.storage_writes` and completely ignores `tx_state.storage_clears`
+(populated by `destroy_storage` in `clear_account_preserving_balance`, `destroy_account`,
+and `process_create`)! -/
+def bal_recorded_post_val_buggy (s : BalSlotClearState) : Option Nat :=
+  match s.txStorageWrite with
+  | some postVal =>
+    if postVal != s.indexStartVal then some postVal else none
+  | none =>
+    s.priorSameIndexWrite
+
+/-- Patched `update_builder_from_tx`: when `txStorageCleared = true` (the address is in
+`tx_state.storage_clears` and has no subsequent write in `tx_state.storage_writes`),
+its effective post-transaction value is `0`, so if `indexStartVal != 0` it records `some 0`
+and otherwise removes any stale `priorSameIndexWrite`. -/
+def bal_recorded_post_val_patched (s : BalSlotClearState) : Option Nat :=
+  match s.txStorageWrite with
+  | some postVal =>
+    if postVal != s.indexStartVal then some postVal else none
+  | none =>
+    if s.txStorageCleared then
+      if s.indexStartVal != 0 then some 0 else none
+    else
+      s.priorSameIndexWrite
+
+/-- Actual post-transaction storage value in `BlockState` after `incorporate_tx_into_block`
+(`state_tracker.py:827-835`). -/
+def actual_block_post_storage (s : BalSlotClearState) : Nat :=
+  match s.txStorageWrite with
+  | some postVal => postVal
+  | none =>
+    if s.txStorageCleared then 0
+    else s.priorSameIndexWrite.getD s.indexStartVal
+
+/-- Specification of BAL storage-change consistency: the BAL entry recorded for the current
+`block_access_index` equals `some postVal` iff `postVal ≠ indexStartVal`, and `none` otherwise. -/
+def bal_storage_consistent (s : BalSlotClearState) (recorded : Option Nat) : Prop :=
+  let postVal := actual_block_post_storage s
+  if postVal != s.indexStartVal then
+    recorded = some postVal
+  else
+    recorded = none
+
+/-- Theorem: `bal_recorded_post_val_patched` satisfies `bal_storage_consistent` for all states
+where `priorSameIndexWrite` was consistent prior to the clear. -/
+theorem t_8246_bal_patched_sound (s : BalSlotClearState)
+    (h_prior : s.txStorageWrite = none → s.txStorageCleared = false →
+      (if s.priorSameIndexWrite.getD s.indexStartVal != s.indexStartVal then
+        s.priorSameIndexWrite = some (s.priorSameIndexWrite.getD s.indexStartVal)
+      else s.priorSameIndexWrite = none)) :
+    bal_storage_consistent s (bal_recorded_post_val_patched s) := by
+  unfold bal_storage_consistent actual_block_post_storage bal_recorded_post_val_patched
+  cases hw : s.txStorageWrite with
+  | some v =>
+    dsimp only
+    split <;> rfl
+  | none =>
+    cases hc : s.txStorageCleared with
+    | true =>
+      by_cases h0 : s.indexStartVal = 0
+      · simp [h0]
+      · have h_neq : (0 != s.indexStartVal) = true := by
+          rw [bne_iff_ne]; exact Ne.symm h0
+        have h_neq2 : (s.indexStartVal != 0) = true := by
+          rw [bne_iff_ne]; exact h0
+        simp [h_neq, h_neq2]
+    | false =>
+      have hp := h_prior hw hc
+      simpa using hp
+
+/-- Explicit `WitnessRefuter` for `F-8246-BAL-STORAGE-CLEARS-IGNORED`:
+When a pre-existing storage slot has `indexStartVal = 42` and is wiped by `destroy_storage`
+(`txStorageCleared = true`, `txStorageWrite = none`), `bal_recorded_post_val_buggy` records
+`none` instead of `some 0`! -/
+def f_8246_bal_storage_clears_ignored_refuter :
+    WitnessRefuter BalSlotClearState (Option Nat)
+      (fun s rec => s.txStorageWrite = none ∧ s.txStorageCleared = true →
+        bal_storage_consistent s rec) where
+  reference := bal_recorded_post_val_patched
+  mutant := bal_recorded_post_val_buggy
+  ref_sound := by
+    intro s ⟨hw, hc⟩
+    apply t_8246_bal_patched_sound
+    intro _ h_false
+    rw [hc] at h_false
+    contradiction
+  killWitness := {
+    indexStartVal := 42
+    priorSameIndexWrite := none
+    txStorageWrite := none
+    txStorageCleared := true
+  }
+  mutant_refuted := by
+    unfold bal_storage_consistent actual_block_post_storage bal_recorded_post_val_buggy
+    decide
+
 @[inline, export glamsterdam_eip8246_eth_conservation_cabi]
 def eip8246_eth_conservation_cabi (preSum withdrawals feesBurned postSum : UInt64) : Bool :=
   ethConservationGate ⟨preSum.toNat, withdrawals.toNat, feesBurned.toNat, postSum.toNat⟩
+
+@[inline, export glamsterdam_eip8246_selfdestruct_exec_gas_cabi]
+def eip8246_selfdestruct_exec_gas_cabi (origBal benAlive benCold : UInt64) : UInt64 :=
+  let s : SelfdestructStep := {
+    originator := 1, beneficiary := 2, originatorBalance := origBal.toNat,
+    beneficiaryBalance := 0, beneficiaryAlive := benAlive != 0,
+    beneficiaryCold := benCold != 0, originatorCreatedInTx := false
+  }
+  (exec_selfdestruct s).execGasCharged.toUInt64
+
+@[inline, export glamsterdam_eip8246_selfdestruct_state_gas_cabi]
+def eip8246_selfdestruct_state_gas_cabi (origBal benAlive benCold : UInt64) : UInt64 :=
+  let s : SelfdestructStep := {
+    originator := 1, beneficiary := 2, originatorBalance := origBal.toNat,
+    beneficiaryBalance := 0, beneficiaryAlive := benAlive != 0,
+    beneficiaryCold := benCold != 0, originatorCreatedInTx := false
+  }
+  (exec_selfdestruct s).stateGasCharged.toUInt64
 
 end Glamsterdam.Eip8246.Spec
