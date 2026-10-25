@@ -786,6 +786,55 @@ theorem t_calltree_d13s_post_merge_refund_stranded_symbolic
     dsimp only [exit_child_frame, repay_state_gas_spill_capped] at *
     omega
 
+/-- Theorem 4f (`t_calltree_d0_preserves_spill_invariant_and_d13s_violates`, bridging
+`GasMeter.SpillInvariant` with `EvmGasSemantics.Meter.Discipline` in
+`fradamt/evm-gas-semantics-lean/EvmGasSemantics/Theorems/Meter.lean:95` and
+`Theorems/MeterReach.lean:270, 545`):
+1. Under `amsterdamD0` and `amsterdamD13R`, `exit_child_frame` on `.success` unconditionally
+   establishes `GasMeter.SpillInvariant` (`stateGasLeft = 0 ∨ stateGasSpilled = 0`) for any
+   `pWithheld` and `c`.
+2. Under `amsterdamD13S`, because `repay_state_gas_spill_capped` caps repayment by
+   `childExcess = c.stateGasLeft - c.stateGasBaseline`, reachable multi-frame states (such as
+   `run_t6_failed_create_trace .amsterdamD13S 1000000 0 false`) violate `GasMeter.SpillInvariant`
+   with `stateGasLeft = 183600 > 0` and `stateGasSpilled = 183600 > 0` simultaneously. -/
+theorem t_calltree_d0_preserves_spill_invariant_and_d13s_violates
+    (pWithheld c : CallFrameMeter) :
+    (exit_child_frame .amsterdamD0 pWithheld c .success).meter.SpillInvariant ∧
+    (exit_child_frame .amsterdamD13R pWithheld c .success).meter.SpillInvariant ∧
+    (run_t6_failed_create_trace .amsterdamD13S 1000000 0 false).map
+      (fun fm => (fm.meter.stateGasLeft, fm.meter.stateGasSpilled)) = some (183600, 183600) := by
+  refine ⟨?_, ?_, by decide⟩
+  · dsimp only [exit_child_frame]
+    exact (repay_state_gas_spill_invariant _).2
+  · dsimp only [exit_child_frame]
+    exact (repay_state_gas_spill_invariant _).2
+
+/-- Same-child `0 -> 1 -> 0` trace (`0x7cfb8909` pattern from `fradamt/8037-coordination#70`):
+A child frame enters with `gasLeft = childEntryGas` and `stateGasLeft = 0` (`tx.gas ≤ 2^24`),
+writes one warm slot `0 -> 1` (`10,100` execution gas + `97,920` state gas), and clears that
+same slot `1 -> 0` (`100` execution gas, crediting `97,920` state gas) within the same child frame. -/
+def run_same_child_set_clear_trace (sched : ForkSchedule) (childEntryGas : Nat) : Option CallFrameMeter :=
+  let c0 : CallFrameMeter := { meter := { gasLeft := childEntryGas, stateGasLeft := 0, stateGasBaseline := 0 } }
+  match exec_sstore_frame sched c0 false 0 0 1 with
+  | none => none
+  | some c1 => exec_sstore_frame sched c1 false 0 1 0
+
+/-- Theorem 4g (`t_calltree_eip12581_same_child_clear_tradeoff`):
+Under `amsterdamD13` (which has the exact `(gasLeft, stateGasLeft)` transition rules of
+`ethereum/EIPs#12581` @ `b86de3f4`, Option C: reservoir-only refills and no child-merge spill
+repayment), a same-child `0 -> 1 -> 0` sequence on `childEntryGas = 200000` with `0` initial
+reservoir credits `97,920` into `stateGasLeft` while leaving `stateGasSpilled = 97,920`
+(`(gasLeft, stateGasLeft, stateGasSpilled) = (91880, 97920, 97920)`), whereas `amsterdamD0`
+restores the `97,920` spill directly into `gasLeft` (`(189800, 0, 0)`). -/
+theorem t_calltree_eip12581_same_child_clear_tradeoff :
+    (run_same_child_set_clear_trace .amsterdamD0 200000).map
+      (fun fm => (fm.meter.gasLeft, fm.meter.stateGasLeft, fm.meter.stateGasSpilled)) =
+        some (189800, 0, 0) ∧
+    (run_same_child_set_clear_trace .amsterdamD13 200000).map
+      (fun fm => (fm.meter.gasLeft, fm.meter.stateGasLeft, fm.meter.stateGasSpilled)) =
+        some (91880, 97920, 97920) := by
+  decide
+
 /-! ## 4. C-ABI Exports for Multi-Frame Differential Testing (`tests/differential/test_glamsterdam_differential.py`) -/
 
 @[inline, export glamsterdam_calltree_m2_d0_silent_flip_cabi]

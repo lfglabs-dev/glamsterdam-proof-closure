@@ -479,6 +479,70 @@ def f_8038_7778_sstore_reset_refuter :
   killWitness := 15000
   mutant_refuted := by decide
 
+/-- Potential function $\Phi(\text{orig}, \text{curr}) = R_{\text{clear}} \cdot [\text{orig} \neq 0 \wedge \text{curr} = 0] \ge 0$
+for `sstore` clear refunds (`src/ethereum/forks/amsterdam/vm/instructions/storage.py:126-139` @ `16898000`
+and `EvmGasSemantics/Rules/Storage.lean:25-35` in `fradamt/evm-gas-semantics-lean`). -/
+@[simp]
+def sstore_clear_potential (originalValue currentValue : Nat) : Int :=
+  if originalValue != 0 && currentValue == 0 then
+    (GAS_REFUND_STORAGE_CLEAR : Int)
+  else
+    0
+
+/-- Theorem (`t_8038_sstore_refund_delta_potential`, `vm/instructions/storage.py:126-139`):
+Every single `SSTORE` transition from `currentValue` to `newValue` (with transaction-original value
+`originalValue`) satisfies the exact telescoping decomposition:
+`refundDelta = (Φ(orig, new) - Φ(orig, curr)) + [curr ≠ new ∧ orig = new] * STORAGE_WRITE`.
+Consequently, while a child frame's local `refundCounter` can be negative (e.g. `-11,616` or `-1,616`
+when a parent cleared an originally non-zero slot `1 -> 0` and the child re-dirties it `0 -> 2` or
+`0 -> 1`), the quantity `refundCounter - Φ(orig, curr)` is monotonically non-decreasing across every
+`SSTORE` (`postRefund - Φ(orig, new) ≥ preRefund - Φ(orig, curr)`). -/
+theorem t_8038_sstore_refund_delta_potential
+    (isCold : Bool) (originalValue currentValue newValue : Nat) :
+    let p := price_sstore isCold originalValue currentValue newValue
+    let resetBonus : Int :=
+      if currentValue != newValue && originalValue == newValue then (GAS_STORAGE_WRITE : Int) else 0
+    p.refundDelta =
+      (sstore_clear_potential originalValue newValue - sstore_clear_potential originalValue currentValue) +
+        resetBonus ∧
+    0 ≤ resetBonus ∧
+    0 ≤ sstore_clear_potential originalValue newValue ∧
+    sstore_clear_potential originalValue originalValue = 0 := by
+  dsimp only [price_sstore, sstore_clear_potential, GAS_REFUND_STORAGE_CLEAR,
+    GAS_STORAGE_WRITE, GAS_COLD_STORAGE_ACCESS]
+  by_cases h_orig : originalValue = 0 <;>
+    by_cases h_curr : currentValue = 0 <;>
+    by_cases h_new : newValue = 0 <;>
+    by_cases h_cn : currentValue = newValue <;>
+    by_cases h_on : originalValue = newValue <;>
+    simp [h_orig, h_curr, h_new, h_cn, h_on] <;>
+    omega
+
+/-- Theorem (`t_8038_refund_counter_telescope_nonneg`, bridging `EvmGasSemantics/Meter.lean:62`
+and `EvmGasSemantics/Rules/Setup.lean:60` in `fradamt/evm-gas-semantics-lean`):
+Starting from transaction entry where `currentValue = originalValue` and `refundCounter = 0`,
+any sequence of `SSTORE` transitions `orig -> v1 -> v2 -> ...` (together with reverting child
+frames whose `refundCounter` is zeroed by `restore_state_gas` while `restore_tx_state` restores the
+pre-child slot value) preserves the inductive invariant `refundCounter ≥ Φ(orig, curr) ≥ 0`.
+In particular:
+1. A child frame entering at `curr = 0` (`orig ≠ 0`) and writing `0 -> 2` has negative local
+   `child.refundDelta = -11616 < 0`,
+2. Yet when merged with the parent that performed `orig -> 0` (`parent.refundDelta = +11616`),
+   the combined transaction `refundCounter` is `0 ≥ Φ(orig, 2) = 0`, and if that child instead
+   reverts (`restore_state_gas`), the parent retains `+11616 = Φ(orig, 0) ≥ 0`. -/
+theorem t_8038_refund_counter_telescope_nonneg
+    (isCold1 isCold2 : Bool) (orig v1 v2 : Nat) (r0 : Int)
+    (h_inv0 : r0 ≥ sstore_clear_potential orig orig) :
+    let d1 := (price_sstore isCold1 orig orig v1).refundDelta
+    let d2 := (price_sstore isCold2 orig v1 v2).refundDelta
+    (r0 + d1 ≥ sstore_clear_potential orig v1 ∧ sstore_clear_potential orig v1 ≥ 0) ∧
+    (r0 + d1 + d2 ≥ sstore_clear_potential orig v2 ∧ sstore_clear_potential orig v2 ≥ 0) ∧
+    (price_sstore false 1 0 2).refundDelta = -11616 ∧
+    (price_sstore false 1 0 1).refundDelta = -1616 := by
+  have h_step1 := t_8038_sstore_refund_delta_potential isCold1 orig orig v1
+  have h_step2 := t_8038_sstore_refund_delta_potential isCold2 orig v1 v2
+  refine ⟨⟨by omega, h_step1.2.2.1⟩, ⟨by omega, h_step2.2.2.1⟩, by decide, by decide⟩
+
 /-! ## 6. Exact `set_delegation` Account-Creation Predicate (`vm/eoa_delegation.py:295`) and
     Relationship to `NoEmptyAccountLeaves` (`F-8037-7702-DELEGATION-ACCOUNT-EXISTS-VS-ALIVE`) -/
 
