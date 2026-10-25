@@ -543,6 +543,62 @@ theorem t_8038_refund_counter_telescope_nonneg
   have h_step2 := t_8038_sstore_refund_delta_potential isCold2 orig v1 v2
   refine ⟨⟨by omega, h_step1.2.2.1⟩, ⟨by omega, h_step2.2.2.1⟩, by decide, by decide⟩
 
+/-- Inductive step of a single-slot multi-frame `SSTORE` trace:
+- `sstore isCold newVal`: performs `SSTORE` to `newVal` and adds `refundDelta` to `refundCounter`.
+- `revertedChild childWrites`: executes a child frame that performs `childWrites` and then reverts
+  or halts (`restore_state_gas` zeroes `child.refundCounter` and `restore_tx_state` rolls back
+  `currentValue` to the pre-child value). -/
+inductive SstoreTraceStep where
+  | sstore (isCold : Bool) (newVal : Nat)
+  | revertedChild (childWrites : List (Bool × Nat))
+  deriving Repr, DecidableEq, BEq
+
+/-- Execute a `List SstoreTraceStep` starting from `(currVal, refundCounter)` with transaction-original
+slot value `origVal`. -/
+def run_sstore_refund_trace (origVal : Nat) : List SstoreTraceStep → Nat × Int → Nat × Int
+  | [], st => st
+  | (.sstore isCold newVal) :: rest, (currVal, r) =>
+    let d := (price_sstore isCold origVal currVal newVal).refundDelta
+    run_sstore_refund_trace origVal rest (newVal, r + d)
+  | (.revertedChild _) :: rest, (currVal, r) =>
+    run_sstore_refund_trace origVal rest (currVal, r)
+
+/-- Theorem (`t_8038_refund_counter_telescope_trace_nonneg`):
+For ANY finite sequence `trace : List SstoreTraceStep` of committed `SSTORE`s (which includes
+merged successful child frames by associativity of `+`) and reverted/halted child frames, starting
+from any state `(curr, r)` satisfying `r ≥ sstore_clear_potential orig curr`, the post-trace state
+`(curr', r')` satisfies `r' ≥ sstore_clear_potential orig curr' ≥ 0`. In particular, starting from
+transaction entry `(orig, 0)`, the root `refundCounter` is unconditionally `≥ 0`. -/
+theorem t_8038_refund_counter_telescope_trace_inv
+    (orig : Nat) (trace : List SstoreTraceStep) (curr : Nat) (r : Int)
+    (h_inv : r ≥ sstore_clear_potential orig curr) :
+    let (curr', r') := run_sstore_refund_trace orig trace (curr, r)
+    r' ≥ sstore_clear_potential orig curr' ∧ sstore_clear_potential orig curr' ≥ 0 := by
+  induction trace generalizing curr r with
+  | nil =>
+    dsimp [run_sstore_refund_trace]
+    have h_nonneg := (t_8038_sstore_refund_delta_potential false orig curr curr).2.2.1
+    exact ⟨h_inv, h_nonneg⟩
+  | cons step rest ih =>
+    cases step with
+    | sstore isCold newVal =>
+      dsimp [run_sstore_refund_trace]
+      have h_step := t_8038_sstore_refund_delta_potential isCold orig curr newVal
+      apply ih newVal (r + (price_sstore isCold orig curr newVal).refundDelta)
+      omega
+    | revertedChild _ =>
+      dsimp [run_sstore_refund_trace]
+      exact ih curr r h_inv
+
+theorem t_8038_refund_counter_telescope_trace_root_nonneg
+    (orig : Nat) (trace : List SstoreTraceStep) :
+    (run_sstore_refund_trace orig trace (orig, 0)).2 ≥ 0 := by
+  have h0 : (0 : Int) ≥ sstore_clear_potential orig orig := by
+    have h_eq := (t_8038_sstore_refund_delta_potential false orig orig orig).2.2.2
+    omega
+  have h_inv := t_8038_refund_counter_telescope_trace_inv orig trace orig 0 h0
+  omega
+
 /-! ## 6. Exact `set_delegation` Account-Creation Predicate (`vm/eoa_delegation.py:295`) and
     Relationship to `NoEmptyAccountLeaves` (`F-8037-7702-DELEGATION-ACCOUNT-EXISTS-VS-ALIVE`) -/
 

@@ -835,6 +835,36 @@ theorem t_calltree_eip12581_same_child_clear_tradeoff :
         some (91880, 97920, 97920) := by
   decide
 
+/-- Theorem 4h (`t_calltree_d13_eq_eip12581_on_gas_and_reservoir`):
+Formal correspondence between `ForkSchedule.amsterdamD13` and `ethereum/EIPs#12581` (`b86de3f4`,
+Option C):
+1. State-gas refills (`frame_credit_state_refund .amsterdamD13`) credit `stateGasLeft`
+   (`state_gas_reservoir`) exclusively and leave `gasLeft` and `stateGasSpilled` untouched.
+2. Child exit on `.success` (`exit_child_frame .amsterdamD13 _ _ .success`) merges `gasLeft`,
+   `stateGasLeft`, and `stateGasSpilled` without `repay_state_gas_spill`.
+3. Child exit on `.revert` and `.halt` (`exit_child_frame .amsterdamD13`) restores `stateGasLeft`
+   to `pWithheld.meter.stateGasLeft + c.meter.stateGasBaseline` (`reservoir_snapshot`) and never
+   returns `c.meter.stateGasSpilled` into `gasLeft`. -/
+theorem t_calltree_d13_eq_eip12581_on_gas_and_reservoir
+    (fm pWithheld c : CallFrameMeter) (amount : Nat) :
+    let refilled := frame_credit_state_refund .amsterdamD13 fm amount
+    let onSucc := exit_child_frame .amsterdamD13 pWithheld c .success
+    let onRev := exit_child_frame .amsterdamD13 pWithheld c .revert
+    let onHalt := exit_child_frame .amsterdamD13 pWithheld c .halt
+    (refilled.meter.gasLeft = fm.meter.gasLeft ∧
+      refilled.meter.stateGasLeft = fm.meter.stateGasLeft + amount ∧
+      refilled.meter.stateGasSpilled = fm.meter.stateGasSpilled) ∧
+    (onSucc.meter.gasLeft = pWithheld.meter.gasLeft + c.meter.gasLeft ∧
+      onSucc.meter.stateGasLeft = pWithheld.meter.stateGasLeft + c.meter.stateGasLeft ∧
+      onSucc.meter.stateGasSpilled = pWithheld.meter.stateGasSpilled + c.meter.stateGasSpilled) ∧
+    (onRev.meter.gasLeft = pWithheld.meter.gasLeft + c.meter.gasLeft ∧
+      onRev.meter.stateGasLeft = pWithheld.meter.stateGasLeft + c.meter.stateGasBaseline) ∧
+    (onHalt.meter.gasLeft = pWithheld.meter.gasLeft ∧
+      onHalt.meter.stateGasLeft = pWithheld.meter.stateGasLeft + c.meter.stateGasBaseline) := by
+  dsimp [frame_credit_state_refund, exit_child_frame, incorporate_child_meter,
+    forfeit_remaining_gas, restore_state_gas]
+  refine ⟨⟨rfl, rfl, rfl⟩, ⟨rfl, rfl, rfl⟩, ⟨rfl, rfl⟩, ⟨by omega, rfl⟩⟩
+
 /-! ## 4. C-ABI Exports for Multi-Frame Differential Testing (`tests/differential/test_glamsterdam_differential.py`) -/
 
 @[inline, export glamsterdam_calltree_m2_d0_silent_flip_cabi]
