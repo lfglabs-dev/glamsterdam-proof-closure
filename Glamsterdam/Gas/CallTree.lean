@@ -786,17 +786,19 @@ theorem t_calltree_d13s_post_merge_refund_stranded_symbolic
     dsimp only [exit_child_frame, repay_state_gas_spill_capped] at *
     omega
 
-/-- Theorem 4f (`t_calltree_d0_preserves_spill_invariant_and_d13s_violates`, bridging
-`GasMeter.SpillInvariant` with `EvmGasSemantics.Meter.Discipline` in
-`fradamt/evm-gas-semantics-lean/EvmGasSemantics/Theorems/Meter.lean:95` and
-`Theorems/MeterReach.lean:270, 545`):
+/-- Theorem 4f (`t_calltree_d0_preserves_spill_invariant_and_d13s_violates`, relating
+`GasMeter.SpillInvariant` to the identical `EvmGasSemantics.Meter.Discipline` predicate in
+`fradamt/evm-gas-semantics-lean/EvmGasSemantics/Theorems/Meter.lean` line 95 and
+`Theorems/MeterReach.lean` lines 270-279, 545):
 1. Under `amsterdamD0` and `amsterdamD13R`, `exit_child_frame` on `.success` unconditionally
    establishes `GasMeter.SpillInvariant` (`stateGasLeft = 0 ∨ stateGasSpilled = 0`) for any
-   `pWithheld` and `c`.
-2. Under `amsterdamD13S`, because `repay_state_gas_spill_capped` caps repayment by
-   `childExcess = c.stateGasLeft - c.stateGasBaseline`, reachable multi-frame states (such as
-   `run_t6_failed_create_trace .amsterdamD13S 1000000 0 false`) violate `GasMeter.SpillInvariant`
-   with `stateGasLeft = 183600 > 0` and `stateGasSpilled = 183600 > 0` simultaneously. -/
+   `pWithheld` and `c` (and under `amsterdamD0`, both LIFO `credit_state_gas_refund` and failed-child
+   merges preserve `SpillInvariant` throughout execution).
+2. Under `amsterdamD13S`, reservoir-only refills create mid-frame `stateGasLeft > 0 ∧ stateGasSpilled > 0`
+   states, and because `repay_state_gas_spill_capped` caps child-exit repayment by
+   `childExcess = c.stateGasLeft - c.stateGasBaseline`, even after a subsequent `.success` child exit
+   (`run_t6_failed_create_trace .amsterdamD13S 1000000 0 false`) `GasMeter.SpillInvariant` remains
+   violated with `stateGasLeft = 183600 > 0` and `stateGasSpilled = 183600 > 0` simultaneously. -/
 theorem t_calltree_d0_preserves_spill_invariant_and_d13s_violates
     (pWithheld c : CallFrameMeter) :
     (exit_child_frame .amsterdamD0 pWithheld c .success).meter.SpillInvariant ∧

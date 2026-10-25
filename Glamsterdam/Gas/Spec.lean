@@ -518,18 +518,19 @@ theorem t_8038_sstore_refund_delta_potential
     simp [h_orig, h_curr, h_new, h_cn, h_on] <;>
     omega
 
-/-- Theorem (`t_8038_refund_counter_telescope_nonneg`, bridging `EvmGasSemantics/Meter.lean:62`
-and `EvmGasSemantics/Rules/Setup.lean:60` in `fradamt/evm-gas-semantics-lean`):
+/-- Theorem (`t_8038_refund_counter_telescope_nonneg`, two-step lemma for
+`EvmGasSemantics/Meter.lean` line 62, `EvmGasSemantics/Rules/Setup.lean` line 60, and
+`EvmGasSemantics/Exec.lean` lines 170-174 in `fradamt/evm-gas-semantics-lean`, plus EELS
+`src/ethereum/forks/amsterdam/vm/gas.py:1168`):
 Starting from transaction entry where `currentValue = originalValue` and `refundCounter = 0`,
-any sequence of `SSTORE` transitions `orig -> v1 -> v2 -> ...` (together with reverting child
-frames whose `refundCounter` is zeroed by `restore_state_gas` while `restore_tx_state` restores the
-pre-child slot value) preserves the inductive invariant `refundCounter ≥ Φ(orig, curr) ≥ 0`.
+two consecutive `SSTORE` transitions `orig -> v1 -> v2` on a slot preserve
+`refundCounter ≥ Φ(orig, curr) ≥ 0` (generalized to arbitrary `List SstoreTraceStep` sequences
+with reverting child frames in `t_8038_refund_counter_telescope_trace_root_nonneg` below).
 In particular:
 1. A child frame entering at `curr = 0` (`orig ≠ 0`) and writing `0 -> 2` has negative local
-   `child.refundDelta = -11616 < 0`,
+   `child.refundDelta = -11616 < 0` (or `-1616 < 0` on `0 -> 1`),
 2. Yet when merged with the parent that performed `orig -> 0` (`parent.refundDelta = +11616`),
-   the combined transaction `refundCounter` is `0 ≥ Φ(orig, 2) = 0`, and if that child instead
-   reverts (`restore_state_gas`), the parent retains `+11616 = Φ(orig, 0) ≥ 0`. -/
+   the combined transaction `refundCounter` is `0 ≥ Φ(orig, 2) = 0` (or `10000 ≥ Φ(orig, 1) = 0`). -/
 theorem t_8038_refund_counter_telescope_nonneg
     (isCold1 isCold2 : Bool) (orig v1 v2 : Nat) (r0 : Int)
     (h_inv0 : r0 ≥ sstore_clear_potential orig orig) :
