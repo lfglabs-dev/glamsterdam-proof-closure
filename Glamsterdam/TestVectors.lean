@@ -8,6 +8,7 @@ import Glamsterdam.Common.MetaSpec
 import Glamsterdam.Common.ElCore
 import Glamsterdam.Eip8246.Spec
 import Glamsterdam.Gas.Spec
+import Glamsterdam.Gas.CallTree
 import Glamsterdam.Gloas7732.Spec
 
 /-!
@@ -29,6 +30,7 @@ open Glamsterdam.Common.MetaSpec
 open Glamsterdam.Common.ElCore
 open Glamsterdam.Eip8246.Spec
 open Glamsterdam.Gas.Spec
+open Glamsterdam.Gas.CallTree
 open Glamsterdam.Gloas7732.Spec
 
 /-! ## 1. `ElCore` State Tracker & `GasMeter` Test Vectors -/
@@ -248,6 +250,19 @@ theorem tv_gloas7732_builder_and_quorum_vectors :
     slashedList = [{}, p2] ∧
     traceWt = (true, 32000000000) ∧
     topupBal = 1500000000 := by
+  decide
+
+/-! ## 5. `Gas.CallTree` (`FV-CORE` Multi-Frame Call Tree & Refill Variants `D0..D13S`) Test Vectors -/
+
+/-- Test Vector 7: `exec_sstore_frame` (`2300` sentry excluding `stateGasLeft`), `enter_child_frame`,
+`exit_child_frame` across `D0`, `D13R`, and `D13S`, and `run_m4_sibling_delta_trace`. -/
+theorem tv_calltree_multi_frame_vectors :
+    let mSentryBlocked : CallFrameMeter := { meter := { gasLeft := 2300, stateGasLeft := 500000, stateGasBaseline := 500000 } }
+    exec_sstore_frame .amsterdamD0 mSentryBlocked false 0 0 1 = none ∧
+    run_m4_sibling_delta_trace .amsterdamD0 500000 20000 = some ⟨391980, 469800, true⟩ ∧
+    run_m4_sibling_delta_trace .amsterdamD13 500000 20000 = some ⟨391980, 371880, false⟩ ∧
+    run_m4_sibling_delta_trace .amsterdamD13R 500000 20000 = some ⟨391980, 469800, true⟩ ∧
+    run_m4_sibling_delta_trace .amsterdamD13S 500000 20000 = some ⟨391980, 469800, true⟩ := by
   decide
 
 end Glamsterdam.TestVectors

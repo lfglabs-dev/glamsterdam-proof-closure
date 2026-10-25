@@ -53,6 +53,10 @@ def ensure_shared_lib() -> ctypes.CDLL:
         ]
         subprocess.run(cmd, check=True)
     lib = ctypes.CDLL(str(SO_PATH))
+    lib.lean_initialize_runtime_module()
+    lib.initialize_glamsterdam_x2dproof_x2dclosure_Glamsterdam_TestVectors.argtypes = [ctypes.c_uint8]
+    lib.initialize_glamsterdam_x2dproof_x2dclosure_Glamsterdam_TestVectors.restype = ctypes.c_void_p
+    lib.initialize_glamsterdam_x2dproof_x2dclosure_Glamsterdam_TestVectors(1)
 
     # Configure signatures
     lib.glamsterdam_charge_gas_ok_cabi.argtypes = [ctypes.c_uint64] * 4
@@ -102,6 +106,23 @@ def ensure_shared_lib() -> ctypes.CDLL:
 
     lib.glamsterdam_eip7732_can_builder_exit_cabi.argtypes = [ctypes.c_uint64] * 2
     lib.glamsterdam_eip7732_can_builder_exit_cabi.restype = ctypes.c_uint8
+
+    lib.glamsterdam_calltree_m2_d0_silent_flip_cabi.argtypes = [ctypes.c_uint64] * 4
+    lib.glamsterdam_calltree_m2_d0_silent_flip_cabi.restype = ctypes.c_uint8
+
+    lib.glamsterdam_calltree_m3_d0_outer_ok_cabi.argtypes = [ctypes.c_uint64] * 4
+    lib.glamsterdam_calltree_m3_d0_outer_ok_cabi.restype = ctypes.c_uint8
+
+    lib.glamsterdam_calltree_m4_sibling_underflow_cabi.argtypes = [ctypes.c_uint64] * 3
+    lib.glamsterdam_calltree_m4_sibling_underflow_cabi.restype = ctypes.c_uint8
+
+    lib.glamsterdam_calltree_t6_midframe_gas_cabi.argtypes = [
+        ctypes.c_uint64,
+        ctypes.c_uint64,
+        ctypes.c_uint64,
+        ctypes.c_uint8,
+    ]
+    lib.glamsterdam_calltree_t6_midframe_gas_cabi.restype = ctypes.c_uint64
 
     return lib
 
@@ -674,12 +695,110 @@ def test_vendored_gloas_slashed_payment_resurrection_trace():
     ]
 
 
+def test_differential_calltree_multi_frame():
+    """
+    Executes multi-frame `M2`, `M3`, and `M4` cross-sibling delta traces using the vendored
+    `GasMeter`, `charge_gas_from_meter`, `charge_state_gas_from_meter`, `credit_state_gas_refund`,
+    `restore_state_gas`, and `repay_state_gas_spill` functions from `vm/gas.py` and compares
+    their outcomes against the Lean 4.31 C-ABI exports from `Glamsterdam/Gas/CallTree.lean`.
+    """
+    lib = ensure_shared_lib()
+    GasMeter = VENDORED_EL["GasMeter"]
+    charge_gas_from_meter = VENDORED_EL["charge_gas_from_meter"]
+    charge_state_gas_from_meter = VENDORED_EL["charge_state_gas_from_meter"]
+    credit_state_gas_refund = VENDORED_EL["credit_state_gas_refund"]
+    restore_state_gas = VENDORED_EL["restore_state_gas"]
+    repay_state_gas_spill = VENDORED_EL["repay_state_gas_spill"]
+
+    # 1. M2 Set-Call-Clear on Amsterdam D0 across entry gas grid
+    for entry_gas in (300_000, 450_000, 550_000, 750_000):
+        k = 3
+        child_need = 240_000
+        post_work = 50_000
+        parent = GasMeter(gas_left=entry_gas, state_gas_left=0, state_gas_baseline=0)
+        py_outer_ok = True
+        py_child_ok = False
+        try:
+            charge_gas_from_meter(parent, k * 10_100)
+            charge_state_gas_from_meter(parent, k * 97_920)
+            child_grant = int(parent.gas_left) - int(parent.gas_left) // 64
+            charge_gas_from_meter(parent, child_grant)
+            res = int(parent.state_gas_left)
+            parent.state_gas_left = 0
+            child = GasMeter(gas_left=child_grant, state_gas_left=res, state_gas_baseline=res)
+            try:
+                charge_gas_from_meter(child, child_need)
+                py_child_ok = True
+                parent.gas_left += child.gas_left
+                parent.state_gas_left += child.state_gas_left
+                parent.state_gas_spilled += child.state_gas_spilled
+                repay_state_gas_spill(parent)
+            except OutOfGasError:
+                py_child_ok = False
+                parent.state_gas_left += child.state_gas_baseline
+            charge_gas_from_meter(parent, k * 100)
+            credit_state_gas_refund(parent, k * 97_920)
+            charge_gas_from_meter(parent, post_work)
+        except OutOfGasError:
+            py_outer_ok = False
+        py_silent_flip = py_outer_ok and not py_child_ok
+        c_silent_flip = bool(
+            lib.glamsterdam_calltree_m2_d0_silent_flip_cabi(entry_gas, k, child_need, post_work)
+        )
+        assert c_silent_flip == py_silent_flip
+
+    # 2. M3 Revert-Restore on Amsterdam D0
+    for entry_gas in (250_000, 400_000, 600_000):
+        k = 3
+        child_exec = 60_000
+        catch_work = 50_000
+        parent = GasMeter(gas_left=entry_gas, state_gas_left=0, state_gas_baseline=0)
+        child_grant = int(parent.gas_left) - int(parent.gas_left) // 64
+        charge_gas_from_meter(parent, child_grant)
+        child = GasMeter(gas_left=child_grant, state_gas_left=0, state_gas_baseline=0)
+        try:
+            charge_gas_from_meter(child, k * 10_100 + child_exec)
+            charge_state_gas_from_meter(child, k * 97_920)
+            # Child reverts: restore_state_gas + incorporate_child
+            restore_state_gas(child)
+            parent.gas_left += child.gas_left
+            parent.state_gas_left += child.state_gas_left
+        except OutOfGasError:
+            parent.state_gas_left += child.state_gas_baseline
+        try:
+            charge_gas_from_meter(parent, catch_work)
+            py_outer_ok = True
+        except OutOfGasError:
+            py_outer_ok = False
+        c_outer_ok = bool(
+            lib.glamsterdam_calltree_m3_d0_outer_ok_cabi(entry_gas, k, child_exec, catch_work)
+        )
+        assert c_outer_ok == py_outer_ok
+
+    # 3. M4 Cross-Sibling Gas-Delta Underflow across D0 (1), D13 (5), D13R (6), D13S (7)
+    assert bool(lib.glamsterdam_calltree_m4_sibling_underflow_cabi(0, 500_000, 20_000)) is False
+    assert bool(lib.glamsterdam_calltree_m4_sibling_underflow_cabi(1, 500_000, 20_000)) is True
+    assert bool(lib.glamsterdam_calltree_m4_sibling_underflow_cabi(5, 500_000, 20_000)) is False
+    assert bool(lib.glamsterdam_calltree_m4_sibling_underflow_cabi(6, 500_000, 20_000)) is True
+    assert bool(lib.glamsterdam_calltree_m4_sibling_underflow_cabi(7, 500_000, 20_000)) is True
+
+    # 4. T6 Failed CREATE mid-frame vs top-exit across D0 (1), D13R (6), D13S (7)
+    assert int(lib.glamsterdam_calltree_t6_midframe_gas_cabi(1, 1_000_000, 0, 0)) == 987_900
+    assert int(lib.glamsterdam_calltree_t6_midframe_gas_cabi(6, 1_000_000, 0, 0)) == 987_900
+    assert int(lib.glamsterdam_calltree_t6_midframe_gas_cabi(7, 1_000_000, 0, 0)) == 804_300
+    assert int(lib.glamsterdam_calltree_t6_midframe_gas_cabi(7, 1_000_000, 0, 1)) == 987_900
+    assert int(lib.glamsterdam_calltree_t6_midframe_gas_cabi(1, 1_000_000, 850_000, 1)) == 137_900
+    assert int(lib.glamsterdam_calltree_t6_midframe_gas_cabi(6, 1_000_000, 850_000, 1)) == 137_900
+    assert int(lib.glamsterdam_calltree_t6_midframe_gas_cabi(7, 1_000_000, 850_000, 1)) == 0
+
+
 if __name__ == "__main__":
     test_differential_charge_gas()
     test_differential_allocate_and_settle_gas()
     test_differential_sstore_and_selfdestruct()
     test_differential_gloas7732()
     test_vendored_gloas_slashed_payment_resurrection_trace()
+    test_differential_calltree_multi_frame()
     print(
         "differential-tests ok: 100% agreement between Lean 4.31 C-ABI and vendored upstream specs."
     )

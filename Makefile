@@ -23,6 +23,7 @@ turbo-verify: prove
 		turbo-lean --json audit-spec Glamsterdam/Common/ElCore.lean; \
 		turbo-lean --json audit-spec Glamsterdam/Eip8246/Spec.lean; \
 		turbo-lean --json audit-spec Glamsterdam/Gas/Spec.lean; \
+		turbo-lean --json audit-spec Glamsterdam/Gas/CallTree.lean; \
 		turbo-lean --json audit-spec Glamsterdam/Gloas7732/Spec.lean; \
 		turbo-lean --json audit-spec Glamsterdam/TestVectors.lean; \
 	fi
