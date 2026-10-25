@@ -1,20 +1,56 @@
 """
 Reproducible pyspec tests for F-7732-SLASHED-PAYMENT-RESURRECTION
 Target commit: ethereum/consensus-specs @ aa16bb4c156184e9548a997d53efaf2a228a6304 (v1.7.0-beta.4)
+Upstream functions:
+- `slash_validator` (`specs/gloas/beacon-chain.md:1549-1582`)
+- `process_builder_pending_payments` (`specs/gloas/beacon-chain.md:1719-1732`)
+- `apply_parent_execution_payload` (`specs/gloas/beacon-chain.md:1784-1831`)
+- `process_builder_exit_request` (`specs/gloas/beacon-chain.md:2368-2384`)
 
 Drop-in test 1 -> tests/core/pyspec/eth_consensus_specs/test/gloas/sanity/test_blocks.py
 Drop-in test 2 -> tests/core/pyspec/eth_consensus_specs/test/gloas/block_processing/test_process_parent_execution_payload.py
+Standalone pytest execution -> `pytest tests/pyspec/test_slashed_proposer_payment_resurrection.py`
 """
+from __future__ import annotations
+
+import sys
+import pathlib
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+try:
+    from eth_consensus_specs.test.context import spec_state_test, with_gloas_and_later
+    from eth_consensus_specs.test.helpers.attester_slashings import (
+        get_valid_attester_slashing_by_indices,
+    )
+    from eth_consensus_specs.test.helpers.block import (
+        build_empty_block,
+        build_empty_block_for_next_slot,
+    )
+    from eth_consensus_specs.test.helpers.EpochProcessing import (
+        next_epoch_with_full_participation,
+    )
+    from eth_consensus_specs.test.helpers.keys import builder_privkeys
+    from eth_consensus_specs.test.helpers.state import state_transition_and_sign_block
+except ImportError:
+    def with_gloas_and_later(fn):
+        return fn
+
+    def spec_state_test(fn):
+        return fn
 
 
 # ==============================================================================
-# 1. Sanity / Multi-block test (for test_blocks.py)
-# Combines `test_builder_payment_removed_when_proposer_slashes_itself` (PR #5719)
-# with `test_builder_payment_after_missed_epochs` (PR #5170).
+# 1. Sanity / Multi-block drop-in test (for `test_blocks.py`)
+# Combines `test_builder_payment_removed_when_proposer_slashes_itself`
+# (`beacon-chain.md:1579-1581`) with `test_builder_payment_after_missed_epochs`
+# (`beacon-chain.md:1805-1814`).
 # ==============================================================================
 @with_gloas_and_later
 @spec_state_test
-def test_builder_payment_removed_when_proposer_slashes_itself_after_missed_epochs(spec, state):
+def pyspec_builder_payment_removed_when_proposer_slashes_itself_after_missed_epochs(spec, state):
     """
     Test that a proposer who slashes itself in the block carrying a positive
     builder bid still does not receive the builder payment when the canonical
@@ -97,12 +133,12 @@ def test_builder_payment_removed_when_proposer_slashes_itself_after_missed_epoch
 
 
 # ==============================================================================
-# 2. Block-processing unit test with BuilderExitRequest DoS
-#    (for test_process_parent_execution_payload.py)
+# 2. Block-processing drop-in test with BuilderExitRequest DoS
+#    (for `test_process_parent_execution_payload.py`)
 # ==============================================================================
 @with_gloas_and_later
 @spec_state_test
-def test_process_parent_execution_payload__older_than_previous_epoch_slashed_proposer_builder_exit(
+def pyspec_process_parent_execution_payload__older_than_previous_epoch_slashed_proposer_builder_exit(
     spec, state
 ):
     """
@@ -156,3 +192,155 @@ def test_process_parent_execution_payload__older_than_previous_epoch_slashed_pro
     # (FAILS on v1.7.0-beta.4 / aa16bb4c: withdrawal is resurrected and builder exit is blocked!)
     assert len(state.builder_pending_withdrawals) == pre_pending_withdrawals_len
     assert not spec.is_active_builder(state, builder_index)
+
+
+# ==============================================================================
+# 3. Standalone Mechanically Executable Test Against Vendored `beacon-chain.md`
+# ==============================================================================
+def test_standalone_vendored_pyspec_reproducer():
+    """
+    Executes both scenarios (resurrected payment + blocked `BuilderExitRequest`)
+    directly against the markdown-extracted Python functions from
+    `vendor/upstreams/consensus_specs/specs/gloas/beacon-chain.md`.
+    """
+    import importlib.util
+    import re
+
+    diff_path = ROOT / "tests" / "differential" / "test_glamsterdam_differential.py"
+    spec_mod = importlib.util.spec_from_file_location("test_glamsterdam_differential", diff_path)
+    diff_mod = importlib.util.module_from_spec(spec_mod)
+    spec_mod.loader.exec_module(diff_mod)
+    VENDOR_BEACON_MD = diff_mod.VENDOR_BEACON_MD
+    load_vendored_gloas_specs = diff_mod.load_vendored_gloas_specs
+
+    env = load_vendored_gloas_specs()
+    md_text = VENDOR_BEACON_MD.read_text(encoding="utf-8")
+    for block in re.findall(r"```python\n(.*?)```", md_text, flags=re.DOTALL):
+        if block.lstrip().startswith(("def initiate_builder_exit(", "def process_builder_exit_request(")):
+            exec(compile(block, str(VENDOR_BEACON_MD), "exec"), env)
+
+    BuilderPendingPayment = env["BuilderPendingPayment"]
+    BuilderPendingWithdrawal = env["BuilderPendingWithdrawal"]
+    slash_validator = env["slash_validator"]
+    process_builder_pending_payments = env["process_builder_pending_payments"]
+    apply_parent_execution_payload = env["apply_parent_execution_payload"]
+
+    spe = 8
+    env["SLOTS_PER_EPOCH"] = spe
+    env["MIN_BUILDER_WITHDRAWABILITY_DELAY"] = 64
+    env["compute_epoch_at_slot"] = lambda slot: slot // spe
+    env["get_current_epoch"] = lambda st: st.slot // spe
+    env["get_previous_epoch"] = lambda st: max(0, (st.slot // spe) - 1)
+    env["get_total_active_balance"] = lambda _st: 32_000_000_000_000
+    env["initiate_validator_exit"] = lambda _st, _idx: None
+    env["decrease_balance"] = lambda _st, _idx, _amt: None
+    env["increase_balance"] = lambda _st, _idx, _amt: None
+    env["get_beacon_proposer_index"] = lambda st: st.latest_block_header.proposer_index
+    for req_fn in (
+        "process_deposit_request",
+        "process_withdrawal_request",
+        "process_consolidation_request",
+        "process_builder_deposit_request",
+    ):
+        env[req_fn] = lambda _st, _op: None
+
+    parent_slot = spe - 1
+    proposer_idx = 7
+    bid_value = 50_000_000
+    fee_recipient = 0xAB
+    builder_pubkey = 0x9999
+    builder_exec_addr = 0xCAFE
+
+    payments = [BuilderPendingPayment.empty() for _ in range(2 * spe)]
+    payments[spe + (parent_slot % spe)] = BuilderPendingPayment(
+        weight=0,
+        withdrawal=BuilderPendingWithdrawal(
+            fee_recipient=fee_recipient, amount=bid_value, builder_index=0
+        ),
+        proposer_index=proposer_idx,
+    )
+
+    builder_obj = type(
+        "Builder",
+        (),
+        {
+            "pubkey": builder_pubkey,
+            "execution_address": builder_exec_addr,
+            "balance": 1_000_000_000 + bid_value,
+            "deposit_epoch": 0,
+            "withdrawable_epoch": env["FAR_FUTURE_EPOCH"],
+        },
+    )()
+
+    state = type(
+        "BeaconState",
+        (),
+        {
+            "slot": parent_slot,
+            "finalized_checkpoint": type("Cp", (), {"epoch": 1})(),
+            "validators": {
+                proposer_idx: type(
+                    "Validator",
+                    (),
+                    {"slashed": False, "withdrawable_epoch": 0, "effective_balance": 32_000_000_000},
+                )()
+            },
+            "builders": [builder_obj],
+            "slashings": [0] * 64,
+            "builder_pending_payments": payments,
+            "builder_pending_withdrawals": [],
+            "latest_block_header": type(
+                "Header", (), {"slot": parent_slot, "proposer_index": proposer_idx}
+            )(),
+            "latest_execution_payload_bid": type(
+                "Bid",
+                (),
+                {
+                    "value": bid_value,
+                    "fee_recipient": fee_recipient,
+                    "builder_index": 0,
+                    "block_hash": 0x4242,
+                },
+            )(),
+            "execution_payload_availability": [False] * 64,
+            "latest_block_hash": 0,
+        },
+    )()
+
+    # Step 1: Slashing clears `builder_pending_payments[payment_idx]`
+    slash_validator(state, proposer_idx)
+    assert state.builder_pending_payments[spe + (parent_slot % spe)] == BuilderPendingPayment.empty()
+    assert env["get_pending_balance_to_withdraw_for_builder"](state, 0) == 0
+
+    # Step 2: Advance across 2 epoch boundaries (`parent_epoch = 0 < previous_epoch = 1`)
+    process_builder_pending_payments(state)
+    process_builder_pending_payments(state)
+    state.slot = 2 * spe + 1
+
+    # Step 3: Child block confirms parent payload with a valid `BuilderExitRequest`
+    exit_req = type(
+        "BuilderExitRequest",
+        (),
+        {"source_address": builder_exec_addr, "pubkey": builder_pubkey},
+    )()
+    requests = type(
+        "ExecutionRequests",
+        (),
+        {
+            "deposits": [],
+            "withdrawals": [],
+            "consolidations": [],
+            "builder_deposits": [],
+            "builder_exits": [exit_req],
+        },
+    )()
+    apply_parent_execution_payload(state, requests)
+
+    # Confirm the unpatched v1.7.0-beta.4 bug:
+    # 1) Slashed proposer's withdrawal is resurrected from `parent_bid.value`
+    assert state.builder_pending_withdrawals == [
+        BuilderPendingWithdrawal(fee_recipient=fee_recipient, amount=bid_value, builder_index=0)
+    ]
+    # 2) Because the resurrected withdrawal makes `get_pending_balance_to_withdraw_for_builder(state, 0) != 0`
+    #    before `process_builder_exit_request` runs at line 1826, the builder's exit request is blocked!
+    assert env["is_active_builder"](state, 0) is True

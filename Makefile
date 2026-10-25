@@ -11,7 +11,8 @@ bootstrap:
 
 prove:
 	@lake build
-	@printf '%s\n' 'prove ok: Common EL core, Eip8246, Gas (8037/8038/2780/7778), Gloas7732 (+8282), and TestVectors compiled with 0 sorryAx'
+	@python3 scripts/audit_metadata.py
+	@printf '%s\n' 'prove ok: Common EL core, Eip8246, Gas (8037/8038/2780/7778), Gloas7732 (+8282), and TestVectors compiled with 0 sorryAx, 0 axiom, 0 native_decide'
 
 turbo-verify: prove
 	@turbo-lean --json ci-verify --project-dir . --mode trusted --receipt .lake/turbo-receipt.json
@@ -28,9 +29,12 @@ turbo-verify: prove
 
 diff-test: prove
 	@python3 tests/differential/test_glamsterdam_differential.py
+	@pytest tests/ -v
 
 audit-check:
 	@python3 scripts/audit_metadata.py
+	@python3 scripts/verify_ground_truth.py --self-test
+	@python3 scripts/verify_ground_truth.py --enforce-ledger-step all
 
 check: prove turbo-verify diff-test audit-check
-	@printf '%s\n' 'check ok: all Glamsterdam Lean 4.31 proofs, turbo-lean gates, C-ABI differential tests, and audit metadata verified'
+	@printf '%s\n' 'check ok: all Glamsterdam Lean 4.31 proofs, turbo-lean gates, C-ABI differential tests, and ground-truth audit metadata verified'

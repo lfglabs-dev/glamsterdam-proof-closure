@@ -1,0 +1,92 @@
+schema_version: 1
+description: "Locked Step 1 Forensic Remediation Ledger for Steps 2-6 of glamsterdam-proof-closure"
+items:
+  - id: "M1-STATE-TRACKER-MODIFY-STATE"
+    step: "step2"
+    target_file: "Glamsterdam/Common/ElCore.lean"
+    upstream_file: "execution_specs/src/ethereum/forks/amsterdam/state_tracker.py"
+    upstream_lines: "606-729"
+    required_symbols:
+      - "modify_state"
+      - "set_account_balance_tx"
+      - "move_ether_tx"
+      - "create_ether"
+      - "increment_nonce"
+      - "set_code"
+      - "no_empty_account_leaves_preserved"
+    forbidden_symbols:
+      - "set_account_balance_zero_creates_empty_leaf"
+    description: "Fix state_tracker.py line citations (move_ether:606-638, create_ether:640-660, set_account_balance:663-684, increment_nonce:686-703, set_code:705-729), make set_account_balance_tx and set_code route through modify_state, remove set_account_balance_zero_creates_empty_leaf, and prove NoEmptyAccountLeaves preservation across all state_tracker mutators."
+
+  - id: "M2-SYS-TX-RESERVOIR-SEMANTICS"
+    step: "step2"
+    target_file: "Glamsterdam/Gas/Spec.lean"
+    upstream_file: "execution_specs/src/ethereum/forks/amsterdam/fork.py"
+    upstream_lines: "100-114,724-780"
+    required_symbols:
+      - "SYSTEM_TRANSACTION_GAS"
+      - "SYSTEM_MAX_SSTORES_PER_CALL"
+    forbidden_symbols:
+      - "SYS_TX_GAS_LIMIT"
+      - "sys_tx_initial_meter_v16898000"
+      - "f_8037_sys_tx_gas_limit_invariant_refuter"
+    description: "Remove hallucinated Finding 2.5 (SYS_TX_GAS_LIMIT / state_gas_left = 0) and model exact system-transaction gas parameters from fork.py:107-108, 756-761 (SYSTEM_TRANSACTION_GAS = 30,000,000, state_gas_reservoir = STORAGE_SET * SYSTEM_MAX_SSTORES_PER_CALL = 1,566,720)."
+
+  - id: "M3-DELEGATION-CREATE-EVM-ORDERING"
+    step: "step2"
+    target_file: "Glamsterdam/Gas/Spec.lean"
+    upstream_file: "execution_specs/src/ethereum/forks/amsterdam/vm/interpreter.py"
+    upstream_lines: "133-196,235-288"
+    required_symbols:
+      - "create_evm_delegation_v16898000"
+      - "top_level_delegation_v16898000"
+      - "f_2780_7928_set_delegation_oog_omits_recipient_refuter"
+    forbidden_symbols: []
+    description: "Map create_evm_delegation_v16898000 and top_level_delegation_v16898000 to create_evm (interpreter.py:133-196) and process_top_level (interpreter.py:235-288) with exact identifiers (tx_env, ExceptionalHalt, set_delegation(block_env, tx_env, gas_meter))."
+
+  - id: "M4-GLOAS-FIRST-PRINCIPLES-AND-SLASH-VALIDATOR"
+    step: "step4"
+    target_file: "Glamsterdam/Gloas7732/Spec.lean"
+    upstream_file: "consensus_specs/specs/gloas/beacon-chain.md"
+    upstream_lines: "1168-1228,1538-1582,1719-1854,1997-2007,2231-2500"
+    required_symbols:
+      - "t_7732_no_eth_minting"
+      - "t_7732_single_settlement"
+      - "t_7732_payment_guarantee"
+      - "t_7732_quorum_no_double_count"
+      - "t_7732_quorum_weight_unconditional"
+      - "t_7732_same_slot_unbundling"
+      - "t_7732_frame"
+    forbidden_symbols:
+      - "slash_pending_payment_v170_beta4_buggy"
+      - "f_7732_earlier_slot_proposer_slashing_refuter"
+    description: "Remove Finding 1.5, transcribe slash_validator loop over builder_pending_payments faithfully, reconcile fork.md:115-117 vs beacon-chain.md:2336 deposit credential check, and prove Potuz's 3 core properties (No ETH Minting / Supply Neutrality, Proposer Payment Guarantee, Same-Slot Unbundling Resistance) + Frame Theorem."
+
+  - id: "M5-READ-TRACKING-PROJECTION-BOUNDARY"
+    step: "step2"
+    target_file: "Glamsterdam/Common/ElCore.lean"
+    upstream_file: "execution_specs/src/ethereum/forks/amsterdam/state_tracker.py"
+    upstream_lines: "103-314"
+    required_symbols:
+      - "get_pre_state_account_optional"
+      - "get_account_optional"
+      - "get_storage"
+      - "read_account_tx"
+      - "read_storage_tx"
+    forbidden_symbols: []
+    description: "Provide stateful read-tracking transitions (read_account_tx, read_storage_tx) that record accountReads/storageReads alongside the pure value-lookup projections, and mark projection vs exact in source-map.yaml."
+
+  - id: "M6-EIP8246-BAL-FULL-SLICE"
+    step: "step3"
+    target_file: "Glamsterdam/Eip8246/Spec.lean"
+    upstream_file: "execution_specs/src/ethereum/forks/amsterdam/block_access_lists.py"
+    upstream_lines: "760-825"
+    required_symbols:
+      - "t_8246_balance_preserved"
+      - "t_8246_selfdestruct_conservation"
+      - "t_8246_no_state_gas_refund"
+      - "t_8246_bal_patched_sound"
+      - "t_8246_storage_clears_recorded_in_bal"
+      - "f_8246_bal_storage_clears_ignored_refuter"
+    forbidden_symbols: []
+    description: "Verify Eip8246/Spec.lean against full update_builder_from_tx slice (block_access_lists.py:760-825) and selfdestruct (system.py:706-779), and prove t_8246_storage_clears_recorded_in_bal."

@@ -6,6 +6,9 @@ assumptions:
   - id: "A-CRYPTO-PRIMITIVES"
     domain: "All"
     description: "Keccak-256, SHA-256, secp256k1 ECDSA, and BLS12-381 signature/hash primitives behave as collision-resistant mathematical functions."
+  - id: "A-SAME-SLOT-UNBUNDLING-BOUNDARY"
+    domain: "Gloas EIP-7732"
+    description: "For same-slot unbundling resistance (t_7732_same_slot_unbundling): (1) a private transaction txPriv is known only to the builder of slot N prior to payload envelope reveal, (2) there is no competing consensus block at slot N prior to the attestation deadline other than the block committing to bid.block_hash via process_execution_payload_bid, and (3) ExecutionPayload.block_hash is collision-resistant."
 exclusions:
   - id: "X-GLOAS-FORK-CHOICE"
     domain: "Gloas EIP-7732"

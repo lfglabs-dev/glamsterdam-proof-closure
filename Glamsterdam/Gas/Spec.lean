@@ -324,7 +324,7 @@ def check_block_gas_capacity
     decide (txGas ≤ stateGasAvailable) &&
     decide (txBlobGas ≤ blobGasAvailable)
 
-/-- Exact `settle_transaction_gas` (`el_vm_gas.py:1163-1228` @ `16898000`):
+/-- Exact `settle_transaction_gas` (`vm/gas.py:1163-1228` @ `16898000`):
 - Sender/receipt `gas_used` applies the `1/5` refund cap (`min(gas_used_before_refund / 5, refund_counter)`)
   and `calldata_floor`.
 - Block `execution_gas_used` (`EIP-7778`) ignores `refund_counter` and takes
@@ -365,7 +365,7 @@ theorem t_7778_8037_dual_cap (txGas floor gasLeft stateGasLeft r1 r2 stateGasUse
   dsimp only [settle_transaction_gas]
   refine ⟨?_, ?_, rfl⟩ <;> omega
 
-/-- T-8038-2780-WARM-COLD: Pinned warm/cold access and write gas bounds (`el_vm_gas.py:47-90`). -/
+/-- T-8038-2780-WARM-COLD: Pinned warm/cold access and write gas bounds (`vm/gas.py:47-90`). -/
 theorem t_8038_2780_warm_cold_bounds :
     GAS_WARM_ACCESS < GAS_COLD_STORAGE_ACCESS ∧
     GAS_COLD_STORAGE_ACCESS < GAS_COLD_ACCOUNT_ACCESS ∧
@@ -386,7 +386,7 @@ structure SstorePricing where
   stateGasRefundCredited : Nat
   deriving Repr, DecidableEq, BEq
 
-/-- Exact `sstore` pricing (`vm/instructions/storage.py:88-157`):
+/-- Exact `sstore` pricing (`vm/instructions/storage.py:68-162`):
 - `accessCost = 2100` if cold else `100`.
 - `writeCost = 10000` (`STORAGE_WRITE`) if `originalValue == currentValue && currentValue != newValue` else `0`.
 - `refundDelta`:
@@ -479,8 +479,8 @@ def f_8038_7778_sstore_reset_refuter :
   killWitness := 15000
   mutant_refuted := by decide
 
-/-! ## 6. Exact `set_delegation` Account-Creation Predicate (`eoa_delegation.py:295`) and
-    Refuter for `F-8037-7702-DELEGATION-ACCOUNT-EXISTS-VS-ALIVE` -/
+/-! ## 6. Exact `set_delegation` Account-Creation Predicate (`vm/eoa_delegation.py:295`) and
+    Relationship to `NoEmptyAccountLeaves` (`F-8037-7702-DELEGATION-ACCOUNT-EXISTS-VS-ALIVE`) -/
 
 /-- Unpatched `set_delegation` (`vm/eoa_delegation.py:295` @ `16898000`):
 Charges `StateGasCosts.NEW_ACCOUNT` (`183,600`) iff `not account_exists(tx_state, authority)`. -/
@@ -492,10 +492,21 @@ charging sites (`call`, `generic_create`, `selfdestruct`, `charge_value_transfer
 def set_delegation_charges_new_account_alive (txState : TransactionState) (authority : Address) : Bool :=
   !is_account_alive txState authority
 
+/-- Theorem: On every `TransactionState` satisfying `NoEmptyAccountLeaves` (which is preserved by all
+`state_tracker.py` mutators via `no_empty_account_leaves_preserved`), `set_delegation_charges_new_account_v16898000`
+and `set_delegation_charges_new_account_alive` are observationally identical. -/
+theorem t_8037_7702_delegation_exists_eq_alive_under_invariant
+    (txState : TransactionState) (authority : Address)
+    (h_wf : NoEmptyAccountLeaves txState authority) :
+    set_delegation_charges_new_account_v16898000 txState authority =
+      set_delegation_charges_new_account_alive txState authority := by
+  dsimp only [set_delegation_charges_new_account_v16898000, set_delegation_charges_new_account_alive]
+  rw [account_exists_iff_alive_of_no_empty_leaves txState authority h_wf]
+
 /-- Explicit `WitnessRefuter` for `F-8037-7702-DELEGATION-ACCOUNT-EXISTS-VS-ALIVE`:
-When `authority` is present in `PreState` as `EMPTY_ACCOUNT` (`Some EMPTY_ACCOUNT`),
-`account_exists` returns `true` (skipping `NEW_ACCOUNT` state gas in `set_delegation`),
-whereas `is_account_alive` returns `false`. -/
+Only when `authority` is present in `PreState` as an unpruned `EMPTY_ACCOUNT` leaf (violating
+`NoEmptyAccountLeaves`, e.g. in a synthetic EEST fixture) does `account_exists` return `true`
+while `is_account_alive` returns `false`. -/
 def f_8037_7702_delegation_exists_vs_alive_refuter :
     WitnessRefuter (TransactionState × Address) Bool
       (fun ⟨st, auth⟩ charged => charged = !is_account_alive st auth) where
@@ -508,61 +519,104 @@ def f_8037_7702_delegation_exists_vs_alive_refuter :
   )
   mutant_refuted := by decide
 
-/-! ## 7. Formalization of Findings `F-8037-SYS-TX-GAS-LIMIT-INVARIANT` (2.5) and
-    `F-2780-7928-SET-DELEGATION-OOG-OMITS-RECIPIENT-READ` (2.6) -/
+/-! ## 7. System-Transaction Gas & Reservoir Transcription (`fork.py:100-114, 724-780`) and
+    Top-Level `create_evm` Delegation Ordering (`vm/interpreter.py:159-196, 261-285`) -/
 
-/-- `process_unchecked_system_transaction` (`fork.py:749-755` @ `16898000`):
-Passes `SYS_TX_GAS_LIMIT = 30,000,000` directly into `GasMeter(gas_left=tx_gas_limit, state_gas_left=0)`,
-bypassing `allocate_evm_gas` (which caps `execution_gas` at `TX_MAX_GAS_LIMIT = 16,777,216` and places
-the remainder in `state_gas_reservoir`). -/
-def SYS_TX_GAS_LIMIT : Nat := 30000000
+/-- Exact `SYSTEM_TRANSACTION_GAS` (`fork.py:107` @ `16898000`): `ExecutionGas(Uint(30000000))`. -/
+def SYSTEM_TRANSACTION_GAS : Nat := 30000000
 
-def sys_tx_initial_meter_v16898000 : GasMeter :=
-  { gasLeft := SYS_TX_GAS_LIMIT, stateGasLeft := 0, stateGasBaseline := 0 }
+/-- Exact `SYSTEM_MAX_SSTORES_PER_CALL` (`fork.py:108` @ `16898000`): `Uint(16)`. -/
+def SYSTEM_MAX_SSTORES_PER_CALL : Nat := 16
 
-def sys_tx_initial_meter_allocated : GasMeter :=
-  let alloc := allocate_evm_gas SYS_TX_GAS_LIMIT ⟨0, 0⟩
-  { gasLeft := alloc.executionGas
-    stateGasLeft := alloc.stateGasReservoir
-    stateGasBaseline := alloc.stateGasReservoir }
+/-- Exact `state_gas_reservoir` configured by `process_unchecked_system_transaction`
+(`fork.py:759-761` @ `16898000`):
+`StateGas(StateGasCosts.STORAGE_SET * SYSTEM_MAX_SSTORES_PER_CALL) = 97920 * 16 = 1,566,720`. -/
+def SYSTEM_TRANSACTION_STATE_GAS_RESERVOIR : Nat :=
+  STATE_GAS_STORAGE_SET * SYSTEM_MAX_SSTORES_PER_CALL
 
-def f_8037_sys_tx_gas_limit_invariant_refuter :
-    WitnessRefuter Unit GasMeter
-      (fun _ m => m.gasLeft ≤ TX_MAX_GAS_LIMIT ∧ m.gasLeft + m.stateGasLeft = SYS_TX_GAS_LIMIT) where
-  reference := fun _ => sys_tx_initial_meter_allocated
-  mutant := fun _ => sys_tx_initial_meter_v16898000
-  ref_sound := fun _ => by decide
-  killWitness := ()
-  mutant_refuted := by decide
+/-- Exact initial `GasMeter` constructed by `process_top_level` (`vm/interpreter.py:261-265`) when
+invoked from `process_unchecked_system_transaction` (`fork.py:750-774` @ `16898000`). -/
+def process_unchecked_system_transaction_meter : GasMeter :=
+  { gasLeft := SYSTEM_TRANSACTION_GAS
+    stateGasLeft := SYSTEM_TRANSACTION_STATE_GAS_RESERVOIR
+    stateGasBaseline := SYSTEM_TRANSACTION_STATE_GAS_RESERVOIR }
 
-/-- Stateful `SpecM` model of top-level `set_delegation` + recipient cold-access ordering
-(`vm/interpreter.py:258-277` @ `16898000`):
-- In `v16898000`, `set_delegation` charges `NEW_ACCOUNT` state gas (`183,600`) at line 259 BEFORE
-  `get_account(tx_state, message.current_target)` is called at line 277!
-- When `set_delegation` raises `OutOfGasError` (`SpecM.throw`), `process_top_level` returns the
-  exception while `incorporate_tx_into_block` still commits `txState.accountReads` into the BAL,
-  so `recipient` is missing from `accountReads` despite `3,000` `COLD_ACCOUNT_ACCESS` having been
-  paid upfront in `calculate_intrinsic_cost`. -/
+/-- Theorem (`t_8037_sys_tx_reservoir_sound`, `fork.py:107-108, 756-761`):
+`process_unchecked_system_transaction` provisions `execution_gas_grant = 30,000,000` and
+`state_gas_reservoir = 1,566,720` (`16 * STATE_GAS_STORAGE_SET`), satisfying `GasMeter.SpillInvariant`
+and covering up to `16` new storage slot writes (`k ≤ SYSTEM_MAX_SSTORES_PER_CALL`) purely from
+`stateGasLeft` with `stateGasSpilled = 0`. -/
+theorem t_8037_sys_tx_reservoir_sound (k : Nat) (h_k : k ≤ SYSTEM_MAX_SSTORES_PER_CALL) :
+    process_unchecked_system_transaction_meter.gasLeft = 30000000 ∧
+    process_unchecked_system_transaction_meter.stateGasLeft = 1566720 ∧
+    process_unchecked_system_transaction_meter.SpillInvariant ∧
+    ∃ post,
+      charge_state_gas_from_meter process_unchecked_system_transaction_meter (k * STATE_GAS_STORAGE_SET) =
+        some post ∧
+      post.gasLeft = SYSTEM_TRANSACTION_GAS ∧
+      post.stateGasSpilled = 0 := by
+  refine ⟨rfl, rfl, Or.inr rfl, ?_⟩
+  have h_le : k * STATE_GAS_STORAGE_SET ≤ process_unchecked_system_transaction_meter.stateGasLeft := by
+    dsimp [process_unchecked_system_transaction_meter, SYSTEM_TRANSACTION_STATE_GAS_RESERVOIR,
+      SYSTEM_MAX_SSTORES_PER_CALL, STATE_GAS_STORAGE_SET, STATE_BYTES_PER_STORAGE_SET,
+      COST_PER_STATE_BYTE] at *
+    omega
+  refine ⟨{ process_unchecked_system_transaction_meter with
+              stateGasLeft := process_unchecked_system_transaction_meter.stateGasLeft - k * STATE_GAS_STORAGE_SET },
+          ?_, rfl, rfl⟩
+  unfold charge_state_gas_from_meter
+  simp [h_le]
+
+/-- Validated projection (`mapping_kind: projection`) of `create_evm` (`vm/interpreter.py:133-196`)
+invoked inside `process_top_level` (`vm/interpreter.py:235-288` @ `16898000`), isolating the
+ordering between EIP-7702 delegation state-gas charging and recipient account reading:
+- In `create_evm` (`vm/interpreter.py:160-163`), `set_delegation(block_env, tx_env, gas_meter)`
+  executes at line 161 BEFORE `resolve_delegated_code_address` and `get_account(tx_env.state, code_address)`
+  read `tx_env.recipient` at lines 189-196!
+- When `set_delegation` raises `OutOfGasError` (`ExceptionalHalt`), `process_top_level` catches
+  `ExceptionalHalt` at line 270 and calls `restore_tx_state(tx_env.state, prep_snapshot)` (which
+  preserves `tx_env.state.account_reads`), `restore_state_gas_to_entry`, and `forfeit_remaining_gas`,
+  returning before lines 189-196 are ever reached.
+- Because `incorporate_tx_into_block` (`fork.py:711-719`) subsequently merges `tx_env.state.account_reads`
+  into the Block Access List (`EIP-7928`), `tx_env.recipient` is omitted from `account_reads` even
+  though `GasCosts.COLD_ACCOUNT_ACCESS` (`3,000`) was charged upfront in `calculate_intrinsic_cost`. -/
 structure TopLevelDelegationState where
   meter : GasMeter
   accountReads : List Address
   deriving Repr, DecidableEq, BEq
 
-def top_level_delegation_v16898000 (authority recipient : Address) (newAccountCharge : Nat) :
+/-- Validated projection of `create_evm` delegation and recipient resolution ordering (`vm/interpreter.py:133-196`). -/
+def create_evm_delegation_v16898000 (authority recipient : Address) (newAccountCharge : Nat) :
     SpecM TopLevelDelegationState Unit Unit :=
   fun s =>
     let s1 := { s with accountReads := authority :: s.accountReads }
     match charge_state_gas_from_meter s1.meter newAccountCharge with
     | none => .err () s1
-    | some m' => .ok () { meter := m', accountReads := recipient :: s1.accountReads }
+    | some m' =>
+      let mCommitted := commit_state_gas m'
+      .ok () { meter := mCommitted, accountReads := recipient :: s1.accountReads }
+
+/-- Validated projection of `process_top_level` catching `ExceptionalHalt` from `create_evm` (`vm/interpreter.py:235-288`):
+rolls back state gas via `restore_state_gas_to_entry` and `forfeit_remaining_gas` while preserving
+accumulated `accountReads` from `restore_tx_state`. -/
+def top_level_delegation_v16898000 (authority recipient : Address) (newAccountCharge : Nat) :
+    SpecM TopLevelDelegationState Unit Unit :=
+  fun s =>
+    match create_evm_delegation_v16898000 authority recipient newAccountCharge s with
+    | .ok () sOk => .ok () sOk
+    | .err () sErr =>
+      let mHalted := forfeit_remaining_gas (restore_state_gas_to_entry sErr.meter s.meter.stateGasBaseline)
+      .err () { sErr with meter := mHalted }
 
 def top_level_delegation_patched (authority recipient : Address) (newAccountCharge : Nat) :
     SpecM TopLevelDelegationState Unit Unit :=
   fun s =>
-    let s1 := { s with accountReads := recipient :: authority :: s.accountReads }
-    match charge_state_gas_from_meter s1.meter newAccountCharge with
-    | none => .err () s1
-    | some m' => .ok () { s1 with meter := m' }
+    let s0 := { s with accountReads := recipient :: s.accountReads }
+    match create_evm_delegation_v16898000 authority recipient newAccountCharge s0 with
+    | .ok () sOk => .ok () sOk
+    | .err () sErr =>
+      let mHalted := forfeit_remaining_gas (restore_state_gas_to_entry sErr.meter s.meter.stateGasBaseline)
+      .err () { sErr with meter := mHalted }
 
 def f_2780_7928_set_delegation_oog_omits_recipient_refuter :
     WitnessRefuter (TopLevelDelegationState × Address × Address × Nat) (Result Unit TopLevelDelegationState Unit)
@@ -573,20 +627,20 @@ def f_2780_7928_set_delegation_oog_omits_recipient_refuter :
   mutant := fun ⟨s0, auth, recp, chg⟩ => top_level_delegation_v16898000 auth recp chg s0
   ref_sound := by
     intro ⟨s0, auth, recp, chg⟩
-    dsimp only [top_level_delegation_patched]
+    dsimp only [top_level_delegation_patched, create_evm_delegation_v16898000]
     cases hc : charge_state_gas_from_meter s0.meter chg with
     | none =>
       dsimp only [charge_state_gas_from_meter] at hc
       split at hc <;> (try split at hc) <;> try contradiction
-      simp only [Result.state, List.contains_cons, beq_self_eq_true, Bool.true_or, Result.isErr,
-        true_iff, true_and]
+      simp only [Result.state, List.contains_cons, beq_self_eq_true, Bool.or_true, Bool.true_or,
+        Result.isErr, true_iff, true_and]
       omega
     | some m' =>
       dsimp only [charge_state_gas_from_meter] at hc
       split at hc <;> (try split at hc) <;> try contradiction
       all_goals
-        simp only [Result.state, List.contains_cons, beq_self_eq_true, Bool.true_or, Result.isErr,
-          Bool.false_eq_true, false_iff, true_and]
+        simp only [Result.state, List.contains_cons, beq_self_eq_true, Bool.or_true, Bool.true_or,
+          Result.isErr, Bool.false_eq_true, false_iff, true_and]
         omega
   killWitness := (
     { meter := { gasLeft := 10000, stateGasLeft := 0, stateGasBaseline := 0 }, accountReads := [] },

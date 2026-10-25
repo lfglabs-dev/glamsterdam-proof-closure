@@ -230,12 +230,23 @@ theorem tv_gloas7732_builder_and_quorum_vectors :
       currentBalance := 1000000000
       depositAmount := 500000000
     }
+    let lifecycleSame := settle_slot_bid_lifecycle 0xaa 5000000 0 7 600000000000 quorum .confirmedSameEpoch
+    let lifecycleNext := settle_slot_bid_lifecycle 0xaa 5000000 0 7 0 quorum .confirmedNextEpoch
+    let lifecycleTwo := settle_slot_bid_lifecycle 0xaa 5000000 0 7 0 quorum .confirmedAfterTwoEpochs
+    let slashedList := slash_validator_pending_payments 7 [p1, p2]
+    let traceWt := accrue_attester_weight_trace false 0 32000000000 [true, true, false, true]
+    PAYLOAD_BUILDER_VERSION = 0 ∧
     quorum = 600000000000 ∧
     can_builder_cover_bid 2000000000 500000000 500000000 = true ∧
     can_builder_cover_bid 2000000000 500000000 500000001 = false ∧
     clearedP1 = {} ∧
     directSettled = [⟨0xaa, 5000000, 0⟩] ∧
     settled = [⟨0xaa, 5000000, 0⟩] ∧
+    lifecycleSame = [⟨0xaa, 5000000, 0⟩] ∧
+    lifecycleNext = [⟨0xaa, 5000000, 0⟩] ∧
+    lifecycleTwo = [⟨0xaa, 5000000, 0⟩] ∧
+    slashedList = [{}, p2] ∧
+    traceWt = (true, 32000000000) ∧
     topupBal = 1500000000 := by
   decide
 

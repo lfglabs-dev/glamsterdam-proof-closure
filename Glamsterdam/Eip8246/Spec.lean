@@ -27,7 +27,8 @@ open Glamsterdam.Common.Prelude
 open Glamsterdam.Common.MetaSpec
 open Glamsterdam.Common.ElCore
 
-/-! ## 1. Core `clear_account_preserving_balance` Theorems on `WorldSnapshot` and `TransactionState` -/
+/-! ## 1. Core `clear_account_preserving_balance` Theorems on `WorldSnapshot` (Single-Account Projection)
+    and `TransactionState` (Multi-Account State Tracker) -/
 
 /-- T-8246-BALANCE-PRESERVED: `clear_account_preserving_balance` never modifies
 the target account's balance or recipient balance, regardless of whether the
@@ -90,14 +91,14 @@ structure SelfdestructOutcome where
   scheduledForClear : Bool
   deriving Repr, DecidableEq, BEq
 
-/-- Exact `selfdestruct` step (`vm/instructions/system.py:725-775`):
+/-- Validated projection of the `selfdestruct` opcode step (`vm/instructions/system.py:706-779`):
 - Charges `5000` (`OPCODE_SELFDESTRUCT_BASE`) + `3000` (`COLD_ACCOUNT_ACCESS` if cold)
   + (`9000` `ACCOUNT_WRITE` + `183,600` `NEW_ACCOUNT` state gas if `!beneficiaryAlive && originatorBalance != 0`).
 - Calls `move_ether(tx_state, originator, beneficiary, originator_balance)`:
   - If `originator == beneficiary`, `reduce_sender_balance` then `increase_recipient_balance` on the same
-    address leaves `originatorBalance` intact!
+    address leaves `originatorBalance` intact (`postOriginatorBalance = postBeneficiaryBalance = originatorBalance`)!
   - If `originator != beneficiary`, `originator` becomes `0` and `beneficiary` gains `originatorBalance`.
-- Adds `originator` to `accounts_to_delete` iff `originatorCreatedInTx`. -/
+- Adds `originator` to `accounts_to_delete` iff `originatorCreatedInTx` (`originator in tx_state.created_accounts`). -/
 def exec_selfdestruct (s : SelfdestructStep) : SelfdestructOutcome :=
   let baseGas := 5000 + (if s.beneficiaryCold then 3000 else 0)
   let createsBeneficiary := !s.beneficiaryAlive && decide (s.originatorBalance ≠ 0)
@@ -306,8 +307,9 @@ structure BalSlotClearState where
   txStorageCleared : Bool
   deriving Repr, DecidableEq, BEq
 
-/-- Unpatched `update_builder_from_tx` (`block_access_lists.py:813-825` @ `16898000`):
-Only iterates over `tx_state.storage_writes` and completely ignores `tx_state.storage_clears`
+/-- Validated projection (`mapping_kind: projection`) of `update_builder_from_tx`
+(`block_access_lists.py:760-825` @ `16898000`):
+Only iterates over `tx_state.storage_writes` (`lines 813-825`) and completely ignores `tx_state.storage_clears`
 (populated by `destroy_storage` in `clear_account_preserving_balance`, `destroy_account`,
 and `process_create`)! -/
 def bal_recorded_post_val_buggy (s : BalSlotClearState) : Option Nat :=
@@ -423,17 +425,71 @@ theorem t_8246_bal_tx_block_state_desync (pre : PreState) (addr : Address) (slot
     tx2.storageClears.contains addr = true := by
   simp [set_storage, incorporate_tx_into_block, destroy_storage_tx, get_block_storage]
 
-/-- Unchecked system transaction (`fork.py:724-780`, `process_unchecked_system_transaction` @ `16898000`):
-Executes `process_top_level` and calls `incorporate_tx_into_block(tx_state)`, completely dropping
-`tx_output.accounts_to_delete` (whereas `process_transaction` at `fork.py:1088-1089` runs
-`clear_account_preserving_balance(tx_state, addr)` for each `addr ∈ tx_output.accounts_to_delete`
-before `incorporate_tx_into_block`). -/
+/-- Lemma: `clear_account_preserving_balance_tx` has the exact same `storageWrites` and `storageClears`
+effects as `destroy_storage_tx` (since the subsequent `modify_state` only updates `accountWrites` or
+runs an idempotent second `destroy_storage_tx` when `balance == 0`). -/
+@[simp]
+theorem clear_account_preserving_balance_tx_storage_effects (txState : TransactionState) (addr : Address) :
+    (clear_account_preserving_balance_tx txState addr).storageWrites =
+      (destroy_storage_tx txState addr).storageWrites ∧
+    (clear_account_preserving_balance_tx txState addr).storageClears =
+      (destroy_storage_tx txState addr).storageClears := by
+  dsimp only [clear_account_preserving_balance_tx, modify_state, destroy_account]
+  split
+  · have hc := storageClears_destroy_storage_tx_contains txState addr
+    dsimp only [set_account, destroy_storage_tx] at *
+    rw [hc]
+    simp [List.filter_filter]
+  · exact ⟨rfl, rfl⟩
+
+/-- End-to-end theorem (`t_8246_storage_clears_recorded_in_bal`) connecting `destroy_storage_tx`
+(and `clear_account_preserving_balance_tx` via `clear_account_preserving_balance_tx_storage_effects`)
+and `incorporate_tx_into_block` (`state_tracker.py:494-540, 793-846`) to `update_builder_from_tx`
+(`block_access_lists.py:760-825`):
+When `Tx1` writes a non-zero storage slot `val > 0` (`b1 := incorporate_tx_into_block tx1`) and `Tx2`
+wipes `addr`'s storage via `destroy_storage_tx` (`b2 := incorporate_tx_into_block tx2`),
+the resulting BAL slot state `balState` extracted from `tx2` has `bal_recorded_post_val_patched balState = some 0`
+(matching `get_block_storage b2 addr slot = 0` and satisfying `bal_storage_consistent`), whereas
+`bal_recorded_post_val_buggy balState = none`! -/
+theorem t_8246_storage_clears_recorded_in_bal
+    (pre : PreState) (addr : Address) (slot : StorageKey) (val : Nat) (h_pos : val > 0) :
+    let b0 : BlockState := { preState := pre }
+    let tx1 : TransactionState := set_storage { parent := b0 } addr slot val
+    let b1 : BlockState := incorporate_tx_into_block tx1
+    let tx2 : TransactionState := destroy_storage_tx { parent := b1 } addr
+    let b2 : BlockState := incorporate_tx_into_block tx2
+    let balState : BalSlotClearState :=
+      { indexStartVal := get_block_storage b1 addr slot
+        priorSameIndexWrite := none
+        txStorageWrite := (tx2.storageWrites.find? (fun p => p.1 == (addr, slot))).map Prod.snd
+        txStorageCleared := tx2.storageClears.contains addr }
+    get_block_storage b2 addr slot = 0 ∧
+    bal_recorded_post_val_patched balState = some 0 ∧
+    bal_recorded_post_val_buggy balState = none ∧
+    bal_storage_consistent balState (bal_recorded_post_val_patched balState) := by
+  have h_ne : val ≠ 0 := Nat.ne_of_gt h_pos
+  have h_ne_symm : 0 ≠ val := Ne.symm h_ne
+  simp [set_storage, incorporate_tx_into_block, destroy_storage_tx, get_block_storage,
+    bal_recorded_post_val_patched, bal_recorded_post_val_buggy, bal_storage_consistent,
+    actual_block_post_storage, h_ne, h_ne_symm]
+
+/-- Validated projection (`mapping_kind: projection`) of `process_unchecked_system_transaction`
+(`fork.py:724-780` @ `16898000`):
+Executes `process_top_level` and calls `incorporate_tx_into_block(system_tx_state, ...)` directly,
+omitting the `for address in tx_output.accounts_to_delete: clear_account_preserving_balance(...)`
+cleanup loop present in `process_transaction` (`fork.py:1088-1089`). -/
 def finalize_unchecked_sys_tx_v16898000 (frame : EvmFrame) (target : Address) : TransactionState :=
   let _ := target
   frame.txState
 
-/-- Patched `process_unchecked_system_transaction` (`fork.py:766-768`): clears `target` via
-`clear_account_preserving_balance_tx` whenever `target ∈ frame.accountsToDelete`. -/
+/-- Full list-fold of `for address in tx_output.accounts_to_delete: clear_account_preserving_balance(tx_state, address)`
+(`fork.py:1088-1089`). -/
+def clear_accounts_to_delete_tx (txState : TransactionState) (accountsToDelete : List Address) : TransactionState :=
+  accountsToDelete.foldl clear_account_preserving_balance_tx txState
+
+/-- Target-address projection of patched `process_unchecked_system_transaction` (`fork.py:724-780`):
+clears `target` via `clear_account_preserving_balance_tx` whenever `target ∈ frame.accountsToDelete`
+(coinciding with `clear_accounts_to_delete_tx frame.txState [target]` when `frame.accountsToDelete = [target]`). -/
 def finalize_unchecked_sys_tx_patched (frame : EvmFrame) (target : Address) : TransactionState :=
   if frame.accountsToDelete.contains target then
     clear_account_preserving_balance_tx frame.txState target

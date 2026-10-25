@@ -8,8 +8,8 @@ import Glamsterdam.Common.MetaSpec
 /-!
 # Glamsterdam Common Execution Layer Core (`ElCore`)
 
-Exact transcription of the Amsterdam Execution Layer state tracker and two-dimensional
-gas meter pinned against `ethereum/execution-specs` @ `16898000911c1e3caa57be08509536c10ae92d3e`:
+Formal specification and validated state-tracker / gas-meter model pinned against
+`ethereum/execution-specs` @ `16898000911c1e3caa57be08509536c10ae92d3e`:
 - `src/ethereum/forks/amsterdam/state_tracker.py` (`Account`, `BlockState`, `TransactionState`,
   `get_pre_state_account_optional`, `get_pre_state_account`, `get_account_optional`,
   `get_account`, `get_code`, `get_storage`, `get_storage_original`, `get_transient_storage`,
@@ -26,6 +26,13 @@ gas meter pinned against `ethereum/execution-specs` @ `16898000911c1e3caa57be085
   `calculate_message_call_gas`, `init_code_cost`, `allocate_evm_gas`,
   `settle_transaction_gas`, `check_block_gas_capacity`).
 - `src/ethereum/forks/amsterdam/vm/__init__.py` (`incorporate_child`).
+
+Abstraction conventions (documented in `audit/source-map.yaml` via `mapping_kind: exact | projection`):
+- Addresses, storage keys, storage values, and 32-byte code hashes are modeled in `Nat`, with
+  `EMPTY_CODE_HASH = 0` as the abstract sentinel for `keccak256(b"")`.
+- Pure value-lookup projections (`get_pre_state_account_optional`, `get_account_optional`,
+  `get_storage`, `account_exists`, `is_account_alive`) are paired with explicit stateful
+  read-tracking transitions (`read_account_tx`, `read_storage_tx`).
 -/
 
 namespace Glamsterdam.Common.ElCore
@@ -65,10 +72,11 @@ structure Account where
 def EMPTY_ACCOUNT : Account :=
   { nonce := 0, balance := 0, codeHash := EMPTY_CODE_HASH, codeEmpty := true, storageNonEmpty := false }
 
-/-- Whether an `Account` equals `EMPTY_ACCOUNT` (`nonce == 0 && balance == 0 && codeHash == EMPTY_CODE_HASH`). -/
+/-- Whether an `Account` equals `EMPTY_ACCOUNT` (`nonce == 0 && balance == 0 && codeHash == EMPTY_CODE_HASH`,
+matching `state_tracker.py:397-400` `account.nonce == Uint(0) and account.code_hash == EMPTY_CODE_HASH and account.balance == 0`). -/
 @[inline, simp]
 def Account.isEmpty (acc : Account) : Bool :=
-  acc.nonce == 0 && acc.balance == 0 && acc.codeHash == EMPTY_CODE_HASH && acc.codeEmpty
+  acc.nonce == 0 && acc.balance == 0 && acc.codeHash == EMPTY_CODE_HASH
 
 /-! ## 2. BlockState and TransactionState (`state_tracker.py:44-101`) -/
 
@@ -120,37 +128,40 @@ structure TransactionState where
 
 /-! ## 3. Exact `state_tracker.py` Read/Write/Lifecycle Functions (`lines 103-789`) -/
 
-/-- `get_pre_state_account_optional` (`state_tracker.py:103-133`):
-Look up the account at `addr` before the current transaction (`parent.accountWrites` then `preState`). -/
+/-- Pure value-lookup projection of `get_pre_state_account_optional` (`state_tracker.py:103-133`):
+Look up the account at `addr` before the current transaction (`parent.accountWrites` then `preState`).
+See `read_account_tx` below for the stateful transition that also appends `addr` to `accountReads`. -/
 def get_pre_state_account_optional (txState : TransactionState) (addr : Address) : Option Account :=
   match txState.parent.accountWrites.find? (fun p => p.1 == addr) with
   | some (_, accOpt) => accOpt
   | none => txState.parent.preState.getAccountOptional addr
 
-/-- `get_pre_state_account` (`state_tracker.py:136-167`):
+/-- Pure value-lookup projection of `get_pre_state_account` (`state_tracker.py:136-167`):
 Return `get_pre_state_account_optional` or `EMPTY_ACCOUNT` if `none`. -/
 def get_pre_state_account (txState : TransactionState) (addr : Address) : Account :=
   match get_pre_state_account_optional txState addr with
   | some acc => acc
   | none => EMPTY_ACCOUNT
 
-/-- `get_account_optional` (`state_tracker.py:170-193`):
-Read chain `txState.accountWrites -> parent.accountWrites -> preState`. -/
+/-- Pure value-lookup projection of `get_account_optional` (`state_tracker.py:170-193`):
+Read chain `txState.accountWrites -> parent.accountWrites -> preState`.
+See `read_account_tx` below for the stateful transition that also records `accountReads`. -/
 def get_account_optional (txState : TransactionState) (addr : Address) : Option Account :=
   match txState.accountWrites.find? (fun p => p.1 == addr) with
   | some (_, accOpt) => accOpt
   | none => get_pre_state_account_optional txState addr
 
-/-- `get_account` (`state_tracker.py:196-221`):
+/-- Pure value-lookup projection of `get_account` (`state_tracker.py:196-221`):
 Return `get_account_optional` or `EMPTY_ACCOUNT` if `none`. -/
 def get_account (txState : TransactionState) (addr : Address) : Account :=
   match get_account_optional txState addr with
   | some acc => acc
   | none => EMPTY_ACCOUNT
 
-/-- `get_storage` (`state_tracker.py:252-285`):
+/-- Pure value-lookup projection of `get_storage` (`state_tracker.py:252-285`):
 Read chain: `txState.storageWrites` -> `txState.storageClears` (`0`) ->
-`parent.storageWrites` -> `parent.storageClears` (`0`) -> `preState.getStorage`. -/
+`parent.storageWrites` -> `parent.storageClears` (`0`) -> `preState.getStorage`.
+See `read_storage_tx` below for the stateful transition that also records `storageReads`. -/
 def get_storage (txState : TransactionState) (addr : Address) (key : StorageKey) : StorageVal :=
   match txState.storageWrites.find? (fun p => p.1 == (addr, key)) with
   | some (_, v) => v
@@ -162,6 +173,43 @@ def get_storage (txState : TransactionState) (addr : Address) (key : StorageKey)
       | none =>
         if txState.parent.storageClears.contains addr then 0
         else txState.parent.preState.getStorage addr key
+
+/-- Stateful account read transition (`state_tracker.py:103-221`):
+Returns `get_account txState addr` and records `addr` in `txState.accountReads`
+(`tx_state.account_reads.add(address)` at `state_tracker.py:130, 190`). -/
+def read_account_tx (txState : TransactionState) (addr : Address) : Account × TransactionState :=
+  let newReads := if txState.accountReads.contains addr then txState.accountReads else addr :: txState.accountReads
+  (get_account txState addr, { txState with accountReads := newReads })
+
+/-- Stateful storage read transition (`state_tracker.py:252-285`):
+Returns `get_storage txState addr key` and records `(addr, key)` in `txState.storageReads`
+(`tx_state.storage_reads.add((address, key))` at `state_tracker.py:274`). -/
+def read_storage_tx (txState : TransactionState) (addr : Address) (key : StorageKey) :
+    StorageVal × TransactionState :=
+  let newReads :=
+    if txState.storageReads.contains (addr, key) then txState.storageReads
+    else (addr, key) :: txState.storageReads
+  (get_storage txState addr key, { txState with storageReads := newReads })
+
+@[simp]
+theorem read_account_tx_records_read (txState : TransactionState) (addr : Address) :
+    (read_account_tx txState addr).1 = get_account txState addr ∧
+    (read_account_tx txState addr).2.accountReads.contains addr = true := by
+  dsimp only [read_account_tx]
+  refine ⟨rfl, ?_⟩
+  cases h : txState.accountReads.contains addr
+  · simp
+  · exact h
+
+@[simp]
+theorem read_storage_tx_records_read (txState : TransactionState) (addr : Address) (key : StorageKey) :
+    (read_storage_tx txState addr key).1 = get_storage txState addr key ∧
+    (read_storage_tx txState addr key).2.storageReads.contains (addr, key) = true := by
+  dsimp only [read_storage_tx]
+  refine ⟨rfl, ?_⟩
+  cases h : txState.storageReads.contains (addr, key)
+  · simp
+  · exact h
 
 /-- `get_storage_original` (`state_tracker.py:288-314`):
 Return `0` if `addr ∈ txState.createdAccounts`, otherwise read from `parent.storageWrites` ->
@@ -190,7 +238,7 @@ def account_exists (txState : TransactionState) (addr : Address) : Bool :=
 True iff `account.nonce == 0` and `account.codeHash == EMPTY_CODE_HASH`. -/
 def account_deployable (txState : TransactionState) (addr : Address) : Bool :=
   let acc := get_account txState addr
-  acc.nonce == 0 && acc.codeHash == EMPTY_CODE_HASH && acc.codeEmpty
+  acc.nonce == 0 && acc.codeHash == EMPTY_CODE_HASH
 
 /-- `account_exists_and_is_empty` (`state_tracker.py:373-400`):
 True iff `get_account_optional` is `some acc` with `nonce == 0`, `codeHash == EMPTY_CODE_HASH`, and `balance == 0`. -/
@@ -315,32 +363,9 @@ def set_transient_storage (txState : TransactionState) (addr : Address) (key : S
   { txState with
     transientStorage := ((addr, key), val) :: txState.transientStorage.filter (fun p => p.1 != (addr, key)) }
 
-/-- `set_account_balance_tx` (`state_tracker.py:606-625`):
-Note that in `execution-specs` (`state_tracker.py:624-625`), `set_account_balance` calls
-`set_account` directly WITHOUT `modify_state` (so setting `balance := 0` on an account with
-`nonce = 0` and `codeHash = EMPTY_CODE_HASH` writes `some EMPTY_ACCOUNT` into `txState.accountWrites`!). -/
-def set_account_balance_tx (txState : TransactionState) (addr : Address) (newBalance : Nat) :
-    TransactionState :=
-  let acc := get_account txState addr
-  set_account txState addr (some { acc with balance := newBalance })
-
-/-- `increment_nonce` (`state_tracker.py:628-643`). -/
-def increment_nonce (txState : TransactionState) (addr : Address) : TransactionState :=
-  modify_state txState addr (fun acc => { acc with nonce := acc.nonce + 1 })
-
-/-- `set_code` (`state_tracker.py:646-672`). -/
-def set_code (txState : TransactionState) (addr : Address) (codeHash : Hash32) (codeLen : Nat) :
-    TransactionState :=
-  let acc := get_account txState addr
-  let s1 := set_account txState addr
-    (some { acc with codeHash := codeHash, codeEmpty := (codeHash == EMPTY_CODE_HASH) })
-  { s1 with codeWrites := (codeHash, codeLen) :: s1.codeWrites.filter (fun p => p.1 != codeHash) }
-
-/-- `create_ether` (`state_tracker.py:694-707`). -/
-def create_ether (txState : TransactionState) (recipient : Address) (amount : Nat) : TransactionState :=
-  modify_state txState recipient (fun acc => { acc with balance := acc.balance + amount })
-
-/-- `move_ether_tx` (`state_tracker.py:710-731`). -/
+/-- `move_ether_tx` (`state_tracker.py:606-638`):
+Transfer `amount` from `sender` to `recipient` via `modify_state` (`lines 636-638`), or return
+`none` (`InsufficientBalanceError`) if `senderAcc.balance < amount`. -/
 def move_ether_tx (txState : TransactionState) (sender recipient : Address) (amount : Nat) :
     Option TransactionState :=
   let senderAcc := get_account txState sender
@@ -349,6 +374,36 @@ def move_ether_tx (txState : TransactionState) (sender recipient : Address) (amo
   else
     let s1 := modify_state txState sender (fun acc => { acc with balance := acc.balance - amount })
     some (modify_state s1 recipient (fun acc => { acc with balance := acc.balance + amount }))
+
+/-- `create_ether` (`state_tracker.py:640-660`):
+Add `amount` to `recipient`'s balance via `modify_state(tx_state, recipient, add_balance)`. -/
+def create_ether (txState : TransactionState) (recipient : Address) (amount : Nat) : TransactionState :=
+  modify_state txState recipient (fun acc => { acc with balance := acc.balance + amount })
+
+/-- `set_account_balance_tx` (`state_tracker.py:663-684`):
+In `execution-specs` (`state_tracker.py:683`), `set_account_balance` calls
+`modify_state(tx_state, address, set_balance)`, which destroys the account (`set_account(..., None)`)
+if setting `balance := newBalance` produces `EMPTY_ACCOUNT`. -/
+def set_account_balance_tx (txState : TransactionState) (addr : Address) (newBalance : Nat) :
+    TransactionState :=
+  modify_state txState addr (fun acc => { acc with balance := newBalance })
+
+/-- `increment_nonce` (`state_tracker.py:686-703`):
+Increment `addr`'s nonce by 1 via `modify_state(tx_state, address, increase_nonce)`. -/
+def increment_nonce (txState : TransactionState) (addr : Address) : TransactionState :=
+  modify_state txState addr (fun acc => { acc with nonce := acc.nonce + 1 })
+
+/-- `set_code` (`state_tracker.py:705-729`):
+If `codeHash != EMPTY_CODE_HASH` (`state_tracker.py:722-723`), record `(codeHash, codeLen)` in
+`codeWrites`, and update `addr`'s `codeHash` via `modify_state(tx_state, address, write_code)` (`line 728`). -/
+def set_code (txState : TransactionState) (addr : Address) (codeHash : Hash32) (codeLen : Nat) :
+    TransactionState :=
+  let s0 :=
+    if codeHash != EMPTY_CODE_HASH then
+      { txState with codeWrites := (codeHash, codeLen) :: txState.codeWrites.filter (fun p => p.1 != codeHash) }
+    else
+      txState
+  modify_state s0 addr (fun acc => { acc with codeHash := codeHash, codeEmpty := (codeHash == EMPTY_CODE_HASH) })
 
 /-- `incorporate_tx_into_block` (`state_tracker.py:793-846`):
 Merge `txState` into `txState.parent` (`BlockState`). Crucially (`lines 827-829`), for each
@@ -392,10 +447,9 @@ EIP-7523 invariant). -/
 def NoEmptyAccountLeaves (txState : TransactionState) (addr : Address) : Prop :=
   ∀ acc, get_account_optional txState addr = some acc → acc.isEmpty = false
 
-/-- Theorem: Under `NoEmptyAccountLeaves`, `account_exists` and `is_account_alive` are identical,
-whereas whenever `get_account_optional txState addr = some acc` with `acc.isEmpty = true`
-(e.g. produced by `set_account_balance_tx txState addr 0` on an empty EOA, or an EEST pre-state leaf),
-`account_exists` is `true` while `is_account_alive` is `false`! -/
+/-- Theorem: Under `NoEmptyAccountLeaves`, `account_exists` and `is_account_alive` are identical;
+they can only diverge if `get_account_optional txState addr = some acc` with `acc.isEmpty = true`
+(e.g. an unpruned `EMPTY_ACCOUNT` leaf injected into `PreState` in a synthetic test fixture). -/
 theorem account_exists_iff_alive_of_no_empty_leaves (txState : TransactionState) (addr : Address)
     (h_wf : NoEmptyAccountLeaves txState addr) :
     account_exists txState addr = is_account_alive txState addr := by
@@ -405,15 +459,6 @@ theorem account_exists_iff_alive_of_no_empty_leaves (txState : TransactionState)
   | some acc =>
     have h_ne := h_wf acc h_opt
     simp only [Option.isSome_some, h_ne, Bool.not_false]
-
-theorem set_account_balance_zero_creates_empty_leaf (txState : TransactionState) (addr : Address)
-    (h_nonce : (get_account txState addr).nonce = 0)
-    (h_code : (get_account txState addr).codeHash = EMPTY_CODE_HASH)
-    (h_empty : (get_account txState addr).codeEmpty = true) :
-    let post := set_account_balance_tx txState addr 0
-    account_exists post addr = true ∧ is_account_alive post addr = false := by
-  dsimp only [set_account_balance_tx, account_exists, is_account_alive, get_account_optional, set_account]
-  simp [Account.isEmpty, h_nonce, h_code, h_empty, EMPTY_CODE_HASH]
 
 /-! ### Layer-0b Equation Lemmas for `TransactionState` Read/Write Operations -/
 
@@ -506,6 +551,38 @@ theorem get_storage_destroy_account_same (txState : TransactionState) (addr : Ad
     get_storage (destroy_account txState addr) addr slot = 0 := by
   dsimp only [destroy_account]
   rw [get_storage_set_account, get_storage_destroy_storage_tx_same]
+
+/-- Theorem (`no_empty_account_leaves_preserved`, `state_tracker.py:591-729`):
+Because `modify_state` destroys the account (`set_account(..., None)`) whenever `f(acc).isEmpty = true`,
+every `state_tracker.py` account mutator (`modify_state`, `set_account_balance_tx`, `increment_nonce`,
+`create_ether`, `set_code`, `clear_account_preserving_balance_tx`) establishes `NoEmptyAccountLeaves`
+at the target address `addr` — it NEVER creates an `EMPTY_ACCOUNT` leaf in `accountWrites`! -/
+theorem modify_state_no_empty_account_leaf (txState : TransactionState) (addr : Address)
+    (f : Account → Account) :
+    NoEmptyAccountLeaves (modify_state txState addr f) addr := by
+  intro acc h_opt
+  dsimp only [modify_state] at h_opt
+  cases h_emp : (f (get_account txState addr)).isEmpty
+  · rw [h_emp] at h_opt
+    simp only [Bool.false_eq_true, ↓reduceIte, get_account_optional_set_account_same, Option.some.injEq] at h_opt
+    subst h_opt
+    exact h_emp
+  · rw [h_emp] at h_opt
+    simp only [↓reduceIte, get_account_optional_destroy_account_same, reduceCtorEq] at h_opt
+
+theorem no_empty_account_leaves_preserved (txState : TransactionState) (addr : Address)
+    (newBal amount : Nat) (codeHash : Hash32) (codeLen : Nat) :
+    NoEmptyAccountLeaves (set_account_balance_tx txState addr newBal) addr ∧
+    NoEmptyAccountLeaves (increment_nonce txState addr) addr ∧
+    NoEmptyAccountLeaves (create_ether txState addr amount) addr ∧
+    NoEmptyAccountLeaves (set_code txState addr codeHash codeLen) addr ∧
+    NoEmptyAccountLeaves (clear_account_preserving_balance_tx txState addr) addr := by
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
+  · exact modify_state_no_empty_account_leaf txState addr _
+  · exact modify_state_no_empty_account_leaf txState addr _
+  · exact modify_state_no_empty_account_leaf txState addr _
+  · exact modify_state_no_empty_account_leaf _ addr _
+  · exact modify_state_no_empty_account_leaf _ addr _
 
 /-! ## 4. Algebraic Single-Target Snapshot Projection (Backwards-Compatible with Layer-II Proofs) -/
 
@@ -764,7 +841,7 @@ theorem repay_state_gas_spill_invariant (m : GasMeter) :
 def check_gas (m : GasMeter) (amount : Nat) : Bool :=
   decide (m.gasLeft ≥ amount)
 
-/-- `GasMeter` Spill Invariant (`vm/gas.py:298-303`): at least one of `stateGasLeft` or
+/-- `GasMeter` Spill Invariant (`vm/gas.py:260-303`): at least one of `stateGasLeft` or
 `stateGasSpilled` is `0` at all times during normal execution. -/
 def GasMeter.SpillInvariant (m : GasMeter) : Prop :=
   m.stateGasLeft = 0 ∨ m.stateGasSpilled = 0

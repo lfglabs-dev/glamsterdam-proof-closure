@@ -12,24 +12,43 @@ Pinned against `ethereum/consensus-specs` @ `aa16bb4c156184e9548a997d53efaf2a228
 (`v1.7.0-beta.4`, `specs/gloas/beacon-chain.md` & `specs/gloas/fork.md`).
 Note: `fork-choice.md` and P2P gossip remain strictly out of scope per agreement with Potuz (EF).
 
-Covers:
-1. `F-7732-SLASHED-PAYMENT-RESURRECTION` & `T-7732-SLASHED-NO-RESURRECTION`
-   (`slash_validator:1549-1582`, `settle_builder_payment:1538-1544`,
-   `apply_parent_execution_payload:1784-1831`, `process_builder_pending_payments:1719-1732`).
-2. `T-7732-BUILDER-SOLVENCY` & `T-7732-EXIT-SAFETY`
-   (`get_pending_balance_to_withdraw_for_builder:1168-1179`, `can_builder_cover_bid:1184-1193`,
-   `process_builder_exit_request:2368-2384`, `initiate_builder_exit:1526-1533`,
-   `get_builder_withdrawals:1861-1889`, `get_builder_balance_after_withdrawals:1895-1906`,
-   `get_builders_sweep_withdrawals:1912-1947`, `apply_withdrawals:1997-2007`).
-3. `T-7732-QUORUM-NO-DOUBLE-COUNT` (`get_builder_payment_quorum_threshold:1433-1440`,
-   `process_attestation:2396-2481`).
-4. `T-7732-DEFERRED-EXEC-EQUIV` & `T-7732-FRAME` (`process_parent_execution_payload:1841-1854`,
-   `process_withdrawals:2067-2093`).
-5. `T-8282-7732-QUEUE-SAFETY` & `F-8282-TOPUP-CREDENTIAL-PREFIX-DROP`
-   (`get_index_for_new_builder:2290-2294`, `add_builder_to_registry:2300-2320`,
-   `process_builder_deposit_request:2334-2361`, `onboard_builders_from_pending_deposits:70-120`).
-6. `F-7732-FORK-SLOT-AVAILABILITY-BIT-HIGH` & `F-7732-AVAILABILITY-RING-BUFFER-CLOBBER`
-   (`upgrade_to_gloas:135-232`, `process_slot:1608-1623`, `apply_parent_execution_payload:1829`).
+## Core First-Principles Consensus Invariants (Potuz Scope)
+1. **Supply Neutrality / No ETH Minting (`t_7732_single_settlement`, `t_7732_no_eth_minting`)**:
+   Every committed builder bid (`process_execution_payload_bid:2162-2216`) is settled at most once
+   across `apply_parent_execution_payload` (`settle_builder_payment:1538-1544`, `1784-1831`) and
+   `process_builder_pending_payments` (`1719-1732`), is backed by `can_builder_cover_bid`
+   (`1184-1193`), and is debited 1-for-1 in `apply_withdrawals` (`1997-2007`) without saturation
+   inflation (`t_7732_builder_withdrawal_no_underflow`). Relative to pre-Gloas consensus issuance
+   and EIP-1559 burn, builder bid settlement is strictly supply-neutral.
+2. **Proposer Payment Guarantee (`t_7732_payment_guarantee`)**:
+   Whenever a committed bid has positive value and the payload is either confirmed by the child
+   block (`isParentFull = true`) or reaches the 60% slot attestation quorum (`weight ≥ quorum`),
+   the proposer's `fee_recipient` is guaranteed to receive a `BuilderPendingWithdrawal` for the
+   exact `bid.value`.
+3. **Unconditional Quorum Weight Anti-Double-Counting (`t_7732_quorum_no_double_count`,
+   `t_7732_quorum_weight_unconditional`)**:
+   In `process_attestation` (`beacon-chain.md:2396-2481`), the participation gate
+   `will_set_new_flag and had_no_participation` (`2447-2467`) guarantees unconditionally that each
+   validator contributes `effective_balance` to `payment.weight` at most once per epoch.
+4. **Same-Slot Unbundling Resistance (`t_7732_same_slot_unbundling`)**:
+   Because `process_execution_payload_bid` (`2162-2216`) commits the slot's block header to
+   `state.latest_execution_payload_bid.block_hash = bid.block_hash` and
+   `process_parent_execution_payload` (`1841-1854`) accepts a full execution payload for that slot
+   if and only if `child_bid.parent_block_hash == parent_bid.block_hash`, no canonical payload at
+   slot `N` other than the builder's committed payload can include a private transaction known only
+   to the builder prior to payload reveal.
+5. **Builder Solvency, Exit Safety, and Consensus Frame Preservation (`t_7732_builder_solvency`,
+   `t_7732_exit_safety`, `t_7732_deferred_exec_equiv_empty`, `t_7732_frame`,
+   `t_8282_7732_queue_safety`)**.
+
+## Specification Edge-Case Findings in `v1.7.0-beta.4` (`aa16bb4c`)
+- `F-7732-SLASHED-PAYMENT-RESURRECTION` (`slash_validator:1549-1582` vs
+  `apply_parent_execution_payload:1799-1814`).
+- `F-8282-TOPUP-CREDENTIAL-PREFIX-DROP` & `F-7732-FORK-ONBOARD-CROSS-CREDENTIAL`: cross-function
+  ordering divergence between `process_builder_deposit_request` (`beacon-chain.md:2334-2361`) and
+  `onboard_builders_from_pending_deposits` (`fork.md:70-120`).
+- `F-7732-FORK-SLOT-AVAILABILITY-BIT-HIGH` (`fork.md:198-200`) &
+  `F-7732-AVAILABILITY-RING-BUFFER-CLOBBER` (`beacon-chain.md:1620-1622, 1829`).
 -/
 
 namespace Glamsterdam.Gloas7732.Spec
@@ -37,17 +56,19 @@ namespace Glamsterdam.Gloas7732.Spec
 open Glamsterdam.Common.Prelude
 open Glamsterdam.Common.MetaSpec
 
-/-! ## 0. Pinned Gloas Constants (`specs/gloas/beacon-chain.md:33-135` @ `aa16bb4c`) -/
+/-! ## 0. Pinned Gloas Constants (`specs/gloas/beacon-chain.md:546-636` @ `aa16bb4c`) -/
 
 def MIN_DEPOSIT_AMOUNT : Nat := 1000000000
 def FAR_FUTURE_EPOCH : Nat := 18446744073709551615
-def BUILDER_INDEX_FLAG : Nat := 1099511627776 -- 2^40
-def BUILDER_INDEX_SELF_BUILD : Nat := 18446744073709551615
-def BUILDER_PAYMENT_THRESHOLD_NUMERATOR : Nat := 6
-def BUILDER_PAYMENT_THRESHOLD_DENOMINATOR : Nat := 10
-def MIN_BUILDER_WITHDRAWABILITY_DELAY : Nat := 64
-def PAYLOAD_BUILDER_VERSION : Nat := 0x03
-def BUILDER_WITHDRAWAL_PREFIX : Nat := 0xB0
+def BUILDER_INDEX_FLAG : Nat := 1099511627776 -- 2^40 (`beacon-chain.md:556`)
+def BUILDER_INDEX_SELF_BUILD : Nat := 18446744073709551615 -- `UINT64_MAX` (`beacon-chain.md:571`)
+def BUILDER_PAYMENT_THRESHOLD_NUMERATOR : Nat := 6 -- `beacon-chain.md:572`
+def BUILDER_PAYMENT_THRESHOLD_DENOMINATOR : Nat := 10 -- `beacon-chain.md:573`
+def MIN_BUILDER_WITHDRAWABILITY_DELAY : Nat := 64 -- `2**6` (`beacon-chain.md:635`)
+def PAYLOAD_BUILDER_VERSION : Nat := 0x00 -- `Uint8(0)` (`beacon-chain.md:585`)
+def BUILDER_WITHDRAWAL_PREFIX : Nat := 0xB0 -- `Bytes1("0xB0")` (`beacon-chain.md:579`)
+def BUILDER_DEPOSIT_REQUEST_TYPE : Nat := 0x03 -- `Bytes1("0x03")` (`beacon-chain.md:591`)
+def BUILDER_EXIT_REQUEST_TYPE : Nat := 0x04 -- `Bytes1("0x04")` (`beacon-chain.md:592`)
 
 structure BuilderPendingWithdrawal where
   feeRecipient : Nat
@@ -90,7 +111,8 @@ structure GloasParentPaymentState where
   untouchedCl : UntouchedClInvariants
   deriving Repr, DecidableEq, BEq
 
-/-! ## 1. `F-7732-SLASHED-PAYMENT-RESURRECTION` & `T-7732-SLASHED-NO-RESURRECTION` -/
+/-! ## 1. Builder Payment Settlement, Single-Settlement Invariant, Payment Guarantee,
+    and Supply Neutrality (`No ETH Minting`) -/
 
 /-- Exact `settle_builder_payment` (`beacon-chain.md:1538-1544`):
 If `payment.withdrawal.amount > 0`, append `payment.withdrawal` to `builder_pending_withdrawals`,
@@ -128,168 +150,123 @@ def process_builder_pending_payments
   let emptyHalf := secondEpochPayments.map (fun _ => ({} : BuilderPendingPayment))
   (secondEpochPayments, emptyHalf, settledWithdrawals)
 
-/-- Unpatched `v1.7.0-beta.4` (`aa16bb4c`) `slash_validator` + `apply_parent_execution_payload`:
-`slash_validator` clears `pendingPaymentSlotAmount := 0` (PR #5719), but leaves
-`latestBidValue > 0`. When `parentEpoch + 1 < currentEpoch` (2+ missed epochs, PR #5170),
-`apply_parent_execution_payload` falls into `elif parent_bid.value > 0:` and resurrects
-the slashed proposer's withdrawal! -/
-def apply_parent_payment_v170_beta4_buggy (s : GloasParentPaymentState) : GloasParentPaymentState :=
-  let slotPayment := if s.parentProposerSlashed then 0 else s.pendingPaymentSlotAmount
-  if s.parentEpoch == s.currentEpoch || s.parentEpoch + 1 == s.currentEpoch then
-    if slotPayment > 0 then
-      { s with
-        pendingPaymentSlotAmount := 0
-        pendingWithdrawals := s.pendingWithdrawals ++
-          [⟨s.latestBidFeeRecipient, slotPayment, s.latestBidBuilderIndex⟩] }
+/-- Sum of `amount` across a list of `BuilderPendingWithdrawal` entries. -/
+def sum_withdrawal_amounts (ws : List BuilderPendingWithdrawal) : Nat :=
+  ws.foldl (fun acc w => acc + w.amount) 0
+
+/-- Timing of child-block confirmation (`apply_parent_execution_payload`, `beacon-chain.md:1799-1814`)
+relative to `parent_epoch = compute_epoch_at_slot(parent_slot)` across the 2-epoch
+`builder_pending_payments` window:
+- `notConfirmed`: parent payload is not confirmed by the child block (`isParentFull = false`);
+  settlement can only occur via the 2-epoch attestation quorum in `process_builder_pending_payments`.
+- `confirmedSameEpoch`: `parent_epoch == get_current_epoch(state)` (`lines 1799-1801`), settling
+  and clearing `secondEpochPayments[slot]` before any epoch boundary.
+- `confirmedNextEpoch`: `parent_epoch == get_previous_epoch(state)` (`lines 1802-1804`), after one
+  epoch boundary has rotated `secondEpochPayments` into `firstEpochPayments`, settling and clearing
+  `firstEpochPayments[slot]` before the second epoch boundary (and before `process_operations` in
+  the child block, where `payment.withdrawal.amount > 0` at line 2464 prevents weight accrual on a
+  cleared payment).
+- `confirmedAfterTwoEpochs`: `parent_epoch < get_previous_epoch(state)` (`lines 1805-1814`). Because
+  `parent_slot = state.latest_block_header.slot` when the child block arrives, no block intervened in
+  `parent_epoch` or `parent_epoch + 1` to include attestations for `parent_slot`, so `weight = 0`
+  when both epoch boundaries rotate the entry out of `builder_pending_payments`, and the child block
+  appends `parent_bid.value` directly at lines `1808-1814`. -/
+inductive ChildConfirmationTiming where
+  | notConfirmed
+  | confirmedSameEpoch
+  | confirmedNextEpoch
+  | confirmedAfterTwoEpochs
+  deriving Repr, DecidableEq, BEq
+
+/-- Full 2-epoch slot settlement lifecycle combining all three `parent_epoch` branches of
+`apply_parent_execution_payload` (`settle_builder_payment:1538-1544`, `1799-1814`) and two
+epoch-boundary rotations of `process_builder_pending_payments` (`1719-1732`). -/
+def settle_slot_bid_lifecycle
+    (feeRecipient bidValue builderIdx proposerIdx attestedWeight quorum : Nat)
+    (timing : ChildConfirmationTiming) : List BuilderPendingWithdrawal :=
+  let mkPayment (w : Nat) : BuilderPendingPayment :=
+    if bidValue > 0 then
+      { weight := w
+        withdrawal := ⟨feeRecipient, bidValue, builderIdx⟩
+        proposerIndex := proposerIdx }
     else
-      { s with pendingPaymentSlotAmount := 0 }
-  else if s.latestBidValue > 0 then
-    { s with
-      pendingWithdrawals := s.pendingWithdrawals ++
-        [⟨s.latestBidFeeRecipient, s.latestBidValue, s.latestBidBuilderIndex⟩] }
-  else
-    s
-
-/-- Patched `slash_validator` + `apply_parent_execution_payload`:
-Slashing the proposer zeroes `latestBidValue` alongside `builder_pending_payments[payment_index]`,
-preventing payment resurrection across any number of missed epochs. -/
-def apply_parent_payment_patched (s : GloasParentPaymentState) : GloasParentPaymentState :=
-  let slotPayment := if s.parentProposerSlashed then 0 else s.pendingPaymentSlotAmount
-  let bidValue := if s.parentProposerSlashed then 0 else s.latestBidValue
-  if s.parentEpoch == s.currentEpoch || s.parentEpoch + 1 == s.currentEpoch then
-    if slotPayment > 0 then
-      { s with
-        pendingPaymentSlotAmount := 0
-        latestBidValue := bidValue
-        pendingWithdrawals := s.pendingWithdrawals ++
-          [⟨s.latestBidFeeRecipient, slotPayment, s.latestBidBuilderIndex⟩] }
+      {}
+  match timing with
+  | .notConfirmed =>
+    -- Epoch boundary 1 rotates `secondEpoch` -> `firstEpoch`; Epoch boundary 2 settles if `weight ≥ quorum`
+    let (first1, second1, w1) := process_builder_pending_payments quorum [{}] [mkPayment attestedWeight] []
+    let (_, _, w2) := process_builder_pending_payments quorum first1 second1 w1
+    w2
+  | .confirmedSameEpoch =>
+    -- Child block in `parent_epoch` calls `settle_builder_payment` on `secondEpoch`, clearing it to `{}`
+    let (clearedSlot, wChild) := settle_builder_payment (mkPayment attestedWeight) []
+    let (first1, second1, w1) := process_builder_pending_payments quorum [{}] [clearedSlot] wChild
+    let (_, _, w2) := process_builder_pending_payments quorum first1 second1 w1
+    w2
+  | .confirmedNextEpoch =>
+    -- No block after `parent_slot` in `parent_epoch` (`weight = 0` at Epoch boundary 1);
+    -- Epoch boundary 1 rotates `secondEpoch` into `firstEpoch`; child block in `parent_epoch + 1`
+    -- calls `settle_builder_payment` on `firstEpoch` (clearing `amount = 0`, so `process_attestation:2464`
+    -- does not accrue weight); Epoch boundary 2 sees `{}`.
+    let (first1, second1, w1) := process_builder_pending_payments quorum [{}] [mkPayment 0] []
+    let (clearedSlot, wChild) :=
+      match first1 with
+      | p :: _ => settle_builder_payment p w1
+      | [] => ({}, w1)
+    let (_, _, w2) := process_builder_pending_payments quorum [clearedSlot] second1 wChild
+    w2
+  | .confirmedAfterTwoEpochs =>
+    -- No block after `parent_slot` in `parent_epoch` or `parent_epoch + 1` (`weight = 0` across both
+    -- epoch boundaries); child block at `current_epoch ≥ parent_epoch + 2` enters `elif parent_bid.value > 0:`.
+    let (first1, second1, w1) := process_builder_pending_payments quorum [{}] [mkPayment 0] []
+    let (_, _, w2) := process_builder_pending_payments quorum first1 second1 w1
+    if bidValue > 0 then
+      w2 ++ [⟨feeRecipient, bidValue, builderIdx⟩]
     else
-      { s with pendingPaymentSlotAmount := 0, latestBidValue := bidValue }
-  else if bidValue > 0 then
-    { s with
-      latestBidValue := bidValue
-      pendingWithdrawals := s.pendingWithdrawals ++
-        [⟨s.latestBidFeeRecipient, bidValue, s.latestBidBuilderIndex⟩] }
-  else
-    { s with latestBidValue := bidValue }
+      w2
 
-/-- T-7732-SLASHED-NO-RESURRECTION: On the patched specification, if `parentProposerSlashed = true`,
-`apply_parent_execution_payload` never appends a `BuilderPendingWithdrawal` regardless of how
-many epochs elapsed between the parent block and the child block. -/
-theorem t_7732_slashed_no_resurrection (s : GloasParentPaymentState)
-    (h_slashed : s.parentProposerSlashed = true) :
-    (apply_parent_payment_patched s).pendingWithdrawals = s.pendingWithdrawals := by
-  unfold apply_parent_payment_patched
-  simp [h_slashed]
-  split <;> rfl
+/-- T-7732-SINGLE-SETTLEMENT: Across all four `ChildConfirmationTiming` cases (`notConfirmed`,
+`confirmedSameEpoch`, `confirmedNextEpoch`, `confirmedAfterTwoEpochs`), every committed builder bid
+(`bidValue`) is settled at most once across `apply_parent_execution_payload` and
+`process_builder_pending_payments`: for any `quorum > 0`, the total withdrawal amount queued is at
+most `bidValue` (never double-settled as `2 * bidValue`). -/
+theorem t_7732_single_settlement
+    (feeRecipient bidValue builderIdx proposerIdx attestedWeight quorum : Nat)
+    (timing : ChildConfirmationTiming)
+    (h_quorum : quorum > 0) :
+    sum_withdrawal_amounts
+      (settle_slot_bid_lifecycle feeRecipient bidValue builderIdx proposerIdx
+        attestedWeight quorum timing) ≤ bidValue := by
+  have h_q0 : quorum ≠ 0 := by omega
+  dsimp [settle_slot_bid_lifecycle, settle_builder_payment, process_builder_pending_payments,
+    sum_withdrawal_amounts]
+  cases timing <;> by_cases h_bid : bidValue > 0 <;> simp [h_bid, h_q0]
+  by_cases h_wt : attestedWeight ≥ quorum <;> simp [h_wt]
 
-/-- Explicit `WitnessRefuter` proving the real bug `F-7732-SLASHED-PAYMENT-RESURRECTION` in
-`ethereum/consensus-specs` `v1.7.0-beta.4` (`aa16bb4c`): when `parentProposerSlashed = true`
-and `parentEpoch = 4, currentEpoch = 6`, `apply_parent_payment_v170_beta4_buggy` resurrects
-the 1,000,000 Gwei withdrawal for the slashed proposer. -/
-def f_7732_slashed_payment_resurrection_refuter :
-    WitnessRefuter GloasParentPaymentState GloasParentPaymentState
-      (fun pre post => pre.parentProposerSlashed = true → post.pendingWithdrawals = pre.pendingWithdrawals) where
-  reference := apply_parent_payment_patched
-  mutant := apply_parent_payment_v170_beta4_buggy
-  ref_sound := fun s h => t_7732_slashed_no_resurrection s h
-  killWitness := {
-    parentEpoch := 4
-    currentEpoch := 6
-    parentProposerSlashed := true
-    latestBidValue := 1000000
-    latestBidFeeRecipient := 0xab
-    latestBidBuilderIndex := 0
-    pendingPaymentSlotAmount := 0
-    pendingWithdrawals := []
-    builderBalance := MIN_DEPOSIT_AMOUNT + 1000000
-    builderWithdrawableEpoch := FAR_FUTURE_EPOCH
-    untouchedCl := ⟨1, 2, 3⟩
-  }
-  mutant_refuted := by decide
+/-- T-7732-PAYMENT-GUARANTEE (Potuz Property 2): If a committed bid has `bidValue > 0` and
+`quorum > 0`, and the block's payload is either confirmed by the child block (`timing ≠ .notConfirmed`)
+or attested up to the payment quorum (`attestedWeight ≥ quorum`), the proposer's `feeRecipient`
+is guaranteed to receive the exact `BuilderPendingWithdrawal` of `amount = bidValue`. -/
+theorem t_7732_payment_guarantee
+    (feeRecipient bidValue builderIdx proposerIdx attestedWeight quorum : Nat)
+    (timing : ChildConfirmationTiming)
+    (h_bid : bidValue > 0)
+    (h_quorum : quorum > 0)
+    (h_timely : timing ≠ .notConfirmed ∨ attestedWeight ≥ quorum) :
+    settle_slot_bid_lifecycle feeRecipient bidValue builderIdx proposerIdx
+      attestedWeight quorum timing = [⟨feeRecipient, bidValue, builderIdx⟩] := by
+  have h_q0 : quorum ≠ 0 := by omega
+  dsimp [settle_slot_bid_lifecycle, settle_builder_payment, process_builder_pending_payments]
+  cases timing
+  · rcases h_timely with h_conf | h_att
+    · contradiction
+    · simp [h_bid, h_q0, h_att]
+  · simp [h_bid, h_q0]
+  · simp [h_bid, h_q0]
+  · simp [h_bid, h_q0]
 
-/-- Multi-step operational trace of `process_execution_payload_bid` -> `slash_validator` ->
-`2x process_builder_pending_payments` -> `apply_parent_execution_payload` (`beacon-chain.md:1579-1581`,
-`1719-1732`, `1784-1831`):
-1. At parent slot in `parentEpoch`, `process_execution_payload_bid` records `latestBidValue := bidValue`
-   and populates `secondEpochPayments[slotIdx]` with `amount := bidValue, proposerIndex := headerProposer`.
-2. In the same parent block's `process_operations` (or before epoch rotation), `slash_validator` runs on
-   `slashedIndex`. In `v1.7.0-beta.4` (`lines 1579-1581`), `slash_validator` checks
-   `if slashed_index == state.latest_block_header.proposer_index:`, clearing `secondEpochPayments[slotIdx]`
-   to `{}` while leaving `latestBidValue` untouched!
-3. Two epoch boundaries pass without a block (`process_builder_pending_payments` runs twice, rotating
-   and clearing both halves of `builder_pending_payments`).
-4. Child block arrives at `currentEpoch ≥ parentEpoch + 2` and runs `apply_parent_execution_payload`,
-   which enters the `else` branch (`parent_epoch < previous_epoch`) and appends `latestBidValue` to
-   `builder_pending_withdrawals`! -/
-def trace_bid_slash_rotate_apply_v170_beta4
-    (bidValue feeRecipient builderIdx headerProposer slashedIdx : Nat) :
-    List BuilderPendingWithdrawal :=
-  let paymentAfterBid : BuilderPendingPayment :=
-    { weight := 0
-      withdrawal := ⟨feeRecipient, bidValue, builderIdx⟩
-      proposerIndex := headerProposer }
-  -- Step 2: `slash_validator` (`beacon-chain.md:1579-1581`)
-  let paymentAfterSlash : BuilderPendingPayment :=
-    if slashedIdx == headerProposer then {} else paymentAfterBid
-  let latestBidAfterSlash : Nat := bidValue -- BUG: `latest_execution_payload_bid.value` is NOT zeroed!
-  -- Step 3: Two epoch boundaries (`process_builder_pending_payments` with quorum = 600,000,000,000)
-  let (first1, second1, w1) := process_builder_pending_payments 1 [paymentAfterSlash] [{}] []
-  let (_, _, w2) := process_builder_pending_payments 1 first1 second1 w1
-  -- Step 4: `apply_parent_execution_payload` at `parentEpoch = 4, currentEpoch = 6`
-  let s : GloasParentPaymentState := {
-    parentEpoch := 4
-    currentEpoch := 6
-    parentProposerSlashed := (slashedIdx == headerProposer)
-    latestBidValue := latestBidAfterSlash
-    latestBidFeeRecipient := feeRecipient
-    latestBidBuilderIndex := builderIdx
-    pendingPaymentSlotAmount := 0
-    pendingWithdrawals := w2
-    builderBalance := MIN_DEPOSIT_AMOUNT + bidValue
-    builderWithdrawableEpoch := FAR_FUTURE_EPOCH
-    untouchedCl := ⟨1, 2, 3⟩
-  }
-  (apply_parent_payment_v170_beta4_buggy s).pendingWithdrawals
-
-theorem t_7732_composed_trace_resurrects_slashed_payment :
-    trace_bid_slash_rotate_apply_v170_beta4 1000000 0xab 0 42 42 = [⟨0xab, 1000000, 0⟩] := by
-  decide
-
-/-- Finding 1.5 (`F-7732-EARLIER-SLOT-PROPOSER-SLASHING-NOT-CLEARED`, `beacon-chain.md:1579-1581`):
-When proposer `P1` proposes at slot `s1` (`payment1.proposerIndex = P1`), and at a later slot `s2 > s1`
-in the same epoch proposer `P2 ≠ P1` includes a `ProposerSlashing` or `AttesterSlashing` against `P1`,
-`state.latest_block_header.proposer_index` is already `P2` (updated in `process_block_header` before
-`process_operations`).
-- Unpatched `slash_validator` checks `if slashed_index == state.latest_block_header.proposer_index:`
-  (`P1 == P2`, which is `false`!) and leaves `P1`'s pending payment intact in `builder_pending_payments`.
-- Patched `slash_validator` scans `builder_pending_payments` for any entry with
-  `payment.proposerIndex == slashedIndex` and clears it to `{}`. -/
-def slash_pending_payment_v170_beta4_buggy
-    (latestHeaderProposer slashedIndex : Nat) (payment : BuilderPendingPayment) :
-    BuilderPendingPayment :=
-  if slashedIndex == latestHeaderProposer && payment.proposerIndex == latestHeaderProposer then
-    {}
-  else
-    payment
-
-def slash_pending_payment_patched
-    (_latestHeaderProposer slashedIndex : Nat) (payment : BuilderPendingPayment) :
-    BuilderPendingPayment :=
-  if payment.proposerIndex == slashedIndex then {} else payment
-
-def f_7732_earlier_slot_proposer_slashing_refuter :
-    WitnessRefuter (Nat × Nat × BuilderPendingPayment) BuilderPendingPayment
-      (fun ⟨_, slashedIdx, p⟩ post => p.proposerIndex = slashedIdx → post.withdrawal.amount = 0) where
-  reference := fun ⟨hdr, sl, p⟩ => slash_pending_payment_patched hdr sl p
-  mutant := fun ⟨hdr, sl, p⟩ => slash_pending_payment_v170_beta4_buggy hdr sl p
-  ref_sound := by
-    intro ⟨hdr, sl, p⟩ h_eq
-    simp [slash_pending_payment_patched, h_eq]
-  killWitness := (99, 42, { weight := 100, withdrawal := ⟨0xaa, 1000000, 0⟩, proposerIndex := 42 })
-  mutant_refuted := by decide
-
-/-! ## 2. Builder Solvency (`T-7732-BUILDER-SOLVENCY`), Pending Balance Accounting, and Exit Safety (`T-7732-EXIT-SAFETY`) -/
+/-! ## 2. Builder Solvency (`T-7732-BUILDER-SOLVENCY`), Supply Neutrality (`T-7732-NO-ETH-MINTING`),
+    and Exit Safety (`T-7732-EXIT-SAFETY`) -/
 
 /-- Exact `get_pending_balance_to_withdraw_for_builder` (`beacon-chain.md:1168-1179`). -/
 def get_pending_balance_to_withdraw_for_builder
@@ -332,23 +309,62 @@ theorem t_7732_builder_withdrawal_no_underflow (builderBalance withdrawn : Nat)
   unfold saturatingSub
   split <;> omega
 
-/-- Exact `is_active_builder` (`beacon-chain.md:1070-1075`):
-`builder.withdrawable_epoch == FAR_FUTURE_EPOCH and builder.deposit_epoch < finalized_epoch`. -/
+/-- T-7732-NO-ETH-MINTING (Potuz Property 1 — Supply Neutrality of Builder Bids):
+For any committed builder bid validated by `can_builder_cover_bid` (`beacon-chain.md:1184-1193`,
+`2179`) and settled through `settle_slot_bid_lifecycle` (`apply_parent_execution_payload` /
+`process_builder_pending_payments`) and `apply_withdrawals` (`beacon-chain.md:1997-2007`),
+the builder's post-withdrawal Beacon Chain balance plus the execution-layer withdrawal credited
+to `feeRecipient` equals the builder's pre-settlement balance (`postBuilderBalance + settled =
+builderBalance`), and the builder's remaining balance stays at or above `MIN_DEPOSIT_AMOUNT +
+pendingToWithdraw`. Thus builder bids never mint or destroy ETH across CL + EL. -/
+theorem t_7732_no_eth_minting
+    (builderBalance pendingToWithdraw feeRecipient bidValue builderIdx proposerIdx
+      attestedWeight quorum : Nat)
+    (timing : ChildConfirmationTiming)
+    (h_cover : can_builder_cover_bid builderBalance pendingToWithdraw bidValue = true)
+    (h_quorum : quorum > 0) :
+    let settled :=
+      sum_withdrawal_amounts
+        (settle_slot_bid_lifecycle feeRecipient bidValue builderIdx proposerIdx
+          attestedWeight quorum timing)
+    let postBuilderBalance := saturatingSub builderBalance settled
+    postBuilderBalance + settled = builderBalance ∧
+    postBuilderBalance ≥ MIN_DEPOSIT_AMOUNT + pendingToWithdraw := by
+  have h_solv := t_7732_builder_solvency builderBalance pendingToWithdraw bidValue h_cover
+  have h_single :=
+    t_7732_single_settlement feeRecipient bidValue builderIdx proposerIdx
+      attestedWeight quorum timing h_quorum
+  dsimp only
+  unfold saturatingSub
+  split <;> omega
+
+/-- Exact `is_active_builder` (`beacon-chain.md:1053-1065`):
+`builder.deposit_epoch < state.finalized_checkpoint.epoch and builder.withdrawable_epoch == FAR_FUTURE_EPOCH`. -/
 def is_active_builder (b : Builder) (finalizedEpoch : Nat) : Bool :=
   b.withdrawableEpoch == FAR_FUTURE_EPOCH && decide (b.depositEpoch < finalizedEpoch)
 
 def can_builder_exit (isActive : Bool) (pendingToWithdraw : Nat) : Bool :=
   isActive && decide (pendingToWithdraw = 0)
 
-/-- T-7732-EXIT-SAFETY: `process_builder_exit_request` only initiates a builder exit when
-`pendingToWithdraw = 0`, preventing an exiting builder from defaulting on pending bids. -/
+/-- T-7732-EXIT-SAFETY: `process_builder_exit_request` (`beacon-chain.md:2368-2384`) only initiates
+a builder exit when `pendingToWithdraw = 0`, preventing an exiting builder from defaulting on
+pending bids. -/
 theorem t_7732_exit_safety (isActive : Bool) (pendingToWithdraw : Nat)
     (h : can_builder_exit isActive pendingToWithdraw = true) :
     isActive = true ∧ pendingToWithdraw = 0 := by
   simpa [can_builder_exit] using h
 
-/-! ## 3. Quorum Anti-Double-Counting (`T-7732-QUORUM-NO-DOUBLE-COUNT`, `beacon-chain.md:2447-2467`) -/
+/-! ## 3. Unconditional Quorum Weight Anti-Double-Counting
+    (`T-7732-QUORUM-NO-DOUBLE-COUNT`, `T-7732-QUORUM-WEIGHT-UNCONDITIONAL`,
+    `beacon-chain.md:2447-2467`) -/
 
+/-- Single-validator weight accrual step in `process_attestation` (`beacon-chain.md:2447-2467`):
+`had_no_participation = (epoch_participation[index] == 0b0000_0000)`.
+When `alreadyParticipated = false` (`had_no_participation = true`), the first attestation that sets
+a new participation flag transitions `alreadyParticipated` to `true` and adds `effectiveBalance`
+to `payment.weight`. Any subsequent attestation for the same validator in the same epoch sees
+`alreadyParticipated = true` (`had_no_participation = false`) and leaves `payment.weight`
+unchanged. -/
 def accrue_attester_weight (alreadyParticipated : Bool) (currentWeight effectiveBalance : Nat) :
     Bool × Nat :=
   if alreadyParticipated then
@@ -356,19 +372,264 @@ def accrue_attester_weight (alreadyParticipated : Bool) (currentWeight effective
   else
     (true, currentWeight + effectiveBalance)
 
-/-- T-7732-QUORUM-NO-DOUBLE-COUNT: Even if an attester equivocates on target roots within
-the same block (PR #5172), `had_no_participation && will_set_new_flag` gates weight accrual
-so two attestations from the same validator add `effectiveBalance` at most once. -/
+/-- Multi-attestation fold for a validator across an arbitrary sequence of attestations in an epoch
+(`beacon-chain.md:2445-2467`), where each `willSetNewFlag : Bool` indicates whether that
+attestation sets a new participation flag for the validator. -/
+def accrue_attester_weight_trace
+    (alreadyParticipated : Bool) (currentWeight effectiveBalance : Nat)
+    (steps : List Bool) : Bool × Nat :=
+  steps.foldl
+    (fun (st : Bool × Nat) willSetNewFlag =>
+      if willSetNewFlag then
+        accrue_attester_weight st.1 st.2 effectiveBalance
+      else
+        st)
+    (alreadyParticipated, currentWeight)
+
+/-- T-7732-QUORUM-NO-DOUBLE-COUNT: Two attestations from the same validator within the same epoch
+add `effectiveBalance` to `payment.weight` at most once (`beacon-chain.md:2447-2467`). -/
 theorem t_7732_quorum_no_double_count (w eb : Nat) :
     let (flag1, w1) := accrue_attester_weight false w eb
     let (_, w2) := accrue_attester_weight flag1 w1 eb
     w2 = w + eb := rfl
 
-/-! ## 4. Deferred Execution Equivalence (`T-7732-DEFERRED-EXEC-EQUIV`) & Frame Theorem (`T-7732-FRAME`) -/
+private theorem accrue_attester_weight_trace_already_participated
+    (w eb : Nat) (steps : List Bool) :
+    (accrue_attester_weight_trace true w eb steps).2 = w := by
+  induction steps generalizing w with
+  | nil => rfl
+  | cons willSet rest ih =>
+    dsimp [accrue_attester_weight_trace]
+    cases willSet <;> simp [accrue_attester_weight, accrue_attester_weight_trace] at ih ⊢ <;> exact ih w
+
+/-- T-7732-QUORUM-WEIGHT-UNCONDITIONAL: Unconditionally across any arbitrary sequence of
+attestations `steps : List Bool` in an epoch, a single validator contributes at most
+`effectiveBalance` to `payment.weight` (`beacon-chain.md:2447-2467`). -/
+theorem t_7732_quorum_weight_unconditional
+    (alreadyParticipated : Bool) (w eb : Nat) (steps : List Bool) :
+    (accrue_attester_weight_trace alreadyParticipated w eb steps).2 ≤
+      w + (if alreadyParticipated then 0 else eb) := by
+  induction steps generalizing alreadyParticipated w with
+  | nil =>
+    dsimp [accrue_attester_weight_trace]
+    omega
+  | cons willSet rest ih =>
+    cases alreadyParticipated
+    · cases willSet
+      · change (accrue_attester_weight_trace false w eb rest).2 ≤ w + (if false = true then 0 else eb)
+        exact ih false w
+      · change (accrue_attester_weight_trace true (w + eb) eb rest).2 ≤ w + (if false = true then 0 else eb)
+        rw [accrue_attester_weight_trace_already_participated (w + eb) eb rest]
+        simp
+    · rw [accrue_attester_weight_trace_already_participated w eb (willSet :: rest)]
+      simp
+
+/-! ## 4. Same-Slot Unbundling Resistance (`T-7732-SAME-SLOT-UNBUNDLING`,
+    `beacon-chain.md:1841-1854, 2162-2216`) -/
+
+/-- Candidate execution payload for a slot, modeled by its `blockHash` (`payload.block_hash`)
+and list of included transactions `transactions`. -/
+structure SlotCandidatePayload where
+  blockHash : Nat
+  transactions : List Nat
+  deriving Repr, DecidableEq, BEq
+
+/-- In `process_execution_payload_bid` (`beacon-chain.md:2162-2216`), the beacon block at slot `N`
+commits to `state.latest_execution_payload_bid.block_hash = bid.block_hash`.
+In `process_parent_execution_payload` (`beacon-chain.md:1841-1854`), a full execution payload for
+slot `N` becomes canonical if and only if `child_bid.parent_block_hash == parent_bid.block_hash`
+(and if not, slot `N` is canonical with an empty payload, so no slot-`N` execution transactions
+take effect). -/
+def is_canonical_full_slot_payload (committedBidBlockHash : Nat) (candidate : SlotCandidatePayload) : Bool :=
+  candidate.blockHash == committedBidBlockHash
+
+/-- T-7732-SAME-SLOT-UNBUNDLING (Potuz Property 3 — Same-Slot Unbundling Resistance):
+Suppose at slot `N`:
+1. The unique consensus block at slot `N` commits via `process_execution_payload_bid`
+   (`beacon-chain.md:2215`) to the builder's bid hash `committedBidBlockHash = builderPayload.blockHash`.
+2. `block_hash` is collision-resistant across candidate payloads at slot `N`
+   (`candidate.blockHash = builderPayload.blockHash → candidate = builderPayload`).
+Then for any candidate execution payload `candidate` that becomes canonical at slot `N`
+(`is_canonical_full_slot_payload committedBidBlockHash candidate = true`) and includes a private
+transaction `txPriv` (`txPriv ∈ candidate.transactions`), `candidate` is necessarily the builder's
+own committed payload (`candidate = builderPayload ∧ txPriv ∈ builderPayload.transactions`). No
+other canonical block at slot `N` can unbundle and include `txPriv`. -/
+theorem t_7732_same_slot_unbundling
+    (committedBidBlockHash txPriv : Nat)
+    (builderPayload candidate : SlotCandidatePayload)
+    (h_bid_commit : committedBidBlockHash = builderPayload.blockHash)
+    (h_hash_inj : candidate.blockHash = builderPayload.blockHash → candidate = builderPayload)
+    (h_canonical : is_canonical_full_slot_payload committedBidBlockHash candidate = true)
+    (h_tx_in : txPriv ∈ candidate.transactions) :
+    candidate = builderPayload ∧ txPriv ∈ builderPayload.transactions := by
+  unfold is_canonical_full_slot_payload at h_canonical
+  rw [beq_iff_eq] at h_canonical
+  have h_hash_eq : candidate.blockHash = builderPayload.blockHash := by
+    omega
+  have h_eq : candidate = builderPayload := h_hash_inj h_hash_eq
+  subst h_eq
+  exact ⟨rfl, h_tx_in⟩
+
+/-! ## 5. Faithful `slash_validator` Pending-Payment Loop (`beacon-chain.md:1549-1582`),
+    `F-7732-SLASHED-PAYMENT-RESURRECTION`, and `T-7732-SLASHED-NO-RESURRECTION` -/
+
+/-- Exact transcription of the Gloas addition in `slash_validator` (`beacon-chain.md:1578-1581`):
+```python
+for payment_index, payment in enumerate(state.builder_pending_payments):
+    if payment.proposer_index == slashed_index:
+        state.builder_pending_payments[payment_index] = BuilderPendingPayment.empty()
+```
+Clears every pending payment entry in `state.builder_pending_payments` whose `proposer_index`
+equals `slashedIndex`. -/
+def slash_validator_pending_payments
+    (slashedIndex : Nat) (payments : List BuilderPendingPayment) :
+    List BuilderPendingPayment :=
+  payments.map (fun payment =>
+    if payment.proposerIndex == slashedIndex then {} else payment)
+
+/-- Every entry in `slash_validator_pending_payments slashedIndex payments` whose original
+or remaining `proposerIndex` equals `slashedIndex` has `withdrawal.amount = 0` and `weight = 0`. -/
+theorem t_7732_slash_validator_clears_matching_payments
+    (slashedIndex : Nat) (payment : BuilderPendingPayment)
+    (h_match : payment.proposerIndex = slashedIndex) :
+    (slash_validator_pending_payments slashedIndex [payment]) = [{}] := by
+  simp [slash_validator_pending_payments, h_match]
+
+/-- Unpatched `v1.7.0-beta.4` (`aa16bb4c`) `slash_validator` + `apply_parent_execution_payload`
+(`beacon-chain.md:1579-1581, 1799-1814`):
+`slash_validator` clears all matching entries in `state.builder_pending_payments` (PR #5719),
+setting `pendingPaymentSlotAmount := 0`, but leaves `state.latest_execution_payload_bid.value > 0`.
+When `parentEpoch + 1 < currentEpoch` (`parent_epoch < get_previous_epoch(state)`, 2+ missed epochs),
+`apply_parent_execution_payload` falls into `elif parent_bid.value > 0:` (`lines 1805-1814`) and
+resurrects the slashed proposer's withdrawal directly from `parent_bid.value`! -/
+def apply_parent_payment_v170_beta4_buggy (s : GloasParentPaymentState) : GloasParentPaymentState :=
+  let slotPayment := if s.parentProposerSlashed then 0 else s.pendingPaymentSlotAmount
+  if s.parentEpoch == s.currentEpoch || s.parentEpoch + 1 == s.currentEpoch then
+    if slotPayment > 0 then
+      { s with
+        pendingPaymentSlotAmount := 0
+        pendingWithdrawals := s.pendingWithdrawals ++
+          [⟨s.latestBidFeeRecipient, slotPayment, s.latestBidBuilderIndex⟩] }
+    else
+      { s with pendingPaymentSlotAmount := 0 }
+  else if s.latestBidValue > 0 then
+    { s with
+      pendingWithdrawals := s.pendingWithdrawals ++
+        [⟨s.latestBidFeeRecipient, s.latestBidValue, s.latestBidBuilderIndex⟩] }
+  else
+    s
+
+/-- Patched `slash_validator` + `apply_parent_execution_payload`:
+Slashing the parent proposer zeroes `latestBidValue` (or gates the `elif parent_bid.value > 0`
+branch on `not state.validators[parent_proposer_index].slashed`) alongside
+`builder_pending_payments[payment_index]`, preventing payment resurrection across any number of
+missed epochs. -/
+def apply_parent_payment_patched (s : GloasParentPaymentState) : GloasParentPaymentState :=
+  let slotPayment := if s.parentProposerSlashed then 0 else s.pendingPaymentSlotAmount
+  let bidValue := if s.parentProposerSlashed then 0 else s.latestBidValue
+  if s.parentEpoch == s.currentEpoch || s.parentEpoch + 1 == s.currentEpoch then
+    if slotPayment > 0 then
+      { s with
+        pendingPaymentSlotAmount := 0
+        latestBidValue := bidValue
+        pendingWithdrawals := s.pendingWithdrawals ++
+          [⟨s.latestBidFeeRecipient, slotPayment, s.latestBidBuilderIndex⟩] }
+    else
+      { s with pendingPaymentSlotAmount := 0, latestBidValue := bidValue }
+  else if bidValue > 0 then
+    { s with
+      latestBidValue := bidValue
+      pendingWithdrawals := s.pendingWithdrawals ++
+        [⟨s.latestBidFeeRecipient, bidValue, s.latestBidBuilderIndex⟩] }
+  else
+    { s with latestBidValue := bidValue }
+
+/-- T-7732-SLASHED-NO-RESURRECTION: On the patched specification, if `parentProposerSlashed = true`,
+`apply_parent_execution_payload` never appends a `BuilderPendingWithdrawal` regardless of how
+many epochs elapsed between the parent block and the child block. -/
+theorem t_7732_slashed_no_resurrection (s : GloasParentPaymentState)
+    (h_slashed : s.parentProposerSlashed = true) :
+    (apply_parent_payment_patched s).pendingWithdrawals = s.pendingWithdrawals := by
+  unfold apply_parent_payment_patched
+  simp [h_slashed]
+  split <;> rfl
+
+/-- Explicit `WitnessRefuter` proving the bug `F-7732-SLASHED-PAYMENT-RESURRECTION` in
+`ethereum/consensus-specs` `v1.7.0-beta.4` (`aa16bb4c`): when `parentProposerSlashed = true`
+and `parentEpoch = 4, currentEpoch = 6`, `apply_parent_payment_v170_beta4_buggy` resurrects
+the 1,000,000 Gwei withdrawal for the slashed proposer. -/
+def f_7732_slashed_payment_resurrection_refuter :
+    WitnessRefuter GloasParentPaymentState GloasParentPaymentState
+      (fun pre post => pre.parentProposerSlashed = true → post.pendingWithdrawals = pre.pendingWithdrawals) where
+  reference := apply_parent_payment_patched
+  mutant := apply_parent_payment_v170_beta4_buggy
+  ref_sound := fun s h => t_7732_slashed_no_resurrection s h
+  killWitness := {
+    parentEpoch := 4
+    currentEpoch := 6
+    parentProposerSlashed := true
+    latestBidValue := 1000000
+    latestBidFeeRecipient := 0xab
+    latestBidBuilderIndex := 0
+    pendingPaymentSlotAmount := 0
+    pendingWithdrawals := []
+    builderBalance := MIN_DEPOSIT_AMOUNT + 1000000
+    builderWithdrawableEpoch := FAR_FUTURE_EPOCH
+    untouchedCl := ⟨1, 2, 3⟩
+  }
+  mutant_refuted := by decide
+
+/-- Multi-step operational trace of `process_execution_payload_bid` -> `slash_validator` ->
+`2x process_builder_pending_payments` -> `apply_parent_execution_payload` (`beacon-chain.md:1579-1581`,
+`1719-1732`, `1784-1831`):
+1. At parent slot in `parentEpoch`, `process_execution_payload_bid` records `latestBidValue := bidValue`
+   and populates `secondEpochPayments[slotIdx]` with `amount := bidValue, proposerIndex := headerProposer`.
+2. In `slash_validator` (`beacon-chain.md:1579-1581`), `slash_validator_pending_payments` iterates over
+   `state.builder_pending_payments` and clears every entry with `payment.proposer_index == slashedIdx`
+   to `{}`, while leaving `state.latest_execution_payload_bid.value` (`latestBidValue`) untouched!
+3. Two epoch boundaries pass without a block (`process_builder_pending_payments` runs twice, rotating
+   and clearing both halves of `builder_pending_payments`).
+4. Child block arrives at `currentEpoch ≥ parentEpoch + 2` and runs `apply_parent_execution_payload`,
+   which enters the `elif parent_bid.value > 0:` branch (`parent_epoch < previous_epoch`, lines 1805-1814)
+   and appends `latestBidValue` to `builder_pending_withdrawals`! -/
+def trace_bid_slash_rotate_apply_v170_beta4
+    (bidValue feeRecipient builderIdx headerProposer slashedIdx : Nat) :
+    List BuilderPendingWithdrawal :=
+  let paymentAfterBid : BuilderPendingPayment :=
+    { weight := 0
+      withdrawal := ⟨feeRecipient, bidValue, builderIdx⟩
+      proposerIndex := headerProposer }
+  -- Step 2: `slash_validator` (`beacon-chain.md:1579-1581`)
+  let paymentsAfterSlash := slash_validator_pending_payments slashedIdx [paymentAfterBid]
+  let latestBidAfterSlash : Nat := bidValue -- `latest_execution_payload_bid.value` is NOT zeroed!
+  -- Step 3: Two epoch boundaries (`process_builder_pending_payments` with quorum = 1)
+  let (first1, second1, w1) := process_builder_pending_payments 1 [{}] paymentsAfterSlash []
+  let (_, _, w2) := process_builder_pending_payments 1 first1 second1 w1
+  -- Step 4: `apply_parent_execution_payload` at `parentEpoch = 4, currentEpoch = 6`
+  let s : GloasParentPaymentState := {
+    parentEpoch := 4
+    currentEpoch := 6
+    parentProposerSlashed := (slashedIdx == headerProposer)
+    latestBidValue := latestBidAfterSlash
+    latestBidFeeRecipient := feeRecipient
+    latestBidBuilderIndex := builderIdx
+    pendingPaymentSlotAmount := 0
+    pendingWithdrawals := w2
+    builderBalance := MIN_DEPOSIT_AMOUNT + bidValue
+    builderWithdrawableEpoch := FAR_FUTURE_EPOCH
+    untouchedCl := ⟨1, 2, 3⟩
+  }
+  (apply_parent_payment_v170_beta4_buggy s).pendingWithdrawals
+
+theorem t_7732_composed_trace_resurrects_slashed_payment :
+    trace_bid_slash_rotate_apply_v170_beta4 1000000 0xab 0 42 42 = [⟨0xab, 1000000, 0⟩] := by
+  decide
+
+/-! ## 6. Deferred Execution Equivalence (`T-7732-DEFERRED-EXEC-EQUIV`) & Frame Theorem (`T-7732-FRAME`) -/
 
 /-- T-7732-DEFERRED-EXEC-EQUIV: When `bid.parent_block_hash != parent_bid.block_hash` (empty parent),
-`process_parent_execution_payload` leaves builder pending withdrawals, builder balances, and
-builder exit epochs untouched. -/
+`process_parent_execution_payload` (`beacon-chain.md:1841-1854`) leaves builder pending withdrawals,
+builder balances, and builder exit epochs untouched. -/
 def process_parent_payload_if_full (isParentFull : Bool) (s : GloasParentPaymentState) :
     GloasParentPaymentState :=
   if isParentFull then apply_parent_payment_patched s else s
@@ -392,8 +653,8 @@ theorem t_7732_frame (s : GloasParentPaymentState) (steps : List Bool) :
       s.untouchedCl :=
   eip7732_frame_invariant.preserved_list s steps
 
-/-! ## 5. EIP-8282 -> EIP-7732 Builder Queue Closure (`T-8282-7732-QUEUE-SAFETY`) and
-    Refuter for `F-8282-TOPUP-CREDENTIAL-PREFIX-DROP` (`beacon-chain.md:2334-2361`) -/
+/-! ## 7. EIP-8282 -> EIP-7732 Builder Queue Closure (`T-8282-7732-QUEUE-SAFETY`) and
+    Cross-Function Credential-Check Divergence (`beacon-chain.md:2334-2361` vs `fork.md:70-120`) -/
 
 /-- Under Gloas (`process_parent_execution_payload:1841-1854`), when a child block confirms
 an EMPTY parent (`isParentFull = false`), `block.body.parent_execution_requests` MUST be empty;
@@ -414,7 +675,8 @@ theorem t_8282_7732_queue_safety (isParentFull requestsEmpty : Bool)
   unfold valid_parent_execution_requests at h
   cases isParentFull <;> simp_all
 
-/-- Input to `process_builder_deposit_request` (`beacon-chain.md:2334-2361`). -/
+/-- Input to `process_builder_deposit_request` (`beacon-chain.md:2334-2361`) and
+`onboard_builders_from_pending_deposits` (`fork.md:70-120`). -/
 structure BuilderDepositStep where
   pubkeyRegistered : Bool
   credentialPrefix : Nat
@@ -423,13 +685,14 @@ structure BuilderDepositStep where
   depositAmount : Nat
   deriving Repr, DecidableEq, BEq
 
-/-- Unpatched `process_builder_deposit_request` (`beacon-chain.md:2334-2361` @ `v1.7.0-beta.4`):
+/-- `process_builder_deposit_request` (`beacon-chain.md:2334-2361` @ `v1.7.0-beta.4`):
 Checks `if not is_builder_withdrawal_credential(request.withdrawal_credentials): return` at line 2336
 BEFORE checking `if request.pubkey not in builder_pubkeys:` at line 2340!
 If an existing builder (`pubkeyRegistered = true`) submits a top-up with a non-`0xB0` credential
-prefix (e.g., `0x00` or `0x01`), the deposit is silently dropped and the ETH burned on the EL is
-permanently lost on the CL, violating `EIP-8282` ("top-ups do not validate withdrawal_credentials
-or signature", matching `onboard_builders_from_pending_deposits` in `fork.md:92-118`). -/
+prefix (e.g., `0x00` or `0x01`), the deposit is silently ignored and the ETH burned on the EL is
+not credited on the CL, diverging from `onboard_builders_from_pending_deposits` in `fork.md:92-118`
+(which checks `if deposit.pubkey not in builder_pubkeys:` at line 92 first and credits top-ups at
+lines 115-117 without checking `withdrawal_credentials`). -/
 def process_builder_deposit_v170_beta4_buggy (s : BuilderDepositStep) : Nat :=
   if s.credentialPrefix != BUILDER_WITHDRAWAL_PREFIX then
     s.currentBalance
@@ -438,7 +701,7 @@ def process_builder_deposit_v170_beta4_buggy (s : BuilderDepositStep) : Nat :=
   else
     s.currentBalance + s.depositAmount
 
-/-- EIP-8282 compliant `process_builder_deposit_request` (matching `fork.md:92-118`):
+/-- Top-up-permissive `process_builder_deposit_request` (matching `fork.md:92-118`):
 Checks `if request.pubkey not in builder_pubkeys:` first, so top-ups to already-registered builders
 always credit `builder.balance += request.amount` regardless of `withdrawal_credentials`. -/
 def process_builder_deposit_eip8282_patched (s : BuilderDepositStep) : Nat :=
@@ -471,16 +734,15 @@ def f_8282_topup_credential_prefix_drop_refuter :
   }
   mutant_refuted := by decide
 
-/-! ## 6. `F-7732-FORK-ONBOARD-CROSS-CREDENTIAL` (1.6), `F-7732-FORK-SLOT-AVAILABILITY-BIT-HIGH` (1.2),
-    and `F-7732-AVAILABILITY-RING-BUFFER-CLOBBER` (1.3) -/
-
-/-- Finding 1.6 (`F-7732-FORK-ONBOARD-CROSS-CREDENTIAL`, `fork.md:70-120` vs `beacon-chain.md:2336`):
-In `onboard_builders_from_pending_deposits` (`fork.md:92-118`), a pending deposit with
-`is_builder_withdrawal_credential == false` (e.g., `0x01`) Whose `pubkey` is already in `builder_pubkeys`
-(registered by an earlier `0xB0` deposit in the same queue) enters the `else` branch at line 94 and
-is credited to `state.builders[builder_index].balance` instead of remaining in `state.pending_deposits`
-for validator processing (whereas `process_builder_deposit_request` in `beacon-chain.md:2336` checks
-`is_builder_withdrawal_credential` first). -/
+/-- Cross-function divergence in `onboard_builders_from_pending_deposits` (`fork.md:70-120` vs
+`beacon-chain.md:2336`):
+In `onboard_builders_from_pending_deposits` (`fork.md:92-118`), `if deposit.pubkey not in builder_pubkeys:`
+is checked at line 92 before `if not is_builder_withdrawal_credential(deposit.withdrawal_credentials):`
+at line 93. Thus a pending deposit in `state.pending_deposits` with `is_builder_withdrawal_credential == false`
+(e.g., `0x01`) whose `pubkey` is already in `builder_pubkeys` (registered by an earlier `0xB0` deposit in
+the same queue) enters the `else:` branch at lines 115-117 and is consumed into
+`state.builders[builder_index].balance` instead of remaining in `state.pending_deposits`, whereas
+`process_builder_deposit_request` (`beacon-chain.md:2336`) checks `is_builder_withdrawal_credential` first. -/
 def onboard_pending_deposit_fork_v170_beta4 (s : BuilderDepositStep) : Bool × Nat :=
   if s.pubkeyRegistered then
     (true, s.currentBalance + s.depositAmount)
@@ -520,6 +782,9 @@ def f_7732_fork_onboard_cross_credential_refuter :
   }
   mutant_refuted := by decide
 
+/-! ## 8. `F-7732-FORK-SLOT-AVAILABILITY-BIT-HIGH` (`fork.md:198-200`) and
+    `F-7732-AVAILABILITY-RING-BUFFER-CLOBBER` (`beacon-chain.md:1620-1622, 1829`) -/
+
 /-- Genuine Ring-Buffer State Model for `state.execution_payload_availability`
 (`Bitvector[SLOTS_PER_HISTORICAL_ROOT]`, `fork.md:198-200`, `beacon-chain.md:1620-1622, 1829`). -/
 structure AvailabilityRing where
@@ -537,13 +802,13 @@ def AvailabilityRing.setBit (r : AvailabilityRing) (slot : Nat) (val : Bool) : A
   let idx := slot % r.size
   { r with bits := (idx, val) :: r.bits.filter (fun p => p.1 != idx) }
 
-/-- `process_slot` (`beacon-chain.md:1620-1622`):
+/-- `process_slot` (`beacon-chain.md:1608-1623`, specifically lines `1620-1622`):
 At the end of `process_slot(state)` (just before `state.slot += 1` in `process_slots`),
 sets `state.execution_payload_availability[(state.slot + 1) % SLOTS_PER_HISTORICAL_ROOT] = 0b0`. -/
 def process_slot_ring (r : AvailabilityRing) (currentSlot : Nat) : AvailabilityRing :=
   r.setBit (currentSlot + 1) false
 
-/-- `apply_parent_execution_payload` (`beacon-chain.md:1829`):
+/-- `apply_parent_execution_payload` (`beacon-chain.md:1784-1831`, specifically line `1829`):
 When the child block confirms that the parent block at `parentSlot` had a full payload
 (`isParentFull = true`), sets `state.execution_payload_availability[parentSlot % size] = 0b1`. -/
 def apply_parent_payload_ring (r : AvailabilityRing) (parentSlot : Nat) (isParentFull : Bool) :
