@@ -124,3 +124,16 @@
 - **Location:** `src/ethereum/forks/amsterdam/vm/interpreter.py:133-196` (`create_evm`, specifically `line 161`) & `235-288` (`process_top_level`, specifically `lines 264-277`)
 - **Root Cause:** In `process_top_level` (`interpreter.py:265`), `create_evm` runs inside `try: ... except ExceptionalHalt:` *before* `get_account(tx_env.state, tx_env.target)` is called at `line 277`. Inside `create_evm` (`line 161`), `set_delegation(block_env, tx_env, gas_meter)` is called before `create_evm` returns. If `set_delegation` raises `OutOfGasError` (a subclass of `ExceptionalHalt`, e.g., when charging `StateGasCosts.NEW_ACCOUNT = 183,600`), `process_top_level` catches `ExceptionalHalt` at `line 269`, calls `restore_tx_state` and `restore_state_gas_to_entry`, and returns early at `line 275` before `get_account(tx_env.state, tx_env.target)` at `line 277` is reached. Thus `tx_env.target` is omitted from `tx_state.account_reads` even though the sender paid `COLD_ACCOUNT_ACCESS` (`3,000` gas) for `tx.to` in intrinsic gas.
 - **Formal Refuter:** `f_2780_7928_set_delegation_oog_omits_recipient_refuter` in `Glamsterdam/Gas/Spec.lean`.
+
+---
+
+## 4. Upstream War-Room & Coordination Sync (`fradamt/8037-coordination`, `ethereum/8037-findings`, `fradamt/evm-gas-semantics-lean`)
+
+1. **Three-Repository Architecture (2026-10-25)**:
+   - `fradamt/8037-coordination`: AI investigation, EELS/geth screening, spec-variant evaluation (`D0`, `D13R`, `D13S`, `ethereum/EIPs#12581`), and blind cross-model-family triage.
+   - `ethereum/8037-findings`: War-room registry and team outreach status (`SUMMARY.md` in PR #140, ranking rules in PR #139, pre-submission fact checks in PR #138).
+   - `fradamt/evm-gas-semantics-lean`: Shared Lean 4 Amsterdam gas semantics (`FV-CORE`, coordinated on `fradamt/8037-coordination#191`).
+2. **Submitted Upstream Contributions (`fradamt/8037-coordination#214`, `PR #215`)**:
+   - **Multi-Frame `D13S` Counterexamples & `#12581` Comparison (`#70`)**: Submitted `results/SPEC/multiframe-and-eels/README.md` and `check_d13s_multiframe.py` demonstrating `F-D13S-1` (`t_calltree_e3_m4_sibling_underflow_and_d13s_break`), `F-D13S-2` (`t_calltree_d13s_reopens_t2_on_child_clear`), and `F-D13S-3` (`t_calltree_d13s_failed_create_strands_gas`), and contrasting them with `ethereum/EIPs#12581` (`b86de3f4`).
+   - **Cross-EIP EELS (`16898000`) Edge Findings (`X-EIP-SET`)**: Submitted `F-2780-7928-SET-DELEGATION-OOG-OMITS-RECIPIENT-READ`, `F-8246-BAL-STORAGE-CLEARS-IGNORED`, and `F-8246-UNCHECKED-SYS-TX-DROPS-ACCOUNTS-TO-DELETE`. (Note: under `fradamt/8037-coordination/SEVERITY.md` §6 rule 10, `F-8038-7778-SSTORE-RESET-REFUND-CAP-AND-BLOCK-GAS` is intentional spec cost behavior rather than an on-chain contract break.)
+   - **`FV-CORE` Aave V3 Offset Resolution (`#191`)**: Resolved the `+60` (`5 * 12`) and `+312` (`26 * 12`) intrinsic calldata delta discrepancy between `scripts/model.py` and `AaveV3/Model.lean` in `plans/FV-CORE/inputs/requirements.md:89-92`, confirming `AaveV3/Model.lean` and `checks/models.json` (`models_s0`) as the validated `s0` source.
