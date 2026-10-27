@@ -57,3 +57,27 @@ It did **not** reach the differential-test stage. The earlier PR #1 comment attr
 this failure to missing differential dependencies was incorrect. No new Lean guarantee,
 source-map pin, or full-audit closure is asserted by this documentation update.
 Signal/Hindsight remains pending the same access request; this is repository-sourced context.
+
+### Validation refresh — 2026-10-27 08:31 UTC
+
+Turbo-Lean PR #262 merged as `b862fbf`; independent Astra review found no blocker.
+A release binary built from its identical source tree `cd3cc3f` has SHA-256
+`372c155fba8316d82c8f7c1ba56268947f0af14e2c8d4f2e677ba6f7d6374389`.
+With this binary and Lean 4.31, trusted ci-verify passes: 17 files, 336 theorem
+shards, zero sorry/native_decide; receipt
+`1728eb19bb35b29f9da89a26f8f359455a189fbca5e77c09461b7b7324db4add`.
+
+The first corrected run then exposed missing generated C for MetaSpec in the
+differential shared library. `lake build glamsterdam_spec_cabi` supplied the
+missing artifacts (23 jobs). After that explicit preparation, `make check`
+passed: all seven pytest cases, differential agreement, 60/60 kernel axiom
+audit, 23 vendored hashes and 61 source mappings. Its trusted verifier reused
+the preceding successful receipt. This is not an untrusted Warci result or a
+claim that unprepared `make check` builds every required C artifact.
+
+Upstream `main` at `596ed68` restores the server-pinned allowlist, per the lead's
+[confirmation](https://github.com/fradamt/8037-coordination/issues/191#issuecomment-6436669470).
+Fetched jo `95db803` still has hash `1752669a…`, so it still needs that main
+integration. No server re-pin is needed. CallBridge/J work remains with its
+owners; cached sandbox provenance and native-thread/RLIMIT reproduction remain
+our separate open verifier issues. No fresh Signal information was accessed.
