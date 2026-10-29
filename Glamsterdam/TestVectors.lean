@@ -9,6 +9,8 @@ import Glamsterdam.Common.ElCore
 import Glamsterdam.Eip8246.Spec
 import Glamsterdam.Gas.Spec
 import Glamsterdam.Gas.CallTree
+import Glamsterdam.Gas.Eip12582
+import Glamsterdam.Gas.DecisionMatrix
 import Glamsterdam.Gloas7732.Spec
 
 /-!
@@ -31,6 +33,8 @@ open Glamsterdam.Common.ElCore
 open Glamsterdam.Eip8246.Spec
 open Glamsterdam.Gas.Spec
 open Glamsterdam.Gas.CallTree
+open Glamsterdam.Gas.Eip12582
+open Glamsterdam.Gas.DecisionMatrix
 open Glamsterdam.Gloas7732.Spec
 
 /-! ## 1. `ElCore` State Tracker & `GasMeter` Test Vectors -/
@@ -263,6 +267,33 @@ theorem tv_calltree_multi_frame_vectors :
     run_m4_sibling_delta_trace .amsterdamD13 500000 20000 = some ⟨391980, 371880, false⟩ ∧
     run_m4_sibling_delta_trace .amsterdamD13R 500000 20000 = some ⟨391980, 469800, true⟩ ∧
     run_m4_sibling_delta_trace .amsterdamD13S 500000 20000 = some ⟨391980, 469800, true⟩ := by
+  decide
+
+/-! ## 6. Dual-Pin & War-Room Decision-Matrix Test Vectors (`#5736`, `#5763`, `#307`, `#12581`, `#12582`, `8246`, `7702`) -/
+
+/-- Test Vector 8: `consensus-specs#5736` (`onboard_builders_pending_deposit_pr5736`),
+`consensus-specs#5763` (`should_build_on_full`), `FINDING-028/031` (`validate_bid_aligned`),
+`ethereum/8037-findings#307` (`decide_fork_response`, `glamsterdam_dm_value_call_forwarded_cabi`),
+`FINDING-042` (`validate_auth_tuple` & `exec_type4_tx_amsterdam`), and
+`FINDING-023/037` (`eip8246_same_tx_selfdestruct_self_post_balance_cabi`). -/
+theorem tv_warroom_dual_pin_and_decision_matrix_vectors :
+    eip7732_pr5736_onboard_consumed_cabi 0 1 1 0 1 2000000000 1000000000 = false ∧
+    eip7732_pr5736_onboard_consumed_cabi 1 1 1 0 1 2000000000 1000000000 = true ∧
+    eip7732_pr5736_onboard_builder_balance_cabi 1 1 1 0 1 2000000000 1000000000 = 3000000000 ∧
+    eip7732_pr5763_should_build_on_full_cabi 99 100 1 = true ∧
+    eip7732_validate_bid_aligned_cabi 1 0 1 1 1 1 1 1 1 1 0x1111 0x2222 3 6 = true ∧
+    eip7732_validate_bid_aligned_cabi 1 0 1 1 1 1 1 1 1 1 0x2222 0x2222 3 6 = false ∧
+    eip7732_validate_bid_aligned_cabi 1 0 1 1 1 1 1 1 1 0 0x1111 0x2222 3 6 = false ∧
+    decide_fork_response ⟨true, false, false, .eipSpecific, true, true, false, false⟩ = .adoptRevisedSpec ∧
+    decide_fork_response ⟨true, false, false, .inherent, true, true, false, false⟩ = .withdrawEip ∧
+    decide_fork_response ⟨true, false, false, .inherent, true, true, false, true⟩ = .acceptBreak ∧
+    glamsterdam_dm_legacy_share_cabi 97920 20000 10000 = 10000 ∧
+    glamsterdam_dm_settle_capped_repaid_cabi 171000 21000 2080 0 97920 50000 = 79584 ∧
+    glamsterdam_dm_value_call_forwarded_cabi 1000000 1000000 = 945690 ∧
+    glamsterdam_dm_value_call_forwarded_cabi 1000000 0 = 789568 ∧
+    glamsterdam_dm_pre_exec_oog_paid_cabi 20000000 21000 3222784 = 16777216 ∧
+    eip8246_same_tx_selfdestruct_self_post_balance_cabi 0 1000 = 0 ∧
+    eip8246_same_tx_selfdestruct_self_post_balance_cabi 1 1000 = 1000 := by
   decide
 
 end Glamsterdam.TestVectors

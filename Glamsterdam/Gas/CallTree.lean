@@ -666,7 +666,8 @@ where the parent frame charges `GAS_CREATE_ACCESS = 12,000` execution gas (`src/
 and `STATE_GAS_NEW_ACCOUNT = 183,600` (`120 * 1530`, `src/ethereum/forks/amsterdam/vm/gas.py:54-56`,
 `src/ethereum/forks/amsterdam/vm/instructions/system.py:109`) before `withhold_create_gas`
 (`src/ethereum/forks/amsterdam/vm/instructions/system.py:113`), the child `init_code` immediately `REVERT`s (`0` gas spent), and
-the parent receives `credit_state_gas_refund` for `STATE_GAS_NEW_ACCOUNT` (`src/ethereum/forks/amsterdam/vm/instructions/system.py:180`) AFTER
+the parent receives `credit_state_gas_refund` for `STATE_GAS_NEW_ACCOUNT`
+(`src/ethereum/forks/amsterdam/vm/instructions/system.py:180`) AFTER
 `incorporate_child` (`src/ethereum/forks/amsterdam/vm/instructions/system.py:177`), followed by a warm `STATICCALL` costing
 `GAS_WARM_ACCESS = 100` execution gas and `postCreateExec` parent execution work before `settle_top_frame`:
 - Under `amsterdamD0`, `credit_state_gas_refund` immediately returns `183,600` to `P.gasLeft`.
@@ -762,7 +763,8 @@ Universal symbolic (`∀`) characterization of `amsterdamD13S` on post-merge par
 refunds (`F-D13S-3` mechanism): for ANY parent frame `pAfterMerge` that receives
 `frame_credit_state_refund .amsterdamD13S pAfterMerge refund` after child merge (such as
 `credit_state_gas_refund` after `incorporate_child` in `generic_create`), and ANY subsequent
-subcall spawned via `enter_child_frame (frame_credit_state_refund .amsterdamD13S pAfterMerge refund) childCost childGas = some (sInit, pWithheld)`
+subcall spawned via
+`enter_child_frame (frame_credit_state_refund .amsterdamD13S pAfterMerge refund) childCost childGas = some (sInit, pWithheld)`
 that exits cleanly at `sExit` with preserved baseline (`sExit.meter.stateGasBaseline = sInit.meter.stateGasBaseline`)
 and no net state-gas gain (`sExit.meter.stateGasLeft ≤ sInit.meter.stateGasBaseline`), `childExcess = 0`,
 so `exit_child_frame .amsterdamD13S pWithheld sExit .success` transfers `0` gas from `stateGasLeft`

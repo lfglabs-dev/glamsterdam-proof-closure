@@ -209,6 +209,7 @@ def test_standalone_vendored_pyspec_reproducer():
     diff_path = ROOT / "tests" / "differential" / "test_glamsterdam_differential.py"
     spec_mod = importlib.util.spec_from_file_location("test_glamsterdam_differential", diff_path)
     diff_mod = importlib.util.module_from_spec(spec_mod)
+    sys.modules[spec_mod.name] = diff_mod
     spec_mod.loader.exec_module(diff_mod)
     VENDOR_BEACON_MD = diff_mod.VENDOR_BEACON_MD
     load_vendored_gloas_specs = diff_mod.load_vendored_gloas_specs

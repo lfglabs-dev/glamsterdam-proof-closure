@@ -5,5 +5,6 @@ import Glamsterdam.Eip8246.Spec
 import Glamsterdam.Gas.Spec
 import Glamsterdam.Gas.CallTree
 import Glamsterdam.Gas.Eip12582
+import Glamsterdam.Gas.DecisionMatrix
 import Glamsterdam.Gloas7732.Spec
 import Glamsterdam.TestVectors

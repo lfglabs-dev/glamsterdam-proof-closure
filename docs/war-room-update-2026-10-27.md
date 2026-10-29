@@ -81,3 +81,10 @@ Fetched jo `95db803` still has hash `1752669a…`, so it still needs that main
 integration. No server re-pin is needed. CallBridge/J work remains with its
 owners; cached sandbox provenance and native-thread/RLIMIT reproduction remain
 our separate open verifier issues. No fresh Signal information was accessed.
+
+### Formal closure refresh — 2026-10-29
+
+- Upgraded `turbo-lean` to `1949eaac` (`audit-spec` v2.1 strict non-vacuity, non-triviality, referenced-`def` stub detection, and horizontal packing checks) and `maxwell` to `678f67e9`, and repaired Python 3.12 `pytest` compatibility in `tests/pyspec/test_slashed_proposer_payment_resurrection.py` plus automatic `glamsterdam_spec_cabi` compilation in `Makefile`.
+- Added `Glamsterdam/Gas/DecisionMatrix.lean` formalizing the isolated `ethereum/8037-findings#307` (`c3bcaaa9`) mitigation options across `INV-1`, `INV-2`, `INV-3`, and `INV-5` alongside bundled `ethereum/EIPs#12581` (`2ba9176f`), plus `FINDING-042` (`fradamt/8037-coordination#411`: Type-4 EIP-7702 pre-execution runtime OOG rollback keeping sender nonce while leaving authority nonce/delegation replayable, and status-0 receipt ambiguity vs in-frame `REVERT`).
+- Deepened `Glamsterdam/Eip8246/Spec.lean` with full block-level EL ETH supply conservation across transaction fees/burns, `clear_accounts_to_delete_tx`, CL withdrawals, and unchecked system calls, plus `FINDING-023`/`037` contrasting Amsterdam EIP-8246 same-tx `selfdestruct(self)` balance retention ("burn-to-strand") against Osaka EIP-6780 self-burn.
+- Deepened `Glamsterdam/Gloas7732/Spec.lean` with multi-builder CL+EL supply conservation across N-builder registries, concrete `BeaconState` frame preservation, dual-pin verification of `ethereum/consensus-specs#5736` (`onboard_builders_from_pending_deposits` `0xB0` filter) and `#5763` (`should_build_on_full` proposal-slot vs wall-clock slot), and `FINDING-028`/`031` (`builder-specs` `validate_bid` vs `consensus-specs` `process_execution_payload_bid` boundary).

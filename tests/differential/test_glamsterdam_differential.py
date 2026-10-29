@@ -30,28 +30,47 @@ VENDOR_BEACON_MD = ROOT / "vendor" / "upstreams" / "consensus_specs" / "specs" /
 
 
 def ensure_shared_lib() -> ctypes.CDLL:
-    ir_dir = ROOT / ".lake" / "build" / "ir" / "Glamsterdam"
-    c_files = sorted(ir_dir.rglob("*.c"))
-    assert c_files, f"No generated Lean C IR files found under {ir_dir}; run `lake build` first."
-    needs_build = not SO_PATH.exists() or any(
-        c.stat().st_mtime > SO_PATH.stat().st_mtime for c in c_files
-    )
-    if needs_build:
-        lean_prefix = subprocess.check_output(["lean", "--print-prefix"], text=True).strip()
-        cmd = [
-            "gcc",
-            "-shared",
-            "-fPIC",
-            "-O3",
-            f"-I{lean_prefix}/include",
-            *[str(p) for p in c_files],
-            f"-L{lean_prefix}/lib/lean",
-            "-lleanshared",
-            f"-Wl,-rpath,{lean_prefix}/lib/lean",
-            "-o",
-            str(SO_PATH),
-        ]
-        subprocess.run(cmd, check=True)
+    static_lib = ROOT / ".lake" / "build" / "lib" / "libglamsterdam_x2dproof_x2dclosure_glamsterdam__spec__cabi.a"
+    if static_lib.exists():
+        needs_build = not SO_PATH.exists() or static_lib.stat().st_mtime > SO_PATH.stat().st_mtime
+        if needs_build:
+            lean_prefix = subprocess.check_output(["lean", "--print-prefix"], text=True).strip()
+            cmd = [
+                "gcc",
+                "-shared",
+                "-Wl,--whole-archive",
+                str(static_lib),
+                "-Wl,--no-whole-archive",
+                f"-L{lean_prefix}/lib/lean",
+                "-lleanshared",
+                f"-Wl,-rpath,{lean_prefix}/lib/lean",
+                "-o",
+                str(SO_PATH),
+            ]
+            subprocess.run(cmd, check=True)
+    else:
+        ir_dir = ROOT / ".lake" / "build" / "ir" / "Glamsterdam"
+        c_files = sorted(ir_dir.rglob("*.c"))
+        assert c_files, f"No generated Lean C IR files found under {ir_dir}; run `lake build` first."
+        needs_build = not SO_PATH.exists() or any(
+            c.stat().st_mtime > SO_PATH.stat().st_mtime for c in c_files
+        )
+        if needs_build:
+            lean_prefix = subprocess.check_output(["lean", "--print-prefix"], text=True).strip()
+            cmd = [
+                "gcc",
+                "-shared",
+                "-fPIC",
+                "-O3",
+                f"-I{lean_prefix}/include",
+                *[str(p) for p in c_files],
+                f"-L{lean_prefix}/lib/lean",
+                "-lleanshared",
+                f"-Wl,-rpath,{lean_prefix}/lib/lean",
+                "-o",
+                str(SO_PATH),
+            ]
+            subprocess.run(cmd, check=True)
     lib = ctypes.CDLL(str(SO_PATH))
     lib.lean_initialize_runtime_module()
     lib.initialize_glamsterdam_x2dproof_x2dclosure_Glamsterdam_TestVectors.argtypes = [ctypes.c_uint8]
@@ -123,6 +142,33 @@ def ensure_shared_lib() -> ctypes.CDLL:
         ctypes.c_uint8,
     ]
     lib.glamsterdam_calltree_t6_midframe_gas_cabi.restype = ctypes.c_uint64
+
+    lib.glamsterdam_eip7732_pr5736_onboard_consumed_cabi.argtypes = [ctypes.c_uint64] * 7
+    lib.glamsterdam_eip7732_pr5736_onboard_consumed_cabi.restype = ctypes.c_uint8
+
+    lib.glamsterdam_eip7732_pr5736_onboard_builder_balance_cabi.argtypes = [ctypes.c_uint64] * 7
+    lib.glamsterdam_eip7732_pr5736_onboard_builder_balance_cabi.restype = ctypes.c_uint64
+
+    lib.glamsterdam_eip7732_pr5763_should_build_on_full_cabi.argtypes = [ctypes.c_uint64] * 3
+    lib.glamsterdam_eip7732_pr5763_should_build_on_full_cabi.restype = ctypes.c_uint8
+
+    lib.glamsterdam_eip7732_validate_bid_aligned_cabi.argtypes = [ctypes.c_uint64] * 14
+    lib.glamsterdam_eip7732_validate_bid_aligned_cabi.restype = ctypes.c_uint8
+
+    lib.glamsterdam_dm_legacy_share_cabi.argtypes = [ctypes.c_uint64] * 3
+    lib.glamsterdam_dm_legacy_share_cabi.restype = ctypes.c_uint64
+
+    lib.glamsterdam_dm_value_call_forwarded_cabi.argtypes = [ctypes.c_uint64] * 2
+    lib.glamsterdam_dm_value_call_forwarded_cabi.restype = ctypes.c_uint64
+
+    lib.glamsterdam_dm_pre_exec_oog_paid_cabi.argtypes = [ctypes.c_uint64] * 3
+    lib.glamsterdam_dm_pre_exec_oog_paid_cabi.restype = ctypes.c_uint64
+
+    lib.glamsterdam_dm_settle_capped_repaid_cabi.argtypes = [ctypes.c_uint64] * 6
+    lib.glamsterdam_dm_settle_capped_repaid_cabi.restype = ctypes.c_uint64
+
+    lib.glamsterdam_eip8246_same_tx_selfdestruct_self_post_balance_cabi.argtypes = [ctypes.c_uint64] * 2
+    lib.glamsterdam_eip8246_same_tx_selfdestruct_self_post_balance_cabi.restype = ctypes.c_uint64
 
     return lib
 
@@ -792,6 +838,132 @@ def test_differential_calltree_multi_frame():
     assert int(lib.glamsterdam_calltree_t6_midframe_gas_cabi(7, 1_000_000, 850_000, 1)) == 0
 
 
+def test_differential_warroom_dual_pins_and_decision_matrix() -> None:
+    """
+    Differential test of the Wave 2 C-ABI exports against Python reference evaluators for:
+    - `consensus-specs#5736` (`onboard_builders_from_pending_deposits` 0xB0 credential routing)
+    - `consensus-specs#5763` (`should_build_on_full` proposal-slot alignment)
+    - `FINDING-028/031` (`validate_bid_aligned` consensus + fee-recipient boundary)
+    - `ethereum/EIPs#12581` (`2ba9176f`) & `ethereum/8037-findings#307` (`legacy_share`,
+      value-`CALL` pre-63/64 forwarding, and pre-execution OOG settlement)
+    - `FINDING-023/037` (Osaka EIP-6780 same-tx `selfdestruct(self)` burn vs Amsterdam EIP-8246
+      balance preservation)
+    """
+    lib = ensure_shared_lib()
+    rng = random.Random(20261027)
+
+    # 1. consensus-specs#5736 onboarding routing across all 32 boolean flag combinations
+    for flags in range(32):
+        is_builder_cred = (flags >> 0) & 1
+        is_val = (flags >> 1) & 1
+        is_reg_builder = (flags >> 2) & 1
+        is_pending_val = (flags >> 3) & 1
+        sig_ok = (flags >> 4) & 1
+        cur_bal = 2_000_000_000
+        dep_amt = 1_500_000_000
+
+        if not is_builder_cred:
+            py_consumed = False
+            py_bal = cur_bal
+        elif not is_reg_builder:
+            if sig_ok:
+                py_consumed = True
+                py_bal = dep_amt
+            elif is_val or is_pending_val:
+                py_consumed = False
+                py_bal = cur_bal
+            else:
+                py_consumed = True
+                py_bal = cur_bal
+        else:
+            py_consumed = True
+            py_bal = cur_bal + dep_amt
+
+        c_consumed = bool(
+            lib.glamsterdam_eip7732_pr5736_onboard_consumed_cabi(
+                is_builder_cred,
+                is_val,
+                is_reg_builder,
+                is_pending_val,
+                sig_ok,
+                cur_bal,
+                dep_amt,
+            )
+        )
+        c_bal = int(
+            lib.glamsterdam_eip7732_pr5736_onboard_builder_balance_cabi(
+                is_builder_cred,
+                is_val,
+                is_reg_builder,
+                is_pending_val,
+                sig_ok,
+                cur_bal,
+                dep_amt,
+            )
+        )
+        assert c_consumed == py_consumed, f"PR #5736 consumed mismatch for flags={flags:#07b}"
+        assert c_bal == py_bal, f"PR #5736 balance mismatch for flags={flags:#07b}"
+
+    # 2. consensus-specs#5763 should_build_on_full & FINDING-028/031 validate_bid_aligned
+    for parent_slot in (98, 99, 100, 105):
+        for prop_slot in (99, 100, 101):
+            for ptc_ok in (0, 1):
+                py_full = (parent_slot < prop_slot) and bool(ptc_ok)
+                c_full = bool(
+                    lib.glamsterdam_eip7732_pr5763_should_build_on_full_cabi(
+                        parent_slot, prop_slot, ptc_ok
+                    )
+                )
+                assert c_full == py_full
+
+    assert bool(
+        lib.glamsterdam_eip7732_validate_bid_aligned_cabi(
+            1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0xAAAA, 0xBBBB, 3, 6
+        )
+    ) is True
+    # FINDING-028: block_hash == parent_block_hash rejected by aligned validator
+    assert bool(
+        lib.glamsterdam_eip7732_validate_bid_aligned_cabi(
+            1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0xBBBB, 0xBBBB, 3, 6
+        )
+    ) is False
+    # FINDING-031: fee_recipient != proposer expected rejected by aligned validator
+    assert bool(
+        lib.glamsterdam_eip7732_validate_bid_aligned_cabi(
+            1, 0, 1, 1, 1, 1, 1, 1, 1, 0, 0xAAAA, 0xBBBB, 3, 6
+        )
+    ) is False
+
+    # 3. ethereum/EIPs#12581 (2ba9176f) legacy_share, value-CALL 63/64 ordering, pre-exec OOG, INV-2/3 settlement
+    assert int(lib.glamsterdam_dm_legacy_share_cabi(97920, 20000, 10000)) == 10000
+    assert int(lib.glamsterdam_dm_legacy_share_cabi(183600, 25000, 0)) == 25000
+    assert int(lib.glamsterdam_dm_legacy_share_cabi(183600, 32000, 12000)) == 20000
+    assert int(lib.glamsterdam_dm_legacy_share_cabi(306000, 0, 0)) == 0
+    assert int(lib.glamsterdam_dm_settle_capped_repaid_cabi(171000, 21000, 2080, 0, 97920, 50000)) == 79584
+
+    for _ in range(100):
+        gas_left = rng.randint(250_000, 2_000_000)
+        reservoir = rng.choice([0, 50_000, 158_600, 1_000_000, rng.randint(0, 500_000)])
+        non_legacy_state = 183_600 - 25_000  # 158,600
+        spill = max(0, non_legacy_state - reservoir)
+        exec_charge = 3_000 + 11_300 + 25_000 + spill
+        py_forwarded = 0 if gas_left < exec_charge else (gas_left - exec_charge) - (gas_left - exec_charge) // 64
+        c_forwarded = int(lib.glamsterdam_dm_value_call_forwarded_cabi(gas_left, reservoir))
+        assert c_forwarded == py_forwarded
+
+    for tx_gas in (100_000, 16_777_216, 20_000_000, 30_000_000):
+        intrinsic_exec = 21_000
+        reservoir = max(0, tx_gas - 16_777_216)
+        py_paid = min(tx_gas, 16_777_216)
+        c_paid = int(lib.glamsterdam_dm_pre_exec_oog_paid_cabi(tx_gas, intrinsic_exec, reservoir))
+        assert c_paid == py_paid
+
+    # 4. FINDING-023/037 Osaka vs Amsterdam same-tx selfdestruct(self) post-tx balance
+    for slash_amt in (0, 1, 250, 1_000_000_000):
+        assert int(lib.glamsterdam_eip8246_same_tx_selfdestruct_self_post_balance_cabi(0, slash_amt)) == 0
+        assert int(lib.glamsterdam_eip8246_same_tx_selfdestruct_self_post_balance_cabi(1, slash_amt)) == slash_amt
+
+
 if __name__ == "__main__":
     test_differential_charge_gas()
     test_differential_allocate_and_settle_gas()
@@ -799,6 +971,7 @@ if __name__ == "__main__":
     test_differential_gloas7732()
     test_vendored_gloas_slashed_payment_resurrection_trace()
     test_differential_calltree_multi_frame()
+    test_differential_warroom_dual_pins_and_decision_matrix()
     print(
         "differential-tests ok: 100% agreement between Lean 4.31 C-ABI and vendored upstream specs."
     )
