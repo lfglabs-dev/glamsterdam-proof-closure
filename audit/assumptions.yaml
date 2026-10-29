@@ -12,7 +12,7 @@ assumptions:
 exclusions:
   - id: "X-GLOAS-FORK-CHOICE"
     domain: "Gloas EIP-7732"
-    description: "specs/gloas/fork-choice.md (LMD-GHOST payload tree, PTC payload timeliness tie-breaking) is out of scope per agreement with Potuz (EF)."
+    description: "specs/gloas/fork-choice.md full LMD-GHOST payload tree and PTC timeliness tie-breaking are out of scope of the core BeaconState transition audit (only the deterministic parent-payload selector should_build_on_full vs validator.md:216-356 in consensus-specs#5763 is modeled in Glamsterdam/Gloas7732/Spec.lean)."
   - id: "X-GLOAS-P2P-GOSSIP"
     domain: "Gloas EIP-7732"
     description: "specs/gloas/p2p-interface.md and libp2p GossipSub topics for execution payload bids and envelopes are out of scope."

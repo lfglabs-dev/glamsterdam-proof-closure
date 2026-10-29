@@ -813,12 +813,16 @@ theorem credit_after_charge_state_gas_exact (m post : GasMeter) (amount : Nat)
   · simp only [Option.some.injEq] at h
     subst h
     unfold credit_state_gas_refund
-    ext <;> simp only <;> rcases h_inv with h0 | h0 <;> omega
+    ext <;> simp only
+    all_goals
+      rcases h_inv with h0 | h0 <;> omega
   · split at h
     · simp only [Option.some.injEq] at h
       subst h
       unfold credit_state_gas_refund
-      ext <;> simp only <;> rcases h_inv with h0 | h0 <;> omega
+      ext <;> simp only
+      all_goals
+        rcases h_inv with h0 | h0 <;> omega
     · contradiction
 
 /-- Theorem: `repay_state_gas_spill` preserves total available gas (`gasLeft + stateGasLeft`),

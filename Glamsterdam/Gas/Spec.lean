@@ -80,11 +80,21 @@ theorem t_8037_charge_gas_sound (frame post : EvmGasFrame) (regularGas stateGas 
     post.gasLeft ≤ frame.gasLeft ∧
     post.stateGasReservoir ≤ frame.stateGasReservoir := by
   dsimp only [charge_gas] at h
-  split at h <;> (split at h <;> (simp only [Option.some.injEq, reduceCtorEq] at h; try contradiction))
-  all_goals
-    subst h
-    simp only
-    omega
+  by_cases h_spill : stateGas > frame.stateGasReservoir
+  · simp only [h_spill, ↓reduceIte] at h
+    split at h
+    · contradiction
+    · simp only [Option.some.injEq] at h
+      subst h
+      simp only
+      omega
+  · simp only [h_spill, ↓reduceIte, Nat.add_zero] at h
+    split at h
+    · contradiction
+    · simp only [Option.some.injEq] at h
+      subst h
+      simp only
+      omega
 
 /-- T-8037-RESERVOIR-ROUNDTRIP: Parent forwards 100% of `stateGasReservoir` to child
 (`childInit.stateGasReservoir = parentAfterCharge.stateGasReservoir`) and zeroed parent
@@ -370,7 +380,8 @@ theorem t_8038_2780_warm_cold_bounds :
     GAS_WARM_ACCESS < GAS_COLD_STORAGE_ACCESS ∧
     GAS_COLD_STORAGE_ACCESS < GAS_COLD_ACCOUNT_ACCESS ∧
     GAS_COLD_ACCOUNT_ACCESS < GAS_ACCOUNT_WRITE ∧
-    GAS_CREATE_ACCESS = GAS_ACCOUNT_WRITE + GAS_COLD_ACCOUNT_ACCESS ∧
+    GAS_ACCOUNT_WRITE < GAS_CREATE_ACCESS ∧
+    GAS_CREATE_ACCESS = 12000 ∧
     STATE_GAS_NEW_ACCOUNT = 183600 ∧
     STATE_GAS_STORAGE_SET = 97920 := by
   decide
@@ -505,8 +516,10 @@ theorem t_8038_sstore_refund_delta_potential
     p.refundDelta =
       (sstore_clear_potential originalValue newValue - sstore_clear_potential originalValue currentValue) +
         resetBonus ∧
-    0 ≤ resetBonus ∧
-    0 ≤ sstore_clear_potential originalValue newValue ∧
+    resetBonus ≥ 0 ∧
+    resetBonus ≤ (GAS_STORAGE_WRITE : Int) ∧
+    sstore_clear_potential originalValue newValue ≥ 0 ∧
+    sstore_clear_potential originalValue newValue ≤ (GAS_REFUND_STORAGE_CLEAR : Int) ∧
     sstore_clear_potential originalValue originalValue = 0 := by
   dsimp only [price_sstore, sstore_clear_potential, GAS_REFUND_STORAGE_CLEAR,
     GAS_STORAGE_WRITE, GAS_COLD_STORAGE_ACCESS]
@@ -542,7 +555,7 @@ theorem t_8038_refund_counter_telescope_nonneg
     (price_sstore false 1 0 1).refundDelta = -1616 := by
   have h_step1 := t_8038_sstore_refund_delta_potential isCold1 orig orig v1
   have h_step2 := t_8038_sstore_refund_delta_potential isCold2 orig v1 v2
-  refine ⟨⟨by omega, h_step1.2.2.1⟩, ⟨by omega, h_step2.2.2.1⟩, by decide, by decide⟩
+  refine ⟨⟨by omega, h_step1.2.2.2.1⟩, ⟨by omega, h_step2.2.2.2.1⟩, by decide, by decide⟩
 
 /-- Inductive step of a single-slot multi-frame `SSTORE` trace:
 - `sstore isCold newVal`: performs `SSTORE` to `newVal` and adds `refundDelta` to `refundCounter`.
@@ -578,7 +591,7 @@ theorem t_8038_refund_counter_telescope_trace_inv
   induction trace generalizing curr r with
   | nil =>
     dsimp [run_sstore_refund_trace]
-    have h_nonneg := (t_8038_sstore_refund_delta_potential false orig curr curr).2.2.1
+    have h_nonneg := (t_8038_sstore_refund_delta_potential false orig curr curr).2.2.2.1
     exact ⟨h_inv, h_nonneg⟩
   | cons step rest ih =>
     cases step with
@@ -595,7 +608,7 @@ theorem t_8038_refund_counter_telescope_trace_root_nonneg
     (orig : Nat) (trace : List SstoreTraceStep) :
     (run_sstore_refund_trace orig trace (orig, 0)).2 ≥ 0 := by
   have h0 : (0 : Int) ≥ sstore_clear_potential orig orig := by
-    have h_eq := (t_8038_sstore_refund_delta_potential false orig orig orig).2.2.2
+    have h_eq := (t_8038_sstore_refund_delta_potential false orig orig orig).2.2.2.2.2
     omega
   have h_inv := t_8038_refund_counter_telescope_trace_inv orig trace orig 0 h0
   omega
@@ -771,17 +784,373 @@ def f_2780_7928_set_delegation_oog_omits_recipient_refuter :
   )
   mutant_refuted := by decide
 
+/-! ## 8. EIP-7702 Runtime Authorization OOG Rollback & Replayability (`FINDING-042`,
+    `eoa_delegation.py:191-321`, `vm/interpreter.py:159-288`, `fork.py:924-963, 1051-1076`) -/
+
+/-- State of sender and authority nonces and delegation code for a Type-4 (`EIP-7702`) transaction
+(`fork.py:924-963`, `eoa_delegation.py:191-321`, `vm/interpreter.py:261-288`).
+- `senderAddr` / `senderNonce`: sender address and nonce incremented in `update_sender_state` (`fork.py:957`)
+  BEFORE `process_top_level` takes `prep_snapshot = copy_tx_state(tx_env.state)` (`vm/interpreter.py:267`).
+- `authorityAddr` / `authorityNonce`: authority account and nonce checked at `eoa_delegation.py:224-226`
+  and incremented inside `set_delegation` (`eoa_delegation.py:319`).
+- `authorityExists`: whether the authority account leaf exists prior to `set_delegation` (`eoa_delegation.py:295`).
+- `authorityCodeTarget`: `some target` when the authority holds a valid `0xef0100 || target` delegation
+  indicator (`eoa_delegation.py:308-318`), or `none` when cleared / undelegated.
+- `authorityHasNonDelegationCode`: whether the authority holds ordinary smart-contract bytecode
+  (`authority_code and not is_valid_delegation(authority_code)` at `eoa_delegation.py:221`). -/
+structure Type4TxAuthState where
+  senderAddr : Address
+  senderNonce : Nat
+  authorityAddr : Address
+  authorityNonce : Nat
+  authorityExists : Bool
+  authorityCodeTarget : Option Address
+  authorityHasNonDelegationCode : Bool := false
+  deriving Repr, DecidableEq, BEq
+
+/-- Signed `EIP-7702` authorization tuple (`eoa_delegation.py:191-229`).
+When `auth.senderAddr == auth.authorityAddr` (self-sponsored Type-4 tx), `senderNonce` is incremented
+first in `update_sender_state` (`fork.py:957`) before `validate_authorization` reads the authority's nonce. -/
+structure AuthTuple where
+  chainIdMatches : Bool
+  nonceBelowMax : Bool
+  signatureValid : Bool
+  authNonce : Nat
+  delegateTarget : Option Address
+  deriving Repr, DecidableEq, BEq
+
+/-- Effective post-`update_sender_state` state (`fork.py:957`): increments `senderNonce`, and if
+`senderAddr == authorityAddr` (self-sponsored authorization), increments the same account's `authorityNonce`
+and marks `authorityExists = true`. -/
+def bump_type4_sender_nonce (st : Type4TxAuthState) : Type4TxAuthState :=
+  if st.senderAddr == st.authorityAddr then
+    { st with
+      senderNonce := st.senderNonce + 1
+      authorityNonce := st.authorityNonce + 1
+      authorityExists := true }
+  else
+    { st with senderNonce := st.senderNonce + 1 }
+
+/-- Validated projection of `validate_authorization` (`eoa_delegation.py:191-229` @ `16898000`):
+Checks `chain_id in (block_env.chain_id, 0)`, `nonce < 2^64 - 1`, valid signature recovery,
+empty or valid-delegation authority code, and `authority_account.nonce == auth.nonce`. -/
+def validate_auth_tuple (st : Type4TxAuthState) (auth : AuthTuple) : Bool :=
+  auth.chainIdMatches &&
+    auth.nonceBelowMax &&
+    auth.signatureValid &&
+    !st.authorityHasNonDelegationCode &&
+    decide (st.authorityNonce == auth.authNonce)
+
+/-- Settled outcome of a Type-4 transaction across `update_sender_state` -> `process_top_level` -> `make_receipt`
+(`fork.py:1053-1075`, `vm/interpreter.py:261-321`). -/
+structure Type4TxOutcome where
+  postState : Type4TxAuthState
+  receiptStatus : Bool
+  gasLeft : Nat
+  stateGasLeft : Nat
+  stateGasUsed : Int
+  deriving Repr, DecidableEq, BEq
+
+/-- Validated projection of Amsterdam Type-4 transaction execution (`fork.py:1053-1075`,
+`vm/interpreter.py:160-164, 261-321`, `eoa_delegation.py:286-320` @ `16898000`):
+1. `update_sender_state` (`fork.py:957`) bumps the sender nonce BEFORE `prep_snapshot` (`vm/interpreter.py:267`).
+2. `create_evm` calls `set_delegation` (`vm/interpreter.py:161`):
+   - if `validate_auth_tuple` is true, charges `STATE_GAS_NEW_ACCOUNT` when `!authorityExists`,
+     `GAS_ACCOUNT_WRITE` when `authorityAddr != senderAddr` and not exempted by positive-value recipient,
+     and `STATE_GAS_AUTH_BASE` when `authorityCodeTarget.isNone && auth.delegateTarget.isSome`;
+   - if any runtime auth charge runs out of gas, `process_top_level`'s `except ExceptionalHalt` handler
+     (`vm/interpreter.py:270-288`) restores `prep_snapshot` (rolling back `set_code` and authority
+     `increment_nonce` while keeping `update_sender_state`'s sender-nonce bump!), calls
+     `restore_state_gas_to_entry` and `forfeit_remaining_gas`, and emits a `status = false` (`0`) receipt;
+   - otherwise `set_code` and authority `increment_nonce` are applied and `commit_state_gas` runs
+     (`vm/interpreter.py:163`).
+3. Top-frame execution (`process_call`, `vm/interpreter.py:293, 450-469`) then charges `bodyExecGas` and
+   either succeeds (`bodyReverts = false`, `receiptStatus = true`) or executes `REVERT` (`bodyReverts = true`,
+   `restore_state_gas` + `restore_tx_state` to post-`create_evm` snapshot, keeping the committed delegation
+   while emitting `receiptStatus = false`). -/
+def exec_type4_tx_amsterdam
+    (pre : Type4TxAuthState) (auth : AuthTuple)
+    (execGrant reservoir bodyExecGas : Nat)
+    (recipientCoversWrite bodyReverts : Bool) : Type4TxOutcome :=
+  let prepSnapshot := bump_type4_sender_nonce pre
+  let m0 : GasMeter :=
+    { gasLeft := execGrant
+      stateGasLeft := reservoir
+      stateGasBaseline := reservoir }
+  let afterDelegationOpt : Option (Type4TxAuthState × GasMeter) :=
+    if !validate_auth_tuple prepSnapshot auth then
+      some (prepSnapshot, commit_state_gas m0)
+    else
+      let newAccCost := if !prepSnapshot.authorityExists then STATE_GAS_NEW_ACCOUNT else 0
+      let writeCost :=
+        if prepSnapshot.authorityAddr == prepSnapshot.senderAddr || recipientCoversWrite then 0
+        else GAS_ACCOUNT_WRITE
+      let authBaseCost :=
+        if prepSnapshot.authorityCodeTarget.isNone && auth.delegateTarget.isSome then
+          STATE_GAS_AUTH_BASE
+        else 0
+      match charge_state_gas_from_meter m0 newAccCost with
+      | none => none
+      | some m1 =>
+        match charge_gas_from_meter m1 writeCost with
+        | none => none
+        | some m2 =>
+          match charge_state_gas_from_meter m2 authBaseCost with
+          | none => none
+          | some m3 =>
+            let postAuthState : Type4TxAuthState :=
+              { prepSnapshot with
+                authorityNonce := prepSnapshot.authorityNonce + 1
+                authorityExists := true
+                authorityCodeTarget := auth.delegateTarget }
+            some (postAuthState, commit_state_gas m3)
+  match afterDelegationOpt with
+  | none =>
+    let mHalted := forfeit_remaining_gas (restore_state_gas_to_entry m0 reservoir)
+    { postState := prepSnapshot
+      receiptStatus := false
+      gasLeft := mHalted.gasLeft
+      stateGasLeft := mHalted.stateGasLeft
+      stateGasUsed := tx_state_gas_used mHalted reservoir }
+  | some (frameSnapshot, mAfterAuth) =>
+    match charge_gas_from_meter mAfterAuth bodyExecGas with
+    | none =>
+      let mBodyHalt := forfeit_remaining_gas (restore_state_gas mAfterAuth)
+      { postState := frameSnapshot
+        receiptStatus := false
+        gasLeft := mBodyHalt.gasLeft
+        stateGasLeft := mBodyHalt.stateGasLeft
+        stateGasUsed := tx_state_gas_used mBodyHalt reservoir }
+    | some mAfterBody =>
+      if bodyReverts then
+        let mRev := restore_state_gas mAfterBody
+        { postState := frameSnapshot
+          receiptStatus := false
+          gasLeft := mRev.gasLeft
+          stateGasLeft := mRev.stateGasLeft
+          stateGasUsed := tx_state_gas_used mRev reservoir }
+      else
+        { postState := frameSnapshot
+          receiptStatus := true
+          gasLeft := mAfterBody.gasLeft
+          stateGasLeft := mAfterBody.stateGasLeft
+          stateGasUsed := tx_state_gas_used mAfterBody reservoir }
+
+/-- **Theorem (`t_8037_7702_finding042_auth_oog_rollback_replayable`, `FINDING-042`,
+`eoa_delegation.py:296-315`, `vm/interpreter.py:267-288`, `fork.py:957, 1053-1075`)**:
+For **every** Type-4 transaction — BOTH sponsored (`pre.senderAddr ≠ pre.authorityAddr`) AND
+self-sponsored (`pre.senderAddr = pre.authorityAddr`) — whose authorization tuple `auth` is valid
+against `prepSnapshot := bump_type4_sender_nonce pre` (`validate_auth_tuple prepSnapshot auth = true`),
+if the available gas (`execGrant + reservoir`) is strictly less than the runtime authorization charges in
+`set_delegation`, then Amsterdam (`16898000`) does **not** reject the transaction as invalid; instead it:
+1. Includes the transaction and advances `senderNonce` by `1` (`update_sender_state`),
+2. Rolls back `postState` to `prepSnapshot` (preserving `authorityCodeTarget = pre.authorityCodeTarget` and
+   `authorityNonce = prepSnapshot.authorityNonce`, i.e., `pre.authorityNonce` when sponsored and
+   `pre.authorityNonce + 1` when self-sponsored),
+3. Forfeits 100% of `execGrant` (`gasLeft = 0`, `stateGasLeft = reservoir`, `stateGasUsed = 0`) and
+   emits a `status = 0` (`receiptStatus = false`) receipt, and
+4. Leaves the now-public `auth` tuple **valid (`validate_auth_tuple out1.postState auth = true`)** in BOTH
+   sponsored and self-sponsored cases — so any third party `replaySender ≠ authorityAddr` supplying adequate
+   gas in a subsequent transaction replays `auth`, sets `authorityCodeTarget = auth.delegateTarget`, and
+   advances `authorityNonce`!
+5. Concrete witnesses confirm BOTH cases:
+   - Sponsored (`senderAddr = 0x11 ≠ 0x22 = authorityAddr`, `authNonce = 0`, `execGrant = 20000 < 44190`):
+     tx 1 halts in `set_delegation` rolling back delegation while bumping sponsor nonce `5 → 6`, and third-party
+     tx 2 (`0x33`) replays `auth` (`authorityNonce : 0 → 1`, `authorityCodeTarget = some 0x99`);
+   - Self-sponsored (`senderAddr = authorityAddr = 0x22`, pre-nonce `0`, `authNonce = 1`, `execGrant = 20000 < 35190`):
+     `update_sender_state` bumps shared nonce `0 → 1` before `prep_snapshot`, `set_delegation` OOG rolls back to
+     `prep_snapshot` (`nonce = 1`), leaving `authNonce = 1` immediately replayable by third-party tx 2 (`0x33`)! -/
+theorem t_8037_7702_finding042_auth_oog_rollback_replayable
+    (pre : Type4TxAuthState) (auth : AuthTuple)
+    (execGrant reservoir bodyExecGas : Nat)
+    (recipientCoversWrite bodyReverts : Bool)
+    (h_valid : validate_auth_tuple (bump_type4_sender_nonce pre) auth = true)
+    (h_oog :
+      let p := bump_type4_sender_nonce pre
+      execGrant + reservoir <
+        (if !p.authorityExists then STATE_GAS_NEW_ACCOUNT else 0) +
+        (if p.authorityAddr == p.senderAddr || recipientCoversWrite then 0 else GAS_ACCOUNT_WRITE) +
+        (if p.authorityCodeTarget.isNone && auth.delegateTarget.isSome then STATE_GAS_AUTH_BASE else 0)) :
+    let prep := bump_type4_sender_nonce pre
+    let out1 := exec_type4_tx_amsterdam pre auth execGrant reservoir bodyExecGas recipientCoversWrite bodyReverts
+    out1.receiptStatus = false ∧
+    out1.postState = prep ∧
+    out1.postState.senderNonce = pre.senderNonce + 1 ∧
+    out1.postState.authorityCodeTarget = pre.authorityCodeTarget ∧
+    out1.gasLeft = 0 ∧
+    out1.stateGasLeft = reservoir ∧
+    out1.stateGasUsed = 0 ∧
+    validate_auth_tuple out1.postState auth = true ∧
+    (let preSponsored : Type4TxAuthState :=
+       { senderAddr := 0x11, senderNonce := 5, authorityAddr := 0x22, authorityNonce := 0,
+         authorityExists := true, authorityCodeTarget := none }
+     let authSponsored : AuthTuple :=
+       { chainIdMatches := true, nonceBelowMax := true, signatureValid := true,
+         authNonce := 0, delegateTarget := some 0x99 }
+     let tx1 := exec_type4_tx_amsterdam preSponsored authSponsored 20000 0 0 false false
+     let attackerState := { tx1.postState with senderAddr := 0x33, senderNonce := 0 }
+     let tx2 := exec_type4_tx_amsterdam attackerState authSponsored 60000 0 0 false false
+     let preSelf : Type4TxAuthState :=
+       { senderAddr := 0x22, senderNonce := 0, authorityAddr := 0x22, authorityNonce := 0,
+         authorityExists := true, authorityCodeTarget := none }
+     let authSelf : AuthTuple :=
+       { chainIdMatches := true, nonceBelowMax := true, signatureValid := true,
+         authNonce := 1, delegateTarget := some 0x99 }
+     let selfTx1 := exec_type4_tx_amsterdam preSelf authSelf 20000 0 0 false false
+     let selfAttacker := { selfTx1.postState with senderAddr := 0x33, senderNonce := 0 }
+     let selfTx2 := exec_type4_tx_amsterdam selfAttacker authSelf 60000 0 0 false false
+     tx1.receiptStatus = false ∧
+     tx1.postState.senderNonce = 6 ∧
+     tx1.postState.authorityNonce = 0 ∧
+     tx1.postState.authorityCodeTarget = none ∧
+     tx2.receiptStatus = true ∧
+     tx2.postState.authorityNonce = 1 ∧
+     tx2.postState.authorityCodeTarget = some 0x99 ∧
+     selfTx1.receiptStatus = false ∧
+     selfTx1.postState.authorityNonce = 1 ∧
+     selfTx1.postState.authorityCodeTarget = none ∧
+     selfTx2.receiptStatus = true ∧
+     selfTx2.postState.authorityNonce = 2 ∧
+     selfTx2.postState.authorityCodeTarget = some 0x99) := by
+  have h_state_dec : ∀ (m m' : GasMeter) (c : Nat),
+      charge_state_gas_from_meter m c = some m' →
+      m'.gasLeft + m'.stateGasLeft + c = m.gasLeft + m.stateGasLeft := by
+    intro m m' c hc
+    dsimp only [charge_state_gas_from_meter] at hc
+    split at hc
+    · simp only [Option.some.injEq] at hc
+      subst hc
+      dsimp only
+      omega
+    · split at hc
+      · simp only [Option.some.injEq] at hc
+        subst hc
+        dsimp only
+        omega
+      · contradiction
+  have h_exec_dec : ∀ (m m' : GasMeter) (c : Nat),
+      charge_gas_from_meter m c = some m' →
+      m'.gasLeft + m'.stateGasLeft + c = m.gasLeft + m.stateGasLeft := by
+    intro m m' c hc
+    dsimp only [charge_gas_from_meter] at hc
+    split at hc
+    · contradiction
+    · simp only [Option.some.injEq] at hc
+      subst hc
+      dsimp only
+      omega
+  let p := bump_type4_sender_nonce pre
+  have hp : p = bump_type4_sender_nonce pre := rfl
+  have h_cannot_afford :
+      let newAccCost := if !p.authorityExists then STATE_GAS_NEW_ACCOUNT else 0
+      let writeCost :=
+        if p.authorityAddr == p.senderAddr || recipientCoversWrite then 0 else GAS_ACCOUNT_WRITE
+      let authBaseCost :=
+        if p.authorityCodeTarget.isNone && auth.delegateTarget.isSome then STATE_GAS_AUTH_BASE else 0
+      (match charge_state_gas_from_meter ⟨execGrant, reservoir, reservoir, 0, 0, 0⟩ newAccCost with
+       | none => @none (Type4TxAuthState × GasMeter)
+       | some m1 =>
+         match charge_gas_from_meter m1 writeCost with
+         | none => none
+         | some m2 =>
+           match charge_state_gas_from_meter m2 authBaseCost with
+           | none => none
+           | some m3 =>
+             some ({ p with authorityNonce := p.authorityNonce + 1,
+                            authorityExists := true,
+                            authorityCodeTarget := auth.delegateTarget }, commit_state_gas m3)) = none := by
+    dsimp only
+    cases hc1 : charge_state_gas_from_meter ⟨execGrant, reservoir, reservoir, 0, 0, 0⟩
+        (if !p.authorityExists then STATE_GAS_NEW_ACCOUNT else 0) with
+    | none => rfl
+    | some m1 =>
+      dsimp only
+      have hd1 := h_state_dec _ _ _ hc1
+      cases hc2 : charge_gas_from_meter m1
+          (if p.authorityAddr == p.senderAddr || recipientCoversWrite then 0 else GAS_ACCOUNT_WRITE) with
+      | none => rfl
+      | some m2 =>
+        dsimp only
+        have hd2 := h_exec_dec _ _ _ hc2
+        cases hc3 : charge_state_gas_from_meter m2
+            (if p.authorityCodeTarget.isNone && auth.delegateTarget.isSome then STATE_GAS_AUTH_BASE else 0) with
+        | none => rfl
+        | some m3 =>
+          have hd3 := h_state_dec _ _ _ hc3
+          dsimp only [p] at hd1 hd2 hd3 h_oog
+          omega
+  have h_out1 :
+      exec_type4_tx_amsterdam pre auth execGrant reservoir bodyExecGas recipientCoversWrite bodyReverts =
+        { postState := p
+          receiptStatus := false
+          gasLeft := 0
+          stateGasLeft := reservoir
+          stateGasUsed := 0 } := by
+    unfold exec_type4_tx_amsterdam
+    dsimp only
+    rw [← hp]
+    have h_v : (!validate_auth_tuple p auth) = false := by
+      rw [hp, h_valid]; rfl
+    simp only [h_v, Bool.false_eq_true, ↓reduceIte]
+    rw [h_cannot_afford]
+    simp [forfeit_remaining_gas, restore_state_gas_to_entry, tx_state_gas_used]
+  have h_snonce : p.senderNonce = pre.senderNonce + 1 := by
+    dsimp only [p, bump_type4_sender_nonce]
+    split <;> rfl
+  have h_code : p.authorityCodeTarget = pre.authorityCodeTarget := by
+    dsimp only [p, bump_type4_sender_nonce]
+    split <;> rfl
+  dsimp only
+  rw [h_out1]
+  refine ⟨rfl, rfl, h_snonce, h_code, rfl, rfl, rfl, h_valid, by decide⟩
+
+/-- **Theorem (`t_8037_7702_finding042_status0_receipt_ambiguity`, `FINDING-042` Variant 3,
+`vm/interpreter.py:160-164, 267-288, 460-469`)**:
+Under Amsterdam (`EIP-8037` + `EIP-7702`), a `status = 0` (`receiptStatus = false`) receipt on an
+included Type-4 transaction is strictly ambiguous with respect to whether the authorization was applied:
+- **Path A (Pre-execution OOG in `set_delegation`)**: `receiptStatus = false`, `senderNonce` increments,
+  `authorityCodeTarget = none`, `authorityNonce = 0`, and `auth` remains valid/replayable.
+- **Path B (In-frame `REVERT` in `process_call` after `create_evm` commits `set_delegation`)**:
+  `receiptStatus = false`, `senderNonce` increments, `authorityCodeTarget = some 0x99` **persists**
+  (`commit_state_gas` at `vm/interpreter.py:163`), `authorityNonce = 1`, `stateGasUsed = 35190`,
+  and `auth` is consumed (`validate_auth_tuple = false`). -/
+theorem t_8037_7702_finding042_status0_receipt_ambiguity :
+    let pre : Type4TxAuthState :=
+      { senderAddr := 0x11, senderNonce := 0, authorityAddr := 0x22, authorityNonce := 0,
+        authorityExists := true, authorityCodeTarget := none }
+    let auth : AuthTuple :=
+      { chainIdMatches := true, nonceBelowMax := true, signatureValid := true,
+        authNonce := 0, delegateTarget := some 0x99 }
+    let outAuthOog := exec_type4_tx_amsterdam pre auth 20000 0 1000 false true
+    let outBodyRev := exec_type4_tx_amsterdam pre auth 60000 0 1000 false true
+    outAuthOog.receiptStatus = false ∧
+    outBodyRev.receiptStatus = false ∧
+    outAuthOog.postState.senderNonce = outBodyRev.postState.senderNonce ∧
+    outAuthOog.postState.authorityCodeTarget = none ∧
+    outBodyRev.postState.authorityCodeTarget = some 0x99 ∧
+    outAuthOog.postState.authorityNonce = 0 ∧
+    outBodyRev.postState.authorityNonce = 1 ∧
+    outAuthOog.stateGasUsed = 0 ∧
+    outBodyRev.stateGasUsed = 35190 ∧
+    validate_auth_tuple outAuthOog.postState auth = true ∧
+    validate_auth_tuple outBodyRev.postState auth = false := by
+  decide
+
 @[inline, export glamsterdam_gas_dual_cap_cabi]
 def gas_dual_cap_cabi (txRegular txState : UInt64) : UInt64 :=
   max txRegular txState
 
 @[inline, export glamsterdam_settle_gas_used_cabi]
 def settle_gas_used_cabi (txGas floor gasLeft stateGasLeft refund stateGasUsed : UInt64) : UInt64 :=
-  (settle_transaction_gas txGas.toNat floor.toNat gasLeft.toNat stateGasLeft.toNat refund.toNat stateGasUsed.toNat).gasUsed.toUInt64
+  let s := settle_transaction_gas
+    txGas.toNat floor.toNat gasLeft.toNat stateGasLeft.toNat refund.toNat stateGasUsed.toNat
+  s.gasUsed.toUInt64
 
 @[inline, export glamsterdam_settle_exec_gas_used_cabi]
 def settle_exec_gas_used_cabi (txGas floor gasLeft stateGasLeft refund stateGasUsed : UInt64) : UInt64 :=
-  (settle_transaction_gas txGas.toNat floor.toNat gasLeft.toNat stateGasLeft.toNat refund.toNat stateGasUsed.toNat).executionGasUsed.toUInt64
+  let s := settle_transaction_gas
+    txGas.toNat floor.toNat gasLeft.toNat stateGasLeft.toNat refund.toNat stateGasUsed.toNat
+  s.executionGasUsed.toUInt64
 
 @[inline, export glamsterdam_allocate_exec_gas_cabi]
 def allocate_exec_gas_cabi (txGas intrinsicExec : UInt64) : UInt64 :=

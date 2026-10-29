@@ -10,22 +10,16 @@ bootstrap:
 	@turbo-lean --version
 
 prove:
-	@lake build
+	@lake build Glamsterdam glamsterdam_spec_cabi
 	@python3 scripts/audit_metadata.py
-	@printf '%s\n' 'prove ok: Common EL core, Eip8246, Gas (8037/8038/2780/7778), Gloas7732 (+8282), and TestVectors compiled with 0 sorryAx, 0 axiom, 0 native_decide'
+	@printf '%s\n' 'prove ok: Common EL core, Eip8246, Gas (8037/8038/2780/7778/12582/DecisionMatrix), Gloas7732 (+8282), TestVectors, and C-ABI static lib compiled with 0 sorryAx, 0 axiom, 0 native_decide'
 
 turbo-verify: prove
 	@turbo-lean --json ci-verify --project-dir . --mode trusted --receipt .lake/turbo-receipt.json
 	@turbo-lean --json verify-receipt .lake/turbo-receipt.json --baseline-receipt .lake/turbo-receipt.json
 	@if turbo-lean --help 2>&1 | grep -q "audit-spec"; then \
-		turbo-lean --json audit-spec Glamsterdam/Common/Prelude.lean; \
-		turbo-lean --json audit-spec Glamsterdam/Common/MetaSpec.lean; \
-		turbo-lean --json audit-spec Glamsterdam/Common/ElCore.lean; \
-		turbo-lean --json audit-spec Glamsterdam/Eip8246/Spec.lean; \
-		turbo-lean --json audit-spec Glamsterdam/Gas/Spec.lean; \
-		turbo-lean --json audit-spec Glamsterdam/Gas/CallTree.lean; \
-		turbo-lean --json audit-spec Glamsterdam/Gloas7732/Spec.lean; \
-		turbo-lean --json audit-spec Glamsterdam/TestVectors.lean; \
+		turbo-lean --json audit-spec Glamsterdam > .lake/audit-spec.json; \
+		python3 -c 'import json; d = json.load(open(".lake/audit-spec.json")); assert d["ok"] is True and d["vacuous_specs"] == 0 and d["trivial_specs"] == 0 and len(d.get("stub_defs", [])) == 0 and len(d.get("horizontal_packing_warnings", [])) == 0 and len(d.get("droppable_hypotheses", [])) == 0, str((d.get("vacuous_specs"), d.get("trivial_specs"), d.get("stub_defs"), d.get("horizontal_packing_warnings"), d.get("droppable_hypotheses"))); print("audit-spec ok:", d["tight_specs"], "/", d["total_specs_audited"], "tight specs, 0 vacuous, 0 trivial, 0 stub_defs, 0 packing warnings")'; \
 	fi
 
 diff-test: prove

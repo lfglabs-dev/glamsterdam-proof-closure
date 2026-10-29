@@ -94,7 +94,9 @@ instance {σ ε : Type} : Monad (SpecM σ ε) where
 @[simp]
 theorem bind_pure {σ ε α : Type} (m : SpecM σ ε α) :
     bind m pure = m := by
-  funext s; dsimp [bind, pure]; cases m s <;> rfl
+  funext s
+  dsimp [bind, pure]
+  cases m s <;> rfl
 
 @[simp]
 theorem pure_bind {σ ε α β : Type} (a : α) (f : α → SpecM σ ε β) :
@@ -104,7 +106,9 @@ theorem pure_bind {σ ε α β : Type} (a : α) (f : α → SpecM σ ε β) :
 theorem bind_assoc {σ ε α β γ : Type}
     (m : SpecM σ ε α) (f : α → SpecM σ ε β) (g : β → SpecM σ ε γ) :
     bind (bind m f) g = bind m (fun x => bind (f x) g) := by
-  funext s; dsimp [bind]; cases m s <;> rfl
+  funext s
+  dsimp [bind]
+  cases m s <;> rfl
 
 /-- Read the current state without modifying it. -/
 @[inline, simp]

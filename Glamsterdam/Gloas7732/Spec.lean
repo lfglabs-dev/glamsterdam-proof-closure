@@ -9,8 +9,12 @@ import Glamsterdam.Common.MetaSpec
 # Glamsterdam Gloas Consensus Layer (`EIP-7732` + `EIP-8282`) Formal Specification and Verification
 
 Pinned against `ethereum/consensus-specs` @ `aa16bb4c156184e9548a997d53efaf2a228a6304`
-(`v1.7.0-beta.4`, `specs/gloas/beacon-chain.md` & `specs/gloas/fork.md`).
-Note: `fork-choice.md` and P2P gossip remain strictly out of scope per agreement with Potuz (EF).
+(`v1.7.0-beta.4`, `specs/gloas/beacon-chain.md` & `specs/gloas/fork.md`), with dual-pin coverage
+of post-`v1.7.0-beta.4` PRs `consensus-specs#5736` (`8b374fa81b`) and `consensus-specs#5763`
+(`1bdf4b8be5`), plus client-export bid-validation boundaries (`FINDING-028` & `FINDING-031`).
+(Note: full LMD-GHOST tree and P2P gossip remain outside core BeaconState transition scope;
+deterministic should_build_on_full vs proposal-slot alignment from consensus-specs#5763 is
+formalized in Section 9.)
 
 ## Core First-Principles Consensus Invariants (Potuz Scope)
 1. **Supply Neutrality / No ETH Minting (`t_7732_single_settlement`, `t_7732_no_eth_minting`)**:
@@ -180,7 +184,18 @@ inductive ChildConfirmationTiming where
 
 /-- Full 2-epoch slot settlement lifecycle combining all three `parent_epoch` branches of
 `apply_parent_execution_payload` (`settle_builder_payment:1538-1544`, `1799-1814`) and two
-epoch-boundary rotations of `process_builder_pending_payments` (`1719-1732`). -/
+epoch-boundary rotations of `process_builder_pending_payments` (`1719-1732`):
+- `.notConfirmed`: Epoch boundary 1 rotates `secondEpoch` -> `firstEpoch`; Epoch boundary 2 settles
+  iff `attestedWeight >= quorum`.
+- `.confirmedSameEpoch`: Child block in `parent_epoch` calls `settle_builder_payment` on `secondEpoch`,
+  clearing it to `{}` before Epoch boundary 1.
+- `.confirmedNextEpoch`: No block after `parent_slot` in `parent_epoch` (`weight = 0` at Epoch
+  boundary 1); Epoch boundary 1 rotates `secondEpoch` into `firstEpoch`; child block in
+  `parent_epoch + 1` calls `settle_builder_payment` on `firstEpoch` (clearing `amount = 0` before
+  `process_attestation` at line 2464); Epoch boundary 2 sees `{}`.
+- `.confirmedAfterTwoEpochs`: No block after `parent_slot` in `parent_epoch` or `parent_epoch + 1`
+  (`weight = 0` across both epoch boundaries); child block at `current_epoch >= parent_epoch + 2`
+  enters `elif parent_bid.value > 0:`. -/
 def settle_slot_bid_lifecycle
     (feeRecipient bidValue builderIdx proposerIdx attestedWeight quorum : Nat)
     (timing : ChildConfirmationTiming) : List BuilderPendingWithdrawal :=
@@ -193,22 +208,19 @@ def settle_slot_bid_lifecycle
       {}
   match timing with
   | .notConfirmed =>
-    -- Epoch boundary 1 rotates `secondEpoch` -> `firstEpoch`; Epoch boundary 2 settles if `weight ≥ quorum`
-    let (first1, second1, w1) := process_builder_pending_payments quorum [{}] [mkPayment attestedWeight] []
+    let (first1, second1, w1) :=
+      process_builder_pending_payments quorum [{}] [mkPayment attestedWeight] []
     let (_, _, w2) := process_builder_pending_payments quorum first1 second1 w1
     w2
   | .confirmedSameEpoch =>
-    -- Child block in `parent_epoch` calls `settle_builder_payment` on `secondEpoch`, clearing it to `{}`
     let (clearedSlot, wChild) := settle_builder_payment (mkPayment attestedWeight) []
-    let (first1, second1, w1) := process_builder_pending_payments quorum [{}] [clearedSlot] wChild
+    let (first1, second1, w1) :=
+      process_builder_pending_payments quorum [{}] [clearedSlot] wChild
     let (_, _, w2) := process_builder_pending_payments quorum first1 second1 w1
     w2
   | .confirmedNextEpoch =>
-    -- No block after `parent_slot` in `parent_epoch` (`weight = 0` at Epoch boundary 1);
-    -- Epoch boundary 1 rotates `secondEpoch` into `firstEpoch`; child block in `parent_epoch + 1`
-    -- calls `settle_builder_payment` on `firstEpoch` (clearing `amount = 0`, so `process_attestation:2464`
-    -- does not accrue weight); Epoch boundary 2 sees `{}`.
-    let (first1, second1, w1) := process_builder_pending_payments quorum [{}] [mkPayment 0] []
+    let (first1, second1, w1) :=
+      process_builder_pending_payments quorum [{}] [mkPayment 0] []
     let (clearedSlot, wChild) :=
       match first1 with
       | p :: _ => settle_builder_payment p w1
@@ -216,9 +228,8 @@ def settle_slot_bid_lifecycle
     let (_, _, w2) := process_builder_pending_payments quorum [clearedSlot] second1 wChild
     w2
   | .confirmedAfterTwoEpochs =>
-    -- No block after `parent_slot` in `parent_epoch` or `parent_epoch + 1` (`weight = 0` across both
-    -- epoch boundaries); child block at `current_epoch ≥ parent_epoch + 2` enters `elif parent_bid.value > 0:`.
-    let (first1, second1, w1) := process_builder_pending_payments quorum [{}] [mkPayment 0] []
+    let (first1, second1, w1) :=
+      process_builder_pending_payments quorum [{}] [mkPayment 0] []
     let (_, _, w2) := process_builder_pending_payments quorum first1 second1 w1
     if bidValue > 0 then
       w2 ++ [⟨feeRecipient, bidValue, builderIdx⟩]
@@ -599,13 +610,10 @@ def trace_bid_slash_rotate_apply_v170_beta4
     { weight := 0
       withdrawal := ⟨feeRecipient, bidValue, builderIdx⟩
       proposerIndex := headerProposer }
-  -- Step 2: `slash_validator` (`beacon-chain.md:1579-1581`)
   let paymentsAfterSlash := slash_validator_pending_payments slashedIdx [paymentAfterBid]
-  let latestBidAfterSlash : Nat := bidValue -- `latest_execution_payload_bid.value` is NOT zeroed!
-  -- Step 3: Two epoch boundaries (`process_builder_pending_payments` with quorum = 1)
+  let latestBidAfterSlash : Nat := bidValue
   let (first1, second1, w1) := process_builder_pending_payments 1 [{}] paymentsAfterSlash []
   let (_, _, w2) := process_builder_pending_payments 1 first1 second1 w1
-  -- Step 4: `apply_parent_execution_payload` at `parentEpoch = 4, currentEpoch = 6`
   let s : GloasParentPaymentState := {
     parentEpoch := 4
     currentEpoch := 6
@@ -656,24 +664,26 @@ theorem t_7732_frame (s : GloasParentPaymentState) (steps : List Bool) :
 /-! ## 7. EIP-8282 -> EIP-7732 Builder Queue Closure (`T-8282-7732-QUEUE-SAFETY`) and
     Cross-Function Credential-Check Divergence (`beacon-chain.md:2334-2361` vs `fork.md:70-120`) -/
 
-/-- Under Gloas (`process_parent_execution_payload:1841-1854`), when a child block confirms
-an EMPTY parent (`isParentFull = false`), `block.body.parent_execution_requests` MUST be empty;
-when it confirms a FULL parent (`isParentFull = true`), `hash_tree_root(requests)` MUST equal
-`parent_bid.execution_requests_root`. -/
-def valid_parent_execution_requests (isParentFull : Bool) (requestsEmpty : Bool)
-    (requestsRoot parentCommittedRoot : Nat) : Bool :=
-  if !isParentFull then
+/-- Under Gloas (`process_parent_execution_payload:1841-1854`), `bid.parent_block_hash` is compared
+against `parent_bid.block_hash`: when `bidParentBlockHash ≠ parentBidBlockHash` (EMPTY parent),
+`block.body.parent_execution_requests` MUST be empty (`requestsEmpty = true`); when
+`bidParentBlockHash = parentBidBlockHash` (FULL parent), `hash_tree_root(requests)` (`requestsRoot`)
+MUST equal `parent_bid.execution_requests_root` (`parentCommittedRoot`). -/
+def valid_parent_execution_requests (bidParentBlockHash parentBidBlockHash : Nat)
+    (requestsEmpty : Bool) (requestsRoot parentCommittedRoot : Nat) : Bool :=
+  if bidParentBlockHash != parentBidBlockHash then
     requestsEmpty
   else
-    decide (requestsRoot = parentCommittedRoot)
+    requestsRoot == parentCommittedRoot
 
-theorem t_8282_7732_queue_safety (isParentFull requestsEmpty : Bool)
-    (requestsRoot parentCommittedRoot : Nat)
-    (h : valid_parent_execution_requests isParentFull requestsEmpty requestsRoot parentCommittedRoot = true) :
-    (isParentFull = false → requestsEmpty = true) ∧
-    (isParentFull = true → requestsRoot = parentCommittedRoot) := by
-  unfold valid_parent_execution_requests at h
-  cases isParentFull <;> simp_all
+theorem t_8282_7732_queue_safety (bidParentBlockHash parentBidBlockHash : Nat)
+    (requestsEmpty : Bool) (requestsRoot parentCommittedRoot : Nat) :
+    valid_parent_execution_requests bidParentBlockHash parentBidBlockHash
+        requestsEmpty requestsRoot parentCommittedRoot = true ↔
+      ((bidParentBlockHash ≠ parentBidBlockHash ∧ requestsEmpty = true) ∨
+       (bidParentBlockHash = parentBidBlockHash ∧ requestsRoot = parentCommittedRoot)) := by
+  unfold valid_parent_execution_requests
+  by_cases h_eq : bidParentBlockHash = parentBidBlockHash <;> simp [h_eq]
 
 /-- Input to `process_builder_deposit_request` (`beacon-chain.md:2334-2361`) and
 `onboard_builders_from_pending_deposits` (`fork.md:70-120`). -/
@@ -792,11 +802,13 @@ structure AvailabilityRing where
   bits : List (Nat × Bool) := []
   deriving Repr, DecidableEq, BEq
 
+/-- Bit-lookup on `AvailabilityRing` (unwritten slots default to `true`, matching `0b1`
+initialization in `upgrade_to_gloas` at `fork.md:199`). -/
 def AvailabilityRing.getBit (r : AvailabilityRing) (slot : Nat) : Bool :=
   let idx := slot % r.size
   match r.bits.find? (fun p => p.1 == idx) with
   | some (_, b) => b
-  | none => true -- initialized to `0b1` at `upgrade_to_gloas` (`fork.md:199`)
+  | none => true
 
 def AvailabilityRing.setBit (r : AvailabilityRing) (slot : Nat) (val : Bool) : AvailabilityRing :=
   let idx := slot % r.size
@@ -822,8 +834,8 @@ When the fork block at `s_fork` has its payload withheld (`isForkBlockFull = fal
 block at `s_fork + 1` builds on the empty parent (`apply_parent_payload_ring _ s_fork false`),
 `getBit s_fork` remains `true` instead of `false`! -/
 def fork_slot_availability_v170_beta4_buggy (isForkBlockFull : Bool) : Bool :=
-  let r0 : AvailabilityRing := { size := 64, bits := [] } -- all bits `true` after `upgrade_to_gloas`
-  let r1 := process_slot_ring r0 64                       -- clears slot `65`, NOT `64` (`s_fork`)!
+  let r0 : AvailabilityRing := { size := 64, bits := [] }
+  let r1 := process_slot_ring r0 64
   let r2 := apply_parent_payload_ring r1 64 isForkBlockFull
   r2.getBit 64
 
@@ -888,6 +900,793 @@ def f_7732_availability_ring_buffer_clobber_refuter :
     simp
   killWitness := (64, 10, 74, true)
   mutant_refuted := by decide
+
+/-! ## 9. Dual-Pin `consensus-specs#5736` (`8b374fa81b`), `consensus-specs#5763`
+    (`1bdf4b8be5`), and Client-Export Bid-Validation Boundaries (`FINDING-028` & `FINDING-031`) -/
+
+/-- Input to the same-key fork onboarding routing decision in `onboard_builders_from_pending_deposits`
+(dual-pin of `consensus-specs#5736` @ `8b374fa81b`; base `fork.md:70-120` @ `aa16bb4c`).
+`isBuilderCredential` projects `is_builder_withdrawal_credential(withdrawal_credentials)`,
+`pubkeyIsExistingValidator` projects `deposit.pubkey in validator_pubkeys`,
+`pubkeyIsRegisteredBuilder` projects `deposit.pubkey in builder_pubkeys` (recomputed each
+iteration), and `pubkeyIsPendingValidator` projects `is_pending_validator(pending_deposits, pubkey)`. -/
+structure ForkOnboardingDeposit where
+  isBuilderCredential : Bool
+  pubkeyIsExistingValidator : Bool
+  pubkeyIsRegisteredBuilder : Bool
+  pubkeyIsPendingValidator : Bool
+  signatureValid : Bool
+  currentBuilderBalance : Nat
+  depositAmount : Nat
+  deriving Repr, DecidableEq, BEq
+
+/-- Per-deposit onboarding outcome: `consumedFromPending` is `false` iff the deposit is appended
+back to `pending_deposits`; `builderBalanceAfter` is the same-key builder balance after this step
+(or `currentBuilderBalance` when no builder was credited); `registeredNewBuilder` is `true` iff
+`add_builder_to_registry` is invoked (base balance `depositAmount`). -/
+structure ForkOnboardingOutcome where
+  consumedFromPending : Bool
+  builderBalanceAfter : Nat
+  registeredNewBuilder : Bool
+  deriving Repr, DecidableEq, BEq
+
+/-- Patched `onboard_builders_from_pending_deposits` per-deposit routing (`consensus-specs#5736`
+@ `8b374fa81b`):
+1. Non-builder-credential deposits (`isBuilderCredential = false`) ALWAYS stay queued, even when a
+   builder with the same pubkey is already registered (cross-credential key collision is not a
+   builder top-up).
+2. A builder-credential deposit for an already-registered builder credits
+   `currentBuilderBalance + depositAmount` without any signature check.
+3. A builder-credential deposit for a NEW pubkey with a valid signature registers a new builder
+   with balance `depositAmount` (a validator may share the pubkey).
+4. A builder-credential deposit for a NEW pubkey with an INVALID signature is dropped (consumed,
+   not credited), UNLESS an existing or earlier-valid pending validator shares the pubkey, in
+   which case it stays queued as a validator top-up. -/
+def onboard_builders_pending_deposit_pr5736 (d : ForkOnboardingDeposit) : ForkOnboardingOutcome :=
+  if !d.isBuilderCredential then
+    { consumedFromPending := false
+      builderBalanceAfter := d.currentBuilderBalance
+      registeredNewBuilder := false }
+  else if d.pubkeyIsRegisteredBuilder then
+    { consumedFromPending := true
+      builderBalanceAfter := d.currentBuilderBalance + d.depositAmount
+      registeredNewBuilder := false }
+  else if d.signatureValid then
+    { consumedFromPending := true
+      builderBalanceAfter := d.depositAmount
+      registeredNewBuilder := true }
+  else if d.pubkeyIsExistingValidator || d.pubkeyIsPendingValidator then
+    { consumedFromPending := false
+      builderBalanceAfter := d.currentBuilderBalance
+      registeredNewBuilder := false }
+  else
+    { consumedFromPending := true
+      builderBalanceAfter := d.currentBuilderBalance
+      registeredNewBuilder := false }
+
+/-- Pre-#5736 `v1.7.0-beta.4` fork routing (`fork.md:70-120` @ `aa16bb4c`): the first
+`if deposit.pubkey in validator_pubkeys:` gate keeps every existing-validator deposit queued,
+even a valid builder-credential registration, and the `else:` branch at `fork.md:115-117`
+credits non-builder-credential deposits to a same-key builder. -/
+def onboard_builders_pending_deposit_v170_beta4 (d : ForkOnboardingDeposit) : ForkOnboardingOutcome :=
+  if d.pubkeyIsExistingValidator then
+    { consumedFromPending := false
+      builderBalanceAfter := d.currentBuilderBalance
+      registeredNewBuilder := false }
+  else if d.pubkeyIsRegisteredBuilder then
+    { consumedFromPending := true
+      builderBalanceAfter := d.currentBuilderBalance + d.depositAmount
+      registeredNewBuilder := false }
+  else if !d.isBuilderCredential then
+    { consumedFromPending := false
+      builderBalanceAfter := d.currentBuilderBalance
+      registeredNewBuilder := false }
+  else if d.pubkeyIsPendingValidator then
+    { consumedFromPending := false
+      builderBalanceAfter := d.currentBuilderBalance
+      registeredNewBuilder := false }
+  else if d.signatureValid then
+    { consumedFromPending := true
+      builderBalanceAfter := d.depositAmount
+      registeredNewBuilder := true }
+  else
+    { consumedFromPending := true
+      builderBalanceAfter := d.currentBuilderBalance
+      registeredNewBuilder := false }
+
+/-- T-7732-PR5736-SAME-KEY-VALIDATOR-TOPUP-PRESERVED: Exhaustive 4-way partition of
+`onboard_builders_pending_deposit_pr5736` (`consensus-specs#5736` @ `8b374fa81b`):
+1. Every non-builder-credential deposit (`isBuilderCredential = false`) remains pending and leaves
+   `builderBalanceAfter = currentBuilderBalance`, even when the pubkey is a registered builder.
+2. Every `0xB0` deposit for an already-registered builder (`pubkeyIsRegisteredBuilder = true`) is
+   consumed and tops up `builderBalanceAfter = currentBuilderBalance + depositAmount` regardless of
+   `signatureValid` (matching `fork.md` `else: state.builders[builder_index].balance += deposit.amount`).
+3. A `0xB0` deposit for an unregistered pubkey with `signatureValid = true` registers a new builder
+   with `builderBalanceAfter = depositAmount` even when an existing validator shares the pubkey.
+4. A `0xB0` deposit for an unregistered pubkey with `signatureValid = false` stays pending iff an
+   existing or pending validator claims that pubkey (otherwise it is consumed and discarded). -/
+theorem t_7732_pr5736_same_key_validator_topup_preserved (d : ForkOnboardingDeposit) :
+    (d.isBuilderCredential = false →
+      (onboard_builders_pending_deposit_pr5736 d).consumedFromPending = false ∧
+      (onboard_builders_pending_deposit_pr5736 d).builderBalanceAfter = d.currentBuilderBalance) ∧
+    (d.isBuilderCredential = true → d.pubkeyIsRegisteredBuilder = true →
+      (onboard_builders_pending_deposit_pr5736 d).consumedFromPending = true ∧
+      (onboard_builders_pending_deposit_pr5736 d).registeredNewBuilder = false ∧
+      (onboard_builders_pending_deposit_pr5736 d).builderBalanceAfter =
+        d.currentBuilderBalance + d.depositAmount) ∧
+    (d.isBuilderCredential = true → d.pubkeyIsRegisteredBuilder = false → d.signatureValid = true →
+      (onboard_builders_pending_deposit_pr5736 d).registeredNewBuilder = true ∧
+      (onboard_builders_pending_deposit_pr5736 d).builderBalanceAfter = d.depositAmount) ∧
+    (d.isBuilderCredential = true → d.pubkeyIsRegisteredBuilder = false → d.signatureValid = false →
+      ((onboard_builders_pending_deposit_pr5736 d).consumedFromPending = false ↔
+        (d.pubkeyIsExistingValidator = true ∨ d.pubkeyIsPendingValidator = true))) := by
+  unfold onboard_builders_pending_deposit_pr5736
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · intro h_credential
+    simp [h_credential]
+  · intro h_credential h_registered
+    simp [h_credential, h_registered]
+  · intro h_credential h_unregistered h_signature
+    simp [h_credential, h_unregistered, h_signature]
+  · intro h_credential h_unregistered h_signature
+    simp [h_credential, h_unregistered, h_signature]
+    cases d.pubkeyIsExistingValidator <;> cases d.pubkeyIsPendingValidator <;> simp
+
+/-- `WitnessRefuter` for the pre-#5736 same-key cross-credential routing: a non-builder-credential
+validator top-up (`0x01`) on a pubkey already registered as a builder is consumed and credited to
+the builder by `onboard_builders_pending_deposit_v170_beta4`, but correctly stays pending with an
+unchanged builder balance under `onboard_builders_pending_deposit_pr5736`. -/
+def f_7732_pr5736_same_key_cross_credential_refuter :
+    WitnessRefuter ForkOnboardingDeposit ForkOnboardingOutcome
+      (fun d out => d.isBuilderCredential = false →
+        out.consumedFromPending = false ∧ out.builderBalanceAfter = d.currentBuilderBalance) where
+  reference := onboard_builders_pending_deposit_pr5736
+  mutant := onboard_builders_pending_deposit_v170_beta4
+  ref_sound := by
+    intro d h_credential
+    have h_preservation :=
+      (t_7732_pr5736_same_key_validator_topup_preserved d).1 h_credential
+    exact h_preservation
+  killWitness := {
+    isBuilderCredential := false
+    pubkeyIsExistingValidator := false
+    pubkeyIsRegisteredBuilder := true
+    pubkeyIsPendingValidator := false
+    signatureValid := true
+    currentBuilderBalance := MIN_DEPOSIT_AMOUNT
+    depositAmount := 32000000000
+  }
+  mutant_refuted := by decide
+
+/-- Consecutive-slot PTC-quorum slice of `should_build_on_full(store, head, slot)` in Gloas
+(`consensus-specs#5763` @ `1bdf4b8be5`; Gloas `validator.md`, honest proposer
+`prepare_execution_payload` and `signed_execution_payload_bid` construction). Abstracts the
+adjacent-slot (`querySlot = parentSlot + 1` with payload locally available) branch that distinguishes
+`wallclockSlot` from `proposalSlot`; non-adjacent `PAYLOAD_STATUS_FULL`/`EMPTY` and unavailable-payload
+fork-choice branches are orthogonal to the `#5763` slot-argument fix and excluded per `E-FORK-CHOICE`. -/
+def should_build_on_full
+    (parentSlot querySlot : Nat) (ptcQuorumObservedAtSlot : Bool) : Bool :=
+  decide (parentSlot < querySlot) && ptcQuorumObservedAtSlot
+
+/-- Input context for `prepare_execution_payload` and `signed_execution_payload_bid` construction
+at a proposal slot (`consensus-specs#5763`): `parentSlot` is the parent block's slot,
+`wallclockSlot` is `get_current_slot(store)` when `prepare_execution_payload` runs, `proposalSlot`
+is `state.slot` of the block being constructed, `ptcQuorumAtWallclock` / `ptcQuorumAtProposal` are
+the PTC-quorum views at those slots, and `parentBidBlockHash` / `parentBidParentBlockHash` are
+`state.latest_execution_payload_bid.block_hash` and `.parent_block_hash`. -/
+structure ProposalSlotPrepContext where
+  parentSlot : Nat
+  wallclockSlot : Nat
+  proposalSlot : Nat
+  ptcQuorumAtWallclock : Bool
+  ptcQuorumAtProposal : Bool
+  parentBidBlockHash : Nat
+  parentBidParentBlockHash : Nat
+  deriving Repr, DecidableEq, BEq
+
+/-- Execution parent `block_hash` selected by `signed_execution_payload_bid` at `state.slot`:
+`parentBidBlockHash` when `should_build_on_full(store, head, state.slot)` is `true`, otherwise
+`parentBidParentBlockHash`. -/
+def select_bid_parent_block_hash (ctx : ProposalSlotPrepContext) : Nat :=
+  if should_build_on_full ctx.parentSlot ctx.proposalSlot ctx.ptcQuorumAtProposal then
+    ctx.parentBidBlockHash
+  else
+    ctx.parentBidParentBlockHash
+
+/-- Pre-#5763 wall-clock payload preparation: calls `should_build_on_full` at
+`get_current_slot(store)` (`wallclockSlot`), which during early preparation (`wallclockSlot =
+parentSlot`) selects `parentBidParentBlockHash` even when `proposalSlot = parentSlot + 1` builds
+on `parentBidBlockHash`. -/
+def select_prepared_parent_block_hash_buggy (ctx : ProposalSlotPrepContext) : Nat :=
+  if should_build_on_full ctx.parentSlot ctx.wallclockSlot ctx.ptcQuorumAtWallclock then
+    ctx.parentBidBlockHash
+  else
+    ctx.parentBidParentBlockHash
+
+/-- Patched #5763 proposal-slot payload preparation: `prepare_execution_payload` evaluates
+`should_build_on_full(store, head, state.slot)` (`proposalSlot`) instead of `wallclockSlot`. -/
+def select_prepared_parent_block_hash_pr5763 (ctx : ProposalSlotPrepContext) : Nat :=
+  if should_build_on_full ctx.parentSlot ctx.proposalSlot ctx.ptcQuorumAtProposal then
+    ctx.parentBidBlockHash
+  else
+    ctx.parentBidParentBlockHash
+
+/-- `WitnessRefuter` for the pre-#5763 wall-clock desynchronization: preparing during the parent
+slot (`wallclockSlot = 10`, `ptcQuorumAtWallclock = false`) for `proposalSlot = 11` where PTC
+quorum holds (`ptcQuorumAtProposal = true`) prepares against `parentBidParentBlockHash` (`0x1111`)
+while the bid at `state.slot = 11` commits to `parentBidBlockHash` (`0x2222`), whereas the
+#5763-patched `prepare_execution_payload` matches `select_bid_parent_block_hash`. -/
+def f_7732_pr5763_wallclock_slot_desync_refuter :
+    WitnessRefuter ProposalSlotPrepContext Nat
+      (fun ctx preparedHash => preparedHash = select_bid_parent_block_hash ctx) where
+  reference := select_prepared_parent_block_hash_pr5763
+  mutant := select_prepared_parent_block_hash_buggy
+  ref_sound := by
+    intro ctx
+    rfl
+  killWitness := {
+    parentSlot := 10
+    wallclockSlot := 10
+    proposalSlot := 11
+    ptcQuorumAtWallclock := false
+    ptcQuorumAtProposal := true
+    parentBidBlockHash := 0x2222
+    parentBidParentBlockHash := 0x1111
+  }
+  mutant_refuted := by decide
+
+/-- T-7732-PR5763-PROPOSAL-SLOT-AGREEMENT: Under `consensus-specs#5763`, `prepare_execution_payload`
+selects the exact execution parent hash committed by `signed_execution_payload_bid` at `state.slot`
+(`select_bid_parent_block_hash ctx`), AND selects the full parent (`parentBidBlockHash`) when
+`parentBidBlockHash ≠ parentBidParentBlockHash` iff `parentSlot < proposalSlot` and PTC quorum
+holds at the proposal slot — independent of `wallclockSlot` and `ptcQuorumAtWallclock`. -/
+theorem t_7732_pr5763_proposal_slot_agreement (ctx : ProposalSlotPrepContext) :
+    select_prepared_parent_block_hash_pr5763 ctx = select_bid_parent_block_hash ctx ∧
+    (ctx.parentBidBlockHash ≠ ctx.parentBidParentBlockHash →
+      (select_prepared_parent_block_hash_pr5763 ctx = ctx.parentBidBlockHash ↔
+        ctx.parentSlot < ctx.proposalSlot ∧ ctx.ptcQuorumAtProposal = true)) := by
+  have h_agree :
+      select_prepared_parent_block_hash_pr5763 ctx = select_bid_parent_block_hash ctx := rfl
+  refine ⟨h_agree, ?_⟩
+  intro h_distinct
+  rw [h_agree]
+  dsimp [select_bid_parent_block_hash, should_build_on_full]
+  by_cases h_lt : ctx.parentSlot < ctx.proposalSlot
+  · cases ctx.ptcQuorumAtProposal
+    · simp [h_lt, Ne.symm h_distinct]
+    · simp [h_lt]
+  · simp [h_lt, Ne.symm h_distinct]
+
+/-- Input to proposer-side bid validation (`ExecutionPayloadBid` fields plus the proposer's expected
+`fee_recipient`, builder status, solvency, and per-epoch blob limit). `bidValue > 0` activates the
+conditional `can_builder_cover_bid` check in `builder-specs` (whereas `consensus-specs` asserts
+`can_builder_cover_bid` unconditionally on the external-builder branch); `gasLimitCompatible`
+represents `is_gas_limit_target_compatible` solely in `builder-specs` (`consensus-specs` imposes no
+gas-limit target compatibility assert in `process_execution_payload_bid`); `blockHash` /
+`parentBlockHash` are the bid's `block_hash` / `parent_block_hash`; `blobCommitmentCount` is
+`len(bid.blob_kzg_commitments)` and `maxBlobsPerBlock` is
+`get_blob_parameters(get_current_epoch(state)).max_blobs_per_block` (`beacon-chain.md:2183-2187`). -/
+structure BidValidationInput where
+  isActiveBuilder : Bool
+  builderVersion : Nat
+  bidValue : Nat
+  canCoverBid : Bool
+  signatureValid : Bool
+  slotMatchesState : Bool
+  parentBlockHashMatches : Bool
+  parentBlockRootMatches : Bool
+  prevRandaoMatches : Bool
+  gasLimitCompatible : Bool
+  feeRecipientMatchesProposer : Bool
+  blockHash : Nat
+  parentBlockHash : Nat
+  blobCommitmentCount : Nat
+  maxBlobsPerBlock : Nat
+  deriving Repr, DecidableEq, BEq
+
+/-- Shared builder-specs `validate_bid` pre-filter (client-export `FINDING-028` & `FINDING-031`):
+checks builder activity, slot, parent hash/root, `prev_randao`, `is_gas_limit_target_compatible`
+(`gasLimitCompatible`), conditional solvency (`if bid.value > 0: can_builder_cover_bid`),
+signature, and `bid.fee_recipient == fee_recipient`. It OMITS the consensus asserts
+`bid.block_hash != bid.parent_block_hash`, `len(bid.blob_kzg_commitments) <= max_blobs_per_block`,
+and `builder.version == PAYLOAD_BUILDER_VERSION`. -/
+def validate_bid_builder_specs (v : BidValidationInput) : Bool :=
+  v.isActiveBuilder && (v.bidValue == 0 || v.canCoverBid) && v.signatureValid &&
+    v.slotMatchesState && v.parentBlockHashMatches && v.parentBlockRootMatches &&
+    v.prevRandaoMatches && v.gasLimitCompatible && v.feeRecipientMatchesProposer
+
+/-- Consensus `process_execution_payload_bid` validity gate on the external-builder branch
+(`builder_index != BUILDER_INDEX_SELF_BUILD`, `beacon-chain.md:2162-2216`):
+checks `is_active_builder`, `state.builders[builder_index].version == PAYLOAD_BUILDER_VERSION`,
+unconditional `can_builder_cover_bid`, `verify_execution_payload_bid_signature`,
+`len(bid.blob_kzg_commitments) <= max_blobs_per_block`, `bid.slot == state.slot`,
+`bid.parent_block_hash`, `bid.block_hash != bid.parent_block_hash`, `bid.parent_block_root`, and
+`bid.prev_randao` (with NO `is_gas_limit_target_compatible` or `fee_recipient` constraint;
+FINDING-031: consensus records `bid.fee_recipient` verbatim). -/
+def process_bid_consensus_specs (v : BidValidationInput) : Bool :=
+  v.isActiveBuilder && v.canCoverBid && v.signatureValid && v.slotMatchesState &&
+    v.parentBlockHashMatches && v.parentBlockRootMatches && v.prevRandaoMatches &&
+    (v.builderVersion == PAYLOAD_BUILDER_VERSION) &&
+    (v.blobCommitmentCount <= v.maxBlobsPerBlock) && (v.blockHash != v.parentBlockHash)
+
+/-- Aligned proposer-side validation (recommended fix for FINDING-028 & FINDING-031): requires
+BOTH the consensus state-transition validity conditions (`process_bid_consensus_specs`) AND the
+proposer-side `is_gas_limit_target_compatible` and `bid.fee_recipient == fee_recipient` checks. -/
+def validate_bid_aligned (v : BidValidationInput) : Bool :=
+  process_bid_consensus_specs v && v.gasLimitCompatible && v.feeRecipientMatchesProposer
+
+/-- T-7732-FINDING-028-031-BID-VALIDATION-BOUNDARY:
+1. FINDING-028 (grief): `validate_bid_builder_specs` accepting a bid does NOT imply
+   `process_bid_consensus_specs` accepts it (missing `block_hash != parent_block_hash` /
+   blob-count / builder-version / zero-value `can_builder_cover_bid`); a proposer using ONLY the
+   pre-filter can select a consensus-invalid bid.
+2. FINDING-031 (self-payment): `process_bid_consensus_specs` accepting a bid does NOT imply the
+   proposer's `fee_recipient` matches; a self-paying bid yields a fully VALID consensus block.
+3. `validate_bid_aligned` is accepted iff consensus validity AND the proposer's gas-limit and
+   fee-recipient conditions all hold, closing both boundaries. -/
+theorem t_7732_finding_028_031_bid_validation_boundary :
+    (∃ v : BidValidationInput,
+      validate_bid_builder_specs v = true ∧ process_bid_consensus_specs v = false) ∧
+    (∃ v : BidValidationInput,
+      process_bid_consensus_specs v = true ∧ v.feeRecipientMatchesProposer = false) ∧
+    (∀ v : BidValidationInput,
+      validate_bid_aligned v = true ↔
+        (process_bid_consensus_specs v = true ∧
+          v.gasLimitCompatible = true ∧
+          v.feeRecipientMatchesProposer = true)) := by
+  let griefBid : BidValidationInput := {
+    isActiveBuilder := true
+    builderVersion := PAYLOAD_BUILDER_VERSION
+    bidValue := 1000000
+    canCoverBid := true
+    signatureValid := true
+    slotMatchesState := true
+    parentBlockHashMatches := true
+    parentBlockRootMatches := true
+    prevRandaoMatches := true
+    gasLimitCompatible := true
+    feeRecipientMatchesProposer := true
+    blockHash := 0xdead
+    parentBlockHash := 0xdead
+    blobCommitmentCount := 7
+    maxBlobsPerBlock := 6
+  }
+  let selfPayingBid : BidValidationInput := {
+    isActiveBuilder := true
+    builderVersion := PAYLOAD_BUILDER_VERSION
+    bidValue := 1000000
+    canCoverBid := true
+    signatureValid := true
+    slotMatchesState := true
+    parentBlockHashMatches := true
+    parentBlockRootMatches := true
+    prevRandaoMatches := true
+    gasLimitCompatible := true
+    feeRecipientMatchesProposer := false
+    blockHash := 0xbeef
+    parentBlockHash := 0xdead
+    blobCommitmentCount := 6
+    maxBlobsPerBlock := 6
+  }
+  refine ⟨⟨griefBid, by decide⟩, ⟨selfPayingBid, by decide⟩, ?_⟩
+  intro v
+  unfold validate_bid_aligned
+  cases process_bid_consensus_specs v <;>
+    cases v.gasLimitCompatible <;>
+    cases v.feeRecipientMatchesProposer <;> simp
+
+/-- Concrete FINDING-028 `WitnessRefuter`: `validate_bid_builder_specs` accepts a bid with
+`blockHash == parentBlockHash` and `blobCommitmentCount > maxBlobsPerBlock`, which the aligned
+validator rejects (so proposer acceptance implies consensus validity under the aligned gate). -/
+def f_7732_finding_028_incomplete_prefilter_refuter :
+    WitnessRefuter BidValidationInput Bool
+      (fun v accepted => accepted = true → process_bid_consensus_specs v = true) where
+  reference := validate_bid_aligned
+  mutant := validate_bid_builder_specs
+  ref_sound := by
+    intro v h_accepted
+    have h_aligned := (t_7732_finding_028_031_bid_validation_boundary).2.2 v
+    exact (h_aligned.mp h_accepted).1
+  killWitness := {
+    isActiveBuilder := true
+    builderVersion := PAYLOAD_BUILDER_VERSION
+    bidValue := 1000000
+    canCoverBid := true
+    signatureValid := true
+    slotMatchesState := true
+    parentBlockHashMatches := true
+    parentBlockRootMatches := true
+    prevRandaoMatches := true
+    gasLimitCompatible := true
+    feeRecipientMatchesProposer := true
+    blockHash := 0xdead
+    parentBlockHash := 0xdead
+    blobCommitmentCount := 7
+    maxBlobsPerBlock := 6
+  }
+  mutant_refuted := by decide
+
+/-- Concrete FINDING-031 `WitnessRefuter`: the consensus-only checklist accepts a self-paying bid
+(`feeRecipientMatchesProposer = false`), while `validate_bid_aligned` rejects it; any accepted bid
+under the aligned gate pays the proposer's own `fee_recipient`. -/
+def f_7732_finding_031_self_paying_bid_refuter :
+    WitnessRefuter BidValidationInput Bool
+      (fun v accepted => accepted = true → v.feeRecipientMatchesProposer = true) where
+  reference := validate_bid_aligned
+  mutant := process_bid_consensus_specs
+  ref_sound := by
+    intro v h_accepted
+    have h_aligned := (t_7732_finding_028_031_bid_validation_boundary).2.2 v
+    exact (h_aligned.mp h_accepted).2.2
+  killWitness := {
+    isActiveBuilder := true
+    builderVersion := PAYLOAD_BUILDER_VERSION
+    bidValue := 1000000
+    canCoverBid := true
+    signatureValid := true
+    slotMatchesState := true
+    parentBlockHashMatches := true
+    parentBlockRootMatches := true
+    prevRandaoMatches := true
+    gasLimitCompatible := true
+    feeRecipientMatchesProposer := false
+    blockHash := 0xbeef
+    parentBlockHash := 0xdead
+    blobCommitmentCount := 6
+    maxBlobsPerBlock := 6
+  }
+  mutant_refuted := by decide
+
+/-! ## 10. Multi-Builder CL+EL Supply Conservation and Concrete `BeaconState` Frame
+    (`apply_withdrawals` at `beacon-chain.md:1997-2007`, `BeaconState` at `862-934`) -/
+
+/-- One execution-layer builder withdrawal (`Withdrawal`): `builderIndex` projects the registry
+index recovered by `convert_validator_index_to_builder_index(withdrawal.validator_index)` when
+`is_builder_index(withdrawal.validator_index)` holds, `amount` is `withdrawal.amount` in Gwei, and
+`executionRecipient` is the EL address credited (`withdrawal.address`). -/
+structure BuilderWithdrawal where
+  builderIndex : Nat
+  amount : Nat
+  executionRecipient : Nat
+  deriving Repr, DecidableEq, BEq
+
+/-- Concrete `BeaconState` projection (`beacon-chain.md:862-934`) for builder accounting:
+`builders` is `state.builders`, `builderPendingWithdrawals` is the queue consumed by
+`get_builder_withdrawals`, `validatorBalances` is `state.balances`, and `untouchedCl` captures
+every field not written by builder payment/withdrawal transitions (validator registry,
+`latest_block_header`, `block_roots`, `state_roots`, `randao_mixes`, `justification_bits`,
+`current_sync_committee`, `next_sync_committee`, `ptc_window`, ...). -/
+structure GloasBeaconState where
+  builders : List Builder
+  builderPendingWithdrawals : List BuilderPendingWithdrawal
+  validatorBalances : List Nat
+  untouchedCl : UntouchedClInvariants
+  deriving Repr, DecidableEq, BEq
+
+/-- Total CL Gwei locked in the builder registry (`sum(state.builders[i].balance)`). -/
+def total_builders_balance (builders : List Builder) : Nat :=
+  builders.foldl (fun acc b => acc + b.balance) 0
+
+/-- Total EL Gwei credited by a batch of builder withdrawals. -/
+def total_execution_withdrawal_credit (ws : List BuilderWithdrawal) : Nat :=
+  ws.foldl (fun acc w => acc + w.amount) 0
+
+/-- Total Gwei withdrawn from a specific builder index across a withdrawal batch
+(`beacon-chain.md:1899-1905`). -/
+def builder_withdrawn_in_batch (ws : List BuilderWithdrawal) (builderIdx : Nat) : Nat :=
+  ws.foldl (fun acc w => if w.builderIndex == builderIdx then acc + w.amount else acc) 0
+
+/-- Positional list update matching `state.builders[builder_index].balance = saturating_sub(...)`
+in `apply_withdrawals` (`beacon-chain.md:1997-2007`). -/
+def debit_builder_at_index : List Builder → Nat → Nat → List Builder
+  | [], _, _ => []
+  | b :: rest, 0, amt => { b with balance := saturatingSub b.balance amt } :: rest
+  | b :: rest, idx + 1, amt => b :: debit_builder_at_index rest idx amt
+
+/-- Lookup the balance of `builders[idx]` (`0` when `idx >= builders.length`). -/
+def builder_balance_at : List Builder → Nat → Nat
+  | [], _ => 0
+  | b :: _, 0 => b.balance
+  | _ :: rest, idx + 1 => builder_balance_at rest idx
+
+/-- Boolean solvency gate for a batch of builder withdrawals against `builders`
+(`beacon-chain.md:1184-1193`, `1895-1906`): every withdrawal references an in-bounds
+`builderIndex < builders.length`, and for every withdrawal the builder's initial balance covers
+the cumulative withdrawals for that `builderIndex` across the entire batch. -/
+def builder_withdrawals_solvency_ok
+    (builders : List Builder) (ws : List BuilderWithdrawal) : Bool :=
+  ws.all (fun w =>
+    decide (w.builderIndex < builders.length) &&
+      decide (builder_withdrawn_in_batch ws w.builderIndex ≤
+        builder_balance_at builders w.builderIndex))
+
+/-- One `apply_withdrawals` builder-registry update (`beacon-chain.md:2000-2004`): deducts
+`w.amount` from `state.builders[w.builderIndex].balance` via `saturatingSub` (and slices the
+processed head entry off `builderPendingWithdrawals` when non-empty, `beacon-chain.md:2088`). -/
+def apply_builder_withdrawal_step (s : GloasBeaconState) (w : BuilderWithdrawal) : GloasBeaconState :=
+  { s with
+    builders := debit_builder_at_index s.builders w.builderIndex w.amount
+    builderPendingWithdrawals := s.builderPendingWithdrawals.drop 1 }
+
+/-- Batch application of `apply_withdrawals` to all builder-indexed withdrawals
+(`beacon-chain.md:1997-2007`), preserving `validatorBalances` and `untouchedCl`. -/
+def apply_builder_withdrawals_registry
+    (s : GloasBeaconState) (ws : List BuilderWithdrawal) : GloasBeaconState :=
+  ws.foldl apply_builder_withdrawal_step s
+
+private theorem foldl_builder_balance_shift (bs : List Builder) (init : Nat) :
+    bs.foldl (fun acc b => acc + b.balance) init =
+      init + bs.foldl (fun acc b => acc + b.balance) 0 := by
+  induction bs generalizing init with
+  | nil => simp
+  | cons b rest ih =>
+    simp only [List.foldl]
+    rw [ih (init + b.balance), ih (0 + b.balance)]
+    omega
+
+private theorem foldl_withdrawal_amount_shift (ws : List BuilderWithdrawal) (init : Nat) :
+    ws.foldl (fun acc w => acc + w.amount) init =
+      init + ws.foldl (fun acc w => acc + w.amount) 0 := by
+  induction ws generalizing init with
+  | nil => simp
+  | cons w rest ih =>
+    simp only [List.foldl]
+    rw [ih (init + w.amount), ih (0 + w.amount)]
+    omega
+
+private theorem foldl_builder_withdrawn_shift
+    (ws : List BuilderWithdrawal) (idx init : Nat) :
+    ws.foldl (fun acc w => if w.builderIndex == idx then acc + w.amount else acc) init =
+      init + ws.foldl (fun acc w => if w.builderIndex == idx then acc + w.amount else acc) 0 := by
+  induction ws generalizing init with
+  | nil => simp
+  | cons w rest ih =>
+    simp only [List.foldl]
+    by_cases h_eq : (w.builderIndex == idx) = true
+    · simp only [h_eq, ↓reduceIte]
+      rw [ih (init + w.amount), ih (0 + w.amount)]
+      omega
+    · simp only [h_eq, Bool.false_eq_true, ↓reduceIte]
+      exact ih init
+
+private theorem debit_builder_at_index_length
+    (bs : List Builder) (idx amt : Nat) :
+    (debit_builder_at_index bs idx amt).length = bs.length := by
+  induction bs generalizing idx with
+  | nil => rfl
+  | cons b rest ih =>
+    cases idx with
+    | zero => rfl
+    | succ k =>
+      dsimp [debit_builder_at_index]
+      rw [ih k]
+
+private theorem builder_balance_at_debit
+    (bs : List Builder) (idx amt j : Nat)
+    (h_solv : idx = j → amt ≤ builder_balance_at bs idx) :
+    builder_balance_at (debit_builder_at_index bs idx amt) j =
+      if j = idx then builder_balance_at bs j - amt else builder_balance_at bs j := by
+  induction bs generalizing idx j with
+  | nil =>
+    dsimp [debit_builder_at_index, builder_balance_at]
+    split <;> omega
+  | cons b rest ih =>
+    cases idx with
+    | zero =>
+      cases j with
+      | zero =>
+        have h_le : amt ≤ b.balance := h_solv rfl
+        dsimp [debit_builder_at_index, builder_balance_at, saturatingSub]
+        split <;> omega
+      | succ j' =>
+        simp [debit_builder_at_index, builder_balance_at]
+    | succ idx' =>
+      cases j with
+      | zero =>
+        simp [debit_builder_at_index, builder_balance_at]
+      | succ j' =>
+        dsimp [debit_builder_at_index, builder_balance_at]
+        have h_sub : idx' = j' → amt ≤ builder_balance_at rest idx' := by
+          intro h_eq
+          exact h_solv (by omega)
+        rw [ih idx' j' h_sub]
+        by_cases h_eq : j' = idx' <;> simp [h_eq]
+
+private theorem total_builders_balance_debit
+    (bs : List Builder) (idx amt : Nat)
+    (h_lt : idx < bs.length)
+    (h_le : amt ≤ builder_balance_at bs idx) :
+    total_builders_balance (debit_builder_at_index bs idx amt) + amt =
+      total_builders_balance bs := by
+  induction bs generalizing idx with
+  | nil =>
+    simp at h_lt
+  | cons b rest ih =>
+    cases idx with
+    | zero =>
+      dsimp [debit_builder_at_index, total_builders_balance, builder_balance_at, saturatingSub]
+        at h_le ⊢
+      rw [foldl_builder_balance_shift rest (0 + (if b.balance < amt then 0 else b.balance - amt)),
+        foldl_builder_balance_shift rest (0 + b.balance)]
+      split <;> omega
+    | succ idx' =>
+      have h_lt' : idx' < rest.length := by
+        simpa using h_lt
+      dsimp [builder_balance_at] at h_le
+      have h_rec := ih idx' h_lt' h_le
+      dsimp [debit_builder_at_index, total_builders_balance] at h_rec ⊢
+      rw [foldl_builder_balance_shift (debit_builder_at_index rest idx' amt) (0 + b.balance),
+        foldl_builder_balance_shift rest (0 + b.balance)]
+      omega
+
+private theorem builder_withdrawn_cons_eq (w : BuilderWithdrawal) (rest : List BuilderWithdrawal) :
+    builder_withdrawn_in_batch (w :: rest) w.builderIndex =
+      w.amount + builder_withdrawn_in_batch rest w.builderIndex := by
+  dsimp [builder_withdrawn_in_batch]
+  simp only [beq_self_eq_true, ↓reduceIte]
+  rw [foldl_builder_withdrawn_shift rest w.builderIndex (0 + w.amount)]
+  omega
+
+private theorem builder_withdrawn_cons_ne
+    (w : BuilderWithdrawal) (rest : List BuilderWithdrawal) (j : Nat)
+    (h_ne : j ≠ w.builderIndex) :
+    builder_withdrawn_in_batch (w :: rest) j =
+      builder_withdrawn_in_batch rest j := by
+  dsimp [builder_withdrawn_in_batch]
+  have h_beq : (w.builderIndex == j) = false := by
+    rw [beq_eq_false_iff_ne]
+    exact Ne.symm h_ne
+  simp only [h_beq, Bool.false_eq_true, ↓reduceIte]
+
+/-- T-7732-MULTI-BUILDER-CL-EL-SUPPLY-CONSERVATION: For an arbitrary batch of builder withdrawals
+across MULTIPLE builders, when the batch satisfies `builder_withdrawals_solvency_ok` (every
+withdrawal targets an in-bounds builder whose initial balance covers its cumulative withdrawals in
+the batch), applying `apply_withdrawals` (`beacon-chain.md:1997-2007`) to the builder registry
+debits the exact Execution-Layer withdrawal credit:
+
+  `total_builders_balance post + total_execution_withdrawal_credit ws = total_builders_balance pre`
+
+with zero saturation inflation across any number of builders and multiple withdrawals per builder. -/
+theorem t_7732_multi_builder_cl_el_supply_conservation
+    (pre : GloasBeaconState) (ws : List BuilderWithdrawal)
+    (h_solv : builder_withdrawals_solvency_ok pre.builders ws = true) :
+    total_builders_balance (apply_builder_withdrawals_registry pre ws).builders +
+        total_execution_withdrawal_credit ws =
+      total_builders_balance pre.builders := by
+  induction ws generalizing pre with
+  | nil =>
+    simp [apply_builder_withdrawals_registry, total_execution_withdrawal_credit]
+  | cons w rest ih =>
+    unfold builder_withdrawals_solvency_ok at h_solv
+    rw [List.all_cons, Bool.and_eq_true] at h_solv
+    rcases h_solv with ⟨h_head, h_tail⟩
+    simp only [Bool.and_eq_true, decide_eq_true_eq] at h_head
+    rcases h_head with ⟨h_w_lt, h_w_sum⟩
+    have h_w_eq := builder_withdrawn_cons_eq w rest
+    have h_w_amt : w.amount ≤ builder_balance_at pre.builders w.builderIndex := by
+      omega
+    have h_step_total :=
+      total_builders_balance_debit pre.builders w.builderIndex w.amount h_w_lt h_w_amt
+    have h_next_solv :
+        builder_withdrawals_solvency_ok (apply_builder_withdrawal_step pre w).builders rest = true := by
+      unfold builder_withdrawals_solvency_ok
+      rw [List.all_eq_true] at h_tail ⊢
+      intro w' h_in
+      have h_orig := h_tail w' h_in
+      simp only [Bool.and_eq_true, decide_eq_true_eq] at h_orig ⊢
+      rcases h_orig with ⟨h_lt', h_sum'⟩
+      refine ⟨?_, ?_⟩
+      · dsimp [apply_builder_withdrawal_step]
+        rw [debit_builder_at_index_length]
+        exact h_lt'
+      · dsimp [apply_builder_withdrawal_step]
+        have h_bal := builder_balance_at_debit pre.builders w.builderIndex w.amount w'.builderIndex
+          (fun _ => h_w_amt)
+        rw [h_bal]
+        by_cases h_eq : w'.builderIndex = w.builderIndex
+        · simp only [h_eq, ↓reduceIte]
+          omega
+        · simp only [h_eq, ↓reduceIte]
+          have h_ne := builder_withdrawn_cons_ne w rest w'.builderIndex h_eq
+          omega
+    have h_rec := ih (apply_builder_withdrawal_step pre w) h_next_solv
+    have h_cons : apply_builder_withdrawals_registry pre (w :: rest) =
+        apply_builder_withdrawals_registry (apply_builder_withdrawal_step pre w) rest := rfl
+    rw [h_cons]
+    have h_credit : total_execution_withdrawal_credit (w :: rest) =
+        w.amount + total_execution_withdrawal_credit rest := by
+      dsimp [total_execution_withdrawal_credit]
+      rw [foldl_withdrawal_amount_shift rest (0 + w.amount)]
+      omega
+    rw [h_credit]
+    have h_step_eq : (apply_builder_withdrawal_step pre w).builders =
+        debit_builder_at_index pre.builders w.builderIndex w.amount := rfl
+    rw [h_step_eq] at h_rec
+    omega
+
+/-- Concrete `BeaconState` frame projection: builder payment/withdrawal processing touches ONLY
+`builders` and `builder_pending_withdrawals`, leaving validator balances and all other CL fields
+(`untouchedCl`) invariant across arbitrary transition traces. -/
+def gloas_beacon_state_frame : FrameInvariant GloasBeaconState BuilderWithdrawal UntouchedClInvariants where
+  project := fun s => s.untouchedCl
+  step := apply_builder_withdrawal_step
+  preserved := by
+    intro s w
+    rfl
+
+/-- T-7732-CONCRETE-BEACON-STATE-FRAME: Across an arbitrary list of builder-withdrawal operations
+(`apply_builder_withdrawals_registry`), the concrete `GloasBeaconState` projection preserves
+`untouchedCl` (validator registry root, BLS-to-execution root, sync-committee root) AND
+`validatorBalances`; only builder balances and the builder-withdrawal queue are written. -/
+theorem t_7732_concrete_beacon_state_frame
+    (s : GloasBeaconState) (steps : List BuilderWithdrawal) :
+    (apply_builder_withdrawals_registry s steps).untouchedCl = s.untouchedCl ∧
+    (apply_builder_withdrawals_registry s steps).validatorBalances = s.validatorBalances := by
+  constructor
+  · exact gloas_beacon_state_frame.preserved_list s steps
+  · induction steps generalizing s with
+    | nil => rfl
+    | cons w rest ih =>
+      exact ih (apply_builder_withdrawal_step s w)
+
+@[inline, export glamsterdam_eip7732_pr5736_onboard_consumed_cabi]
+def eip7732_pr5736_onboard_consumed_cabi
+    (isBuilderCredential pubkeyIsExistingValidator pubkeyIsRegisteredBuilder : UInt64)
+    (pubkeyIsPendingValidator signatureValid : UInt64)
+    (currentBuilderBalance depositAmount : UInt64) : Bool :=
+  (onboard_builders_pending_deposit_pr5736 {
+    isBuilderCredential := isBuilderCredential != 0
+    pubkeyIsExistingValidator := pubkeyIsExistingValidator != 0
+    pubkeyIsRegisteredBuilder := pubkeyIsRegisteredBuilder != 0
+    pubkeyIsPendingValidator := pubkeyIsPendingValidator != 0
+    signatureValid := signatureValid != 0
+    currentBuilderBalance := currentBuilderBalance.toNat
+    depositAmount := depositAmount.toNat
+  }).consumedFromPending
+
+@[inline, export glamsterdam_eip7732_pr5736_onboard_builder_balance_cabi]
+def eip7732_pr5736_onboard_builder_balance_cabi
+    (isBuilderCredential pubkeyIsExistingValidator pubkeyIsRegisteredBuilder : UInt64)
+    (pubkeyIsPendingValidator signatureValid : UInt64)
+    (currentBuilderBalance depositAmount : UInt64) : UInt64 :=
+  (onboard_builders_pending_deposit_pr5736 {
+    isBuilderCredential := isBuilderCredential != 0
+    pubkeyIsExistingValidator := pubkeyIsExistingValidator != 0
+    pubkeyIsRegisteredBuilder := pubkeyIsRegisteredBuilder != 0
+    pubkeyIsPendingValidator := pubkeyIsPendingValidator != 0
+    signatureValid := signatureValid != 0
+    currentBuilderBalance := currentBuilderBalance.toNat
+    depositAmount := depositAmount.toNat
+  }).builderBalanceAfter.toUInt64
+
+@[inline, export glamsterdam_eip7732_pr5763_should_build_on_full_cabi]
+def eip7732_pr5763_should_build_on_full_cabi
+    (parentSlot proposalSlot ptcQuorumObservedAtSlot : UInt64) : Bool :=
+  should_build_on_full parentSlot.toNat proposalSlot.toNat (ptcQuorumObservedAtSlot != 0)
+
+@[inline, export glamsterdam_eip7732_validate_bid_aligned_cabi]
+def eip7732_validate_bid_aligned_cabi
+    (isActiveBuilder builderVersion canCoverBid signatureValid slotMatchesState : UInt64)
+    (parentBlockHashMatches parentBlockRootMatches prevRandaoMatches gasLimitCompatible : UInt64)
+    (feeRecipientMatchesProposer blockHash parentBlockHash : UInt64)
+    (blobCommitmentCount maxBlobsPerBlock : UInt64) : Bool :=
+  validate_bid_aligned {
+    isActiveBuilder := isActiveBuilder != 0
+    builderVersion := builderVersion.toNat
+    bidValue := 1000000
+    canCoverBid := canCoverBid != 0
+    signatureValid := signatureValid != 0
+    slotMatchesState := slotMatchesState != 0
+    parentBlockHashMatches := parentBlockHashMatches != 0
+    parentBlockRootMatches := parentBlockRootMatches != 0
+    prevRandaoMatches := prevRandaoMatches != 0
+    gasLimitCompatible := gasLimitCompatible != 0
+    feeRecipientMatchesProposer := feeRecipientMatchesProposer != 0
+    blockHash := blockHash.toNat
+    parentBlockHash := parentBlockHash.toNat
+    blobCommitmentCount := blobCommitmentCount.toNat
+    maxBlobsPerBlock := maxBlobsPerBlock.toNat
+  }
 
 @[inline, export glamsterdam_eip7732_can_cover_bid_cabi]
 def eip7732_can_cover_bid_cabi (builderBalance pendingToWithdraw bidAmount : UInt64) : Bool :=
