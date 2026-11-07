@@ -6,6 +6,9 @@ Lean 4.31 formal verification monorepo for the Ethereum Glamsterdam upgrade audi
 
 - Upstream ACD **delayed the Glamsterdam hardfork and did not fork Hoodi** ([EF post, 2026-11-06](https://blog.ethereum.org/2026/11/06/glamsterdam-8037-8038)). The pinned spec and the internal closure in this repo are unchanged; external lead sign-off is pending.
 - EF published eight gas invariants for auditors. The theorem-by-theorem mapping is in [`docs/ef-invariants-map.md`](docs/ef-invariants-map.md), including the residual gaps (notably the off-chain `eth_estimateGas` estimator and INV-8 replay).
+- **12 Spec Cards** — one auditable statement per invariant plus 8246/ePBS/8282/7702: [`docs/spec-cards.md`](docs/spec-cards.md).
+- **Reviewer path (20 min):** [`docs/README-spec-review.md`](docs/README-spec-review.md); simplification plan and trusted core: [`docs/simplification-plan.md`](docs/simplification-plan.md).
+- **Impact register** (confirmed mechanisms vs inferred hypotheses): [`docs/impact-register.md`](docs/impact-register.md); estimator hazard: [`docs/estimator-safety-spec.md`](docs/estimator-safety-spec.md).
 - War-room delta and the Monday 2026-11-09 action list: [`docs/war-room-update-2026-11-07.md`](docs/war-room-update-2026-11-07.md).
 
 ## Pinned Upstream Targets
