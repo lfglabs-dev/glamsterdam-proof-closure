@@ -6,6 +6,8 @@
 - **Pinned Consensus Specs:** `ethereum/consensus-specs` @ `aa16bb4c156184e9548a997d53efaf2a228a6304` (`v1.7.0-beta.4`, `specs/gloas/beacon-chain.md` & `specs/gloas/fork.md`)
 - **Verification Status:** 60/60 formal guarantees and 10/10 verified specification edge-case findings kernel-checked (`0 sorryAx`, `0 native_decide`, `0 trustCompiler`), 61/61 source mappings mechanically verified against 23 SHA256-locked vendored upstream files (`scripts/verify_ground_truth.py`), and 100% agreement on C-ABI + AST-extracted upstream Python differential tests (`pytest tests/ -v`).
 
+> **Status note (2026-11-07).** EF/ACD delayed the Glamsterdam hardfork and did **not** fork Hoodi ([EF post, 2026-11-06](https://blog.ethereum.org/2026/11/06/glamsterdam-8037-8038)). The report’s pinned spec (`16898000`) and internal closure are unchanged. EF’s eight-invariant auditor call is mapped theorem-by-theorem in [`docs/ef-invariants-map.md`](../../docs/ef-invariants-map.md); the current external findings total is tracked in [`ethereum/8037-findings`](https://github.com/ethereum/8037-findings), not in the 25 Oct. snapshot below.
+
 ---
 
 ## 0. First-Principles Formal Verification Scope (Consensus & Execution Core)

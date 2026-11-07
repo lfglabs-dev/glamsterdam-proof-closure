@@ -2,6 +2,12 @@
 
 Lean 4.31 formal verification monorepo for the Ethereum Glamsterdam upgrade audits, verified with [`turbo-lean`](https://github.com/Th0rgal/turbo-lean) (`0 sorryAx`, `0 native_decide`, `0 trustCompiler`).
 
+## Status (2026-11-07)
+
+- Upstream ACD **delayed the Glamsterdam hardfork and did not fork Hoodi** ([EF post, 2026-11-06](https://blog.ethereum.org/2026/11/06/glamsterdam-8037-8038)). The pinned spec and the internal closure in this repo are unchanged; external lead sign-off is pending.
+- EF published eight gas invariants for auditors. The theorem-by-theorem mapping is in [`docs/ef-invariants-map.md`](docs/ef-invariants-map.md), including the residual gaps (notably the off-chain `eth_estimateGas` estimator and INV-8 replay).
+- War-room delta and the Monday 2026-11-09 action list: [`docs/war-room-update-2026-11-07.md`](docs/war-room-update-2026-11-07.md).
+
 ## Pinned Upstream Targets
 
 | Upstream Repository | Pinned Commit / Tag | Scope |
