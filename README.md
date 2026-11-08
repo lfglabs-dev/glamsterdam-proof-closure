@@ -9,6 +9,7 @@ Lean 4.31 formal verification monorepo for the Ethereum Glamsterdam upgrade audi
 - **12 Spec Cards** — one auditable statement per invariant plus 8246/ePBS/8282/7702: [`docs/spec-cards.md`](docs/spec-cards.md).
 - **Reviewer path (20 min):** [`docs/README-spec-review.md`](docs/README-spec-review.md); simplification plan and trusted core: [`docs/simplification-plan.md`](docs/simplification-plan.md).
 - **Impact register** (confirmed mechanisms vs inferred hypotheses): [`docs/impact-register.md`](docs/impact-register.md); estimator hazard: [`docs/estimator-safety-spec.md`](docs/estimator-safety-spec.md).
+- **EF one-pager:** [`docs/ef-report.md`](docs/ef-report.md); **6-week remediation plan:** [`docs/remediation-plan.md`](docs/remediation-plan.md).
 - War-room delta and the Monday 2026-11-09 action list: [`docs/war-room-update-2026-11-07.md`](docs/war-room-update-2026-11-07.md).
 
 ## Pinned Upstream Targets
