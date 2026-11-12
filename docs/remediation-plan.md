@@ -1,8 +1,18 @@
 # Remediation and Improvement Plan — Glamsterdam gas audit
 
-**Status:** proposed, 2026-11-07
+**Status:** proposed, 2026-11-07; refreshed 2026-11-11
 **Scope:** the 60 formal guarantees, the 10 verified edge-case findings, and the EF 8-invariant surface (`INV-1…8`), plus the adjacent 8246 / ePBS / 8282 / 7702 audits.
 **Goal:** make the proof surface small enough to audit in a day, close the two real gaps, and turn the audit into address-level evidence EF can act on.
+**Immediate milestone:** input to ACDT #103 on 16 Nov 2026, 14:00 UTC; audit reports expected 16–19 Nov; ACDE 19 Nov.
+
+## 0.1 Delta since 7 Nov
+
+- **Uniswap v4 gives us an external address-level repro.** `PositionManager` `notifyUnsubscribe{gas: 150_000}` fails with 172,044 gas at `tx.gas ≤ 2^24` and succeeds with 255,543 gas at 16.9M; `eth_estimateGas` returns 169,842 (the failing path). Rerun this before ACDT.
+- **The issue is bigger than repricing.** It is a new invariant: a fixed-budget call’s outcome can depend on `tx.gas`. Add it as **C13 candidate**; do not renumber C1–C12.
+- **OP testnet is upgraded.** EF now has an OP-Stack comms contact; OP-Stack evidence is no longer blocked on “upgrade pending”.
+- **`8037-findings` needs triage before counting.** EF chat estimates ~80% AI false positives; raw counts are not blast radius. Use it as a worklist and keep only rows that pass the evidence gate.
+- **Audit timing is fixed.** ChainSecurity and Dedaub reports are expected 16–19 Nov; both should be summarized at ACDE on 19 Nov. Send the EF one-pager before ACDT, not in week 4.
+- **No EF decision yet.** Live options are ignore / EOF / lower state-gas coefficient / pull 8037 (3–5 months). The plan stays valid, but the EF package must present the decision rather than assume one.
 
 ## 0. What “done” means
 
@@ -52,10 +62,10 @@
 - Until proved, C12 stays `GAP`; do not present it as a guarantee.
 
 **Gap B — estimator safety above `2^24`.**
-- Build the minimal witness in `docs/estimator-safety-spec.md`.
-- Model `EstimatorSafety` with `cap`, `callGas`, `stateGas`, `delta`, `reservoir`; prove the unsoundness condition, not a client-specific claim.
-- Add a negative control at `tx.gas ≤ 2^24`.
-- If a client repro is impossible in the timebox, ship the Lean statement + exact missing observation and say so.
+- Build the minimal witness in `docs/estimator-safety-spec.md` (done in `Glamsterdam/Gas/Spec.lean:806-974`).
+- Model `Estimator` with `cap`, `callGas`, `stateGas`, `delta`, `reservoir`; prove the aggregate budget unsoundness condition (`estimator_unsound_above_2pow24`, `estimator_unsound_above_2pow24_witness`), not a client-specific claim.
+- Add a negative control at `tx.gas ≤ 2^24` (`allocation_zero_reservoir_below_2pow24`) and the C13 subcall mechanism theorem (`t_8037_c13_fixed_budget_subcall_tx_gas_dependent`).
+- Keep the live client/RPC binary-search loop and deployed Uniswap v4 fork bytecode trace explicitly marked `GAP` until reproduced against a live node.
 
 **Adjacent decision — 8246 vs 7708.**
 - Ask EF whether 8246 remains in scope or is superseded by 7708 per-wei logs.
@@ -72,24 +82,25 @@
 2. Resolve implementations through EIP-1967 slots; never test a proxy shell.
 3. Require untrusted-caller reachability and a real divergence: permanent state after failed subcall, or revert where Osaka succeeded.
 4. Priority order:
+   - Uniswap v4 `PositionManager` (`notifyUnsubscribe{gas: 150_000}`): rerun the public 172,044 vs 255,543 measurement before ACDT.
    - ERC-4337 `EntryPoint` v0.6/0.7/0.8 (`innerHandleOp`, `eth_estimateUserOperationGas`).
-   - OP-Stack `CrossDomainMessenger` / `OptimismPortal` (`SafeCall.callWithMinGas`, failed-message marking).
+   - OP-Stack `CrossDomainMessenger` / `OptimismPortal` (`SafeCall.callWithMinGas`, failed-message marking); use the new OP-Stack contact after the testnet upgrade.
    - 7702 delegate `initialize` / `setup`.
    - DEX/lending lock flags `0 → 1 → 0`.
    - Oracle callback budgets; bridge destination gas.
-5. Keep inferred rows in Appendix A only. Mark sensitive rows `EMBARGOED`; report by email, not public issue.
+5. Keep inferred rows in Appendix A only. Mark sensitive rows `EMBARGOED`; report by email, not public issue. An external report (e.g. Uniswap) stays marked “external, rerun pending” until we reproduce it.
 
-**Acceptance:** ≥20 confirmed rows, or a documented “none found” per class with search method and block range. Every row has a one-command repro.
+**Acceptance:** ≥20 confirmed rows, or a documented “none found” per class with search method and block range. Every row has a one-command repro; external-only rows are labelled, not promoted.
 
 ### WS5 — EF package and review
 
 **Plan.**
-1. Send `docs/ef-report.md` (one page) plus `docs/spec-cards.md` (appendix) to `glamsterdam@ethereum.org`.
-2. Ask four concrete decisions: (a) is C1–C4 the right review surface? (b) is 8246 still in scope? (c) does the client expose state gas to estimators? (d) which findings need a local repro before the next ACD?
-3. Run a red-team quorum on the top 10 rows before sending; record dissent in `docs/quorum-log.md`.
-4. Offer a 30-minute walkthrough; do not publish exploit details.
+1. Send `docs/ef-report.md` (one page) plus `docs/spec-cards.md` (appendix) to `glamsterdam@ethereum.org` before 15 Nov, ahead of ACDT on 16 Nov.
+2. Ask five concrete decisions: (a) is C1–C4 plus the Uniswap fixed-budget case the right review surface? (b) is 8246 still in scope? (c) does the client expose state gas to estimators? (d) which findings need a local repro first? (e) will EF adopt a deterministic fixed-budget-call rule or document it as an accepted break?
+3. Run a red-team quorum on the top 10 rows before sending; record dissent in `docs/quorum-log.md`. If model lanes are still down, label the review “manual, quorum pending” rather than skipping the record.
+4. Join ACDT #103 (16 Nov), use the open Q&A, and follow up with audit summaries at ACDE (19 Nov). Offer a 30-minute walkthrough; do not publish exploit details.
 
-**Acceptance:** EF receipt, four answers or explicit “deferred”, and a follow-up date.
+**Acceptance:** EF receipt before ACDT, five answers or explicit “deferred”, and a follow-up date after ACDE.
 
 ### WS6 — CI, release, and maintenance
 
@@ -101,7 +112,9 @@
 
 **Acceptance:** a red CI run blocks merge; a spec-pin bump has a documented revalidation checklist.
 
-## 2. Timeline (6 weeks, part-time)
+## 2. Timeline (6 weeks, part-time, starting after ACDE 19 Nov)
+
+**Immediate (11–19 Nov):** rerun `UNI-V4-01`; send the EF one-pager before ACDT; attend ACDT #103; ingest ChainSecurity/Dedaub reports as they land; attend ACDE and push for a decision. The six-week plan below starts after that decision point.
 
 | Week | WS1 core | WS2 cards | WS3 gaps | WS4 evidence | WS5 EF |
 |---|---|---|---|---|---|
@@ -119,6 +132,8 @@
 | Spec changes again (D1/D3/D4) | Cards and core drift | `ForkParams` is the only fork surface; CI matrix re-runs mutants on pin change |
 | 8246 is pulled in favour of 7708 | C9 wasted effort | Keep C9 isolated; ask EF before deepening |
 | No address-level exploit found | Weak evidence | Report mechanism-level rows + exact search method; do not overclaim |
+| New invariant invalidates the 8-card story | EF review surface is incomplete | Add C13 candidate for fixed-budget determinism; keep C1–C12 frozen and label the addition |
+| Public comms pressure (Uniswap/Banteg) | Rushed or overclaimed evidence | Verify each number; separate repricing from fixed-budget outcome; never use a raw 8037-findings count as blast radius |
 | Client cannot expose state gas | Estimator fix stalls | Ship the Lean condition + recommended RPC change; do not block the report |
 | Public disclosure risk | Harm to users | Embargo sensitive rows; email EF; no public issue |
 | Agent/tooling instability | Delays | Run the critical path manually; agents only for parallel evidence gathering |
@@ -135,7 +150,7 @@
 1. `Glamsterdam/SpecCore/{ForkParams,MeterCore,CallStack,Refine}.lean`
 2. `docs/spec-cards.md` + mutant suite
 3. `docs/estimator-safety-spec.md` with witness or `GAP`
-4. `docs/impact-register.md` with ≥20 confirmed rows or documented none
-5. `docs/ef-report.md` (one page) + `docs/spec-cards.md` appendix
+4. `docs/impact-register.md` with ≥20 confirmed rows or documented none; external-only rows (e.g. Uniswap) labelled separately
+5. `docs/ef-report.md` (one page) + `docs/spec-cards.md` appendix, sent before ACDT #103
 6. `docs/quorum-log.md` with red-team dissent
 7. Tag `v0.2.0-audit`, green CI

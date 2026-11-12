@@ -803,4 +803,172 @@ def sstore_state_cost_cabi (isCold origVal currVal newVal : UInt64) : UInt64 :=
 def sstore_state_refund_cabi (isCold origVal currVal newVal : UInt64) : UInt64 :=
   (price_sstore (isCold != 0) origVal.toNat currVal.toNat newVal.toNat).stateGasRefundCredited.toUInt64
 
+structure Estimator where
+  cap : Nat
+  intrinsicExec : Nat
+  callGas : Nat
+  stateGas : Nat
+  delta : Nat
+  reservoir : Nat
+  ok : Bool
+  deriving Repr, DecidableEq, BEq
+
+def budgetFits (cap intrinsicExec callGas stateGas : Nat) : Bool :=
+  let alloc := allocate_evm_gas cap ⟨intrinsicExec, 0⟩
+  decide (intrinsicExec ≤ cap) &&
+    decide (callGas ≤ alloc.executionGas) &&
+    decide (callGas + stateGas ≤ alloc.executionGas + alloc.stateGasReservoir)
+
+def observedBudget (e : Estimator) : Prop :=
+  let alloc := allocate_evm_gas e.cap ⟨e.intrinsicExec, 0⟩
+  e.intrinsicExec ≤ TX_MAX_GAS_LIMIT ∧
+  e.callGas ≤ TX_MAX_GAS_LIMIT - e.intrinsicExec ∧
+  e.reservoir = alloc.stateGasReservoir ∧
+  e.delta = e.callGas ∧
+  e.ok = budgetFits e.cap e.intrinsicExec e.callGas e.stateGas
+
+def acceptsAtDelta (e e' : Estimator) : Prop :=
+  e.ok = true ∧
+  e'.cap = e.intrinsicExec + e.delta ∧
+  e'.intrinsicExec = e.intrinsicExec ∧
+  e'.callGas = e.callGas ∧
+  e'.stateGas = e.stateGas ∧
+  e'.delta = e.delta ∧
+  e'.reservoir = (allocate_evm_gas e'.cap ⟨e'.intrinsicExec, 0⟩).stateGasReservoir ∧
+  e'.ok = budgetFits e'.cap e'.intrinsicExec e'.callGas e'.stateGas
+
+theorem estimator_unsound_above_2pow24
+    (e : Estimator)
+    (hcap : e.cap > TX_MAX_GAS_LIMIT)
+    (hobs : observedBudget e)
+    (hok : e.ok = true)
+    (hdelta : e.delta < e.callGas + e.stateGas) :
+    e.reservoir > 0 ∧
+    ∃ e' : Estimator,
+      acceptsAtDelta e e' ∧
+      e'.cap ≤ TX_MAX_GAS_LIMIT ∧
+      e'.reservoir = 0 ∧
+      e'.ok = false := by
+  rcases hobs with ⟨hintr, hcall, hres, hdel, heok⟩
+  refine ⟨?_, ?_⟩
+  · dsimp only [allocate_evm_gas, TX_MAX_GAS_LIMIT] at hres ⊢
+    unfold TX_MAX_GAS_LIMIT at hcap hintr
+    omega
+  · let cap' := e.intrinsicExec + e.delta
+    let alloc' := allocate_evm_gas cap' ⟨e.intrinsicExec, 0⟩
+    refine ⟨{
+      cap := cap'
+      intrinsicExec := e.intrinsicExec
+      callGas := e.callGas
+      stateGas := e.stateGas
+      delta := e.delta
+      reservoir := alloc'.stateGasReservoir
+      ok := budgetFits cap' e.intrinsicExec e.callGas e.stateGas
+    }, ?_, ?_, ?_, ?_⟩
+    · refine ⟨hok, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+    · dsimp only [cap']
+      omega
+    · dsimp only [alloc', cap', allocate_evm_gas, TX_MAX_GAS_LIMIT] at *
+      omega
+    · dsimp only [budgetFits, cap', allocate_evm_gas, TX_MAX_GAS_LIMIT] at *
+      simp only [Bool.and_eq_false_iff, decide_eq_false_iff_not]
+      right
+      omega
+
+def highBudgetProbeWitness : Estimator :=
+  let cap := 16900000
+  let intrinsicExec := 21000
+  let callGas := 100000
+  let stateGas := STATE_GAS_STORAGE_SET
+  let alloc := allocate_evm_gas cap ⟨intrinsicExec, 0⟩
+  { cap := cap
+    intrinsicExec := intrinsicExec
+    callGas := callGas
+    stateGas := stateGas
+    delta := callGas
+    reservoir := alloc.stateGasReservoir
+    ok := budgetFits cap intrinsicExec callGas stateGas }
+
+def reducedBudgetCandidateWitness : Estimator :=
+  let cap := highBudgetProbeWitness.intrinsicExec + highBudgetProbeWitness.delta
+  let alloc := allocate_evm_gas cap ⟨highBudgetProbeWitness.intrinsicExec, 0⟩
+  { cap := cap
+    intrinsicExec := highBudgetProbeWitness.intrinsicExec
+    callGas := highBudgetProbeWitness.callGas
+    stateGas := highBudgetProbeWitness.stateGas
+    delta := highBudgetProbeWitness.delta
+    reservoir := alloc.stateGasReservoir
+    ok := budgetFits cap highBudgetProbeWitness.intrinsicExec highBudgetProbeWitness.callGas highBudgetProbeWitness.stateGas }
+
+theorem estimator_unsound_above_2pow24_witness :
+    highBudgetProbeWitness.cap > TX_MAX_GAS_LIMIT ∧
+    observedBudget highBudgetProbeWitness ∧
+    highBudgetProbeWitness.ok = true ∧
+    highBudgetProbeWitness.reservoir = 122784 ∧
+    highBudgetProbeWitness.delta < highBudgetProbeWitness.callGas + highBudgetProbeWitness.stateGas ∧
+    acceptsAtDelta highBudgetProbeWitness reducedBudgetCandidateWitness ∧
+    reducedBudgetCandidateWitness.cap = 121000 ∧
+    reducedBudgetCandidateWitness.cap ≤ TX_MAX_GAS_LIMIT ∧
+    reducedBudgetCandidateWitness.reservoir = 0 ∧
+    reducedBudgetCandidateWitness.ok = false := by
+  refine ⟨by decide, ⟨by decide, by decide, rfl, rfl, rfl⟩, by decide, by decide, by decide,
+    ⟨by decide, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩, by decide, by decide, by decide, by decide⟩
+
+theorem allocation_zero_reservoir_below_2pow24 (txGas : Nat) (intrinsic : IntrinsicGasCost)
+    (h_lo : intrinsic.execution ≤ txGas)
+    (h_hi : txGas ≤ TX_MAX_GAS_LIMIT) :
+    let alloc := allocate_evm_gas txGas intrinsic
+    alloc.stateGasReservoir = 0 ∧
+    alloc.executionGas = txGas - intrinsic.execution := by
+  unfold allocate_evm_gas TX_MAX_GAS_LIMIT at *
+  simp only
+  omega
+
+structure FixedBudgetSubcallOutcome where
+  txSuccess : Bool
+  subcallSuccess : Bool
+  postGasLeft : Nat
+  postStateGasLeft : Nat
+  deriving Repr, DecidableEq, BEq
+
+def run_fixed_budget_caught_subcall
+    (txGas intrinsicExec preExecGas subcallCap subcallExecNeed subcallStateNeed : Nat) :
+    Option FixedBudgetSubcallOutcome :=
+  if txGas < intrinsicExec then
+    none
+  else
+    let alloc := allocate_evm_gas txGas ⟨intrinsicExec, 0⟩
+    let parent0 : GasMeter :=
+      { gasLeft := alloc.executionGas
+        stateGasLeft := alloc.stateGasReservoir
+        stateGasBaseline := alloc.stateGasReservoir }
+    match charge_gas_from_meter parent0 preExecGas with
+    | none => none
+    | some parent1 =>
+      if parent1.gasLeft < subcallCap then
+        none
+      else
+        let (_, parentAfterDrain) :=
+          drain_state_gas_reservoir { parent1 with gasLeft := parent1.gasLeft - subcallCap }
+        let child0 : GasMeter :=
+          { gasLeft := subcallCap
+            stateGasLeft := parent1.stateGasLeft
+            stateGasBaseline := parent1.stateGasLeft }
+        match charge_gas_from_meter child0 subcallExecNeed >>=
+            fun c1 => charge_state_gas_from_meter c1 subcallStateNeed with
+        | some childDone =>
+          let parentFinal := incorporate_child_meter parentAfterDrain childDone false
+          some ⟨true, true, parentFinal.gasLeft, parentFinal.stateGasLeft⟩
+        | none =>
+          let childHalted := forfeit_remaining_gas (restore_state_gas child0)
+          let parentFinal := incorporate_child_meter parentAfterDrain childHalted true
+          some ⟨true, false, parentFinal.gasLeft, parentFinal.stateGasLeft⟩
+
+theorem t_8037_c13_fixed_budget_subcall_tx_gas_dependent :
+    (run_fixed_budget_caught_subcall 500000 21000 50000 150000 60000 STATE_GAS_STORAGE_SET).map
+      (fun o => (o.txSuccess, o.subcallSuccess)) = some (true, false) ∧
+    (run_fixed_budget_caught_subcall 16900000 21000 50000 150000 60000 STATE_GAS_STORAGE_SET).map
+      (fun o => (o.txSuccess, o.subcallSuccess)) = some (true, true) := by
+  exact ⟨by decide, by decide⟩
+
 end Glamsterdam.Gas.Spec

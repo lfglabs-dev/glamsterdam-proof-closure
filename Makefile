@@ -15,7 +15,7 @@ prove:
 	@printf '%s\n' 'prove ok: Common EL core, Eip8246, Gas (8037/8038/2780/7778), Gloas7732 (+8282), and TestVectors compiled with 0 sorryAx, 0 axiom, 0 native_decide'
 
 turbo-verify: prove
-	@turbo-lean --json ci-verify --project-dir . --mode trusted --receipt .lake/turbo-receipt.json
+	@turbo-lean --json ci-verify --project-dir . --mode trusted --scope Glamsterdam --receipt .lake/turbo-receipt.json
 	@turbo-lean --json verify-receipt .lake/turbo-receipt.json --baseline-receipt .lake/turbo-receipt.json
 	@if turbo-lean --help 2>&1 | grep -q "audit-spec"; then \
 		turbo-lean --json audit-spec Glamsterdam/Common/Prelude.lean; \
@@ -24,6 +24,7 @@ turbo-verify: prove
 		turbo-lean --json audit-spec Glamsterdam/Eip8246/Spec.lean; \
 		turbo-lean --json audit-spec Glamsterdam/Gas/Spec.lean; \
 		turbo-lean --json audit-spec Glamsterdam/Gas/CallTree.lean; \
+		turbo-lean --json audit-spec Glamsterdam/Gas/Eip12582.lean; \
 		turbo-lean --json audit-spec Glamsterdam/Gloas7732/Spec.lean; \
 		turbo-lean --json audit-spec Glamsterdam/TestVectors.lean; \
 	fi
