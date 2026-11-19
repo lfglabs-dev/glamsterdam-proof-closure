@@ -1,0 +1,62 @@
+name: Official Gloas builder-payment vectors
+on:
+  pull_request:
+    paths:
+      - 'Glamsterdam/Common/**'
+      - 'Glamsterdam/Gloas7732/**'
+      - 'tests/reference_vectors/**'
+      - 'lean-toolchain'
+      - 'lakefile.lean'
+      - '.github/workflows/builder-payment-vectors.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'Glamsterdam/Common/**'
+      - 'Glamsterdam/Gloas7732/**'
+      - 'tests/reference_vectors/**'
+      - 'lean-toolchain'
+      - 'lakefile.lean'
+      - '.github/workflows/builder-payment-vectors.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: ethereum/consensus-specs
+          ref: aa16bb4c156184e9548a997d53efaf2a228a6304
+          path: .reference
+          persist-credentials: false
+      - name: Prepare pinned decoder and compiler
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y elan
+          elan toolchain install "$(cat lean-toolchain)"
+          python3 -m pip install uv
+          cd .reference
+          uv sync --frozen --extra test --python 3.12
+          uv run --no-sync python -m pysetup.generate_specs --all-forks
+      - name: Fetch official v1.7.0-beta.4 archives
+        run: |
+          mkdir "$RUNNER_TEMP/payment-vectors"
+          for preset in minimal mainnet; do
+            curl --fail --location --retry 3 --silent --show-error \
+              "https://github.com/ethereum/consensus-specs/releases/download/v1.7.0-beta.4/$preset.tar.gz" \
+              --output "$RUNNER_TEMP/payment-vectors/$preset.tar.gz"
+          done
+      - name: Verify archive digests and replay every case in the handler
+        run: .reference/.venv/bin/python tests/reference_vectors/check_payments.py "$RUNNER_TEMP/payment-vectors" payment-results.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: official-builder-payment-results
+          path: payment-results.json
+          if-no-files-found: error
