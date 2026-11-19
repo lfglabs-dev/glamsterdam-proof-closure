@@ -38,7 +38,7 @@ jobs:
       - name: Prepare pinned decoder and compiler
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y elan
+          sudo apt-get install -y elan libssl-dev
           elan toolchain install "$(cat lean-toolchain)"
           python3 -m pip install uv
           cd .reference
