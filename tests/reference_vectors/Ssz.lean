@@ -311,4 +311,16 @@ def check (schema : String) (input : ByteArray) : String := Id.run do
   | .ok root => return root
   | .error err => return "error: " ++ err
 
+/-- Gloas builder deposits sign DepositMessage using DOMAIN_BUILDER_DEPOSIT
+and the preset genesis fork version, with a zero genesis validators root.
+The ABI accepts the 88-byte fixed-width message and four version bytes. -/
+@[export gloas_builder_signing_root]
+def builderSigningRoot (message forkVersion : ByteArray) : ByteArray := Id.run do
+  if message.size != 88 || forkVersion.size != 4 then return ByteArray.empty
+  let messageType := Ty.record #[.bytes (.fixed 48), .bytes (.fixed 32), .uint 8] none
+  let .ok parsed := codec messageType message | return ByteArray.empty
+  let forkDataRoot := shaPair (forkVersion ++ little 0 28) zero
+  let domain := little 14 4 ++ forkDataRoot.extract 0 28
+  return shaPair parsed.root domain
+
 end GloasSsz

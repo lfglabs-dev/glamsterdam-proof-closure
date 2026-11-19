@@ -29,6 +29,10 @@ HANDLERS = {
 
 def compile_bridge(directory):
     subprocess.run(["lake", "build", "Glamsterdam.Gloas7732.BuilderRequests"], cwd=ROOT, check=True)
+    blst = Path(os.environ.get("GLOAS_BLST_DIR", ROOT / ".blst")).resolve()
+    revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=blst, text=True).strip()
+    if revision != "e7f90de551e8df682f3cc99067d204d8b90d27ad":
+        raise ValueError(f"unexpected blst revision {revision}")
     generated = directory / "PaymentVectors.c"
     subprocess.run(["lake", "env", "lean", "-c", generated, "tests/reference_vectors/PaymentVectors.lean"],
                    cwd=ROOT, check=True)
@@ -40,8 +44,8 @@ def compile_bridge(directory):
     ir = ROOT / ".lake/build/ir/Glamsterdam"
     so = directory / "payments.so"
     subprocess.run(["cc", "-O2", "-fPIC", "-shared", f"-I{prefix / 'include'}",
-                    HERE / "bridge.c", HERE / "ssz_bridge.c", ssz_c, generated, ir / "Common/Prelude.c", ir / "Common/MetaSpec.c",
-                    ir / "Gloas7732/Spec.c", ir / "Gloas7732/BuilderRequests.c", f"-L{runtime}", "-lleanshared",
+                    HERE / "bridge.c", HERE / "ssz_bridge.c", HERE / "bls_bridge.c", f"-I{blst / 'bindings'}", ssz_c, generated, ir / "Common/Prelude.c", ir / "Common/MetaSpec.c",
+                    ir / "Gloas7732/Spec.c", ir / "Gloas7732/BuilderRequests.c", f"-L{runtime}", blst / "libblst.a", "-lleanshared",
                     f"-Wl,-rpath,{runtime}", "-o", so], check=True)
     lib = ctypes.CDLL(str(so))
     lib.initialize_vectors.argtypes = []
@@ -52,6 +56,8 @@ def compile_bridge(directory):
     lib.initialize_ssz_vectors.restype = ctypes.c_int
     if lib.initialize_ssz_vectors():
         raise RuntimeError("Lean SSZ initialization failed")
+    lib.verify_builder_signature.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_size_t]
+    lib.verify_builder_signature.restype = ctypes.c_int
     lib.ssz_vector_root.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t]
     lib.ssz_vector_root.restype = ctypes.c_void_p
     lib.replay_vectors.argtypes = [ctypes.c_char_p]
@@ -145,13 +151,28 @@ def check_case(lib, spec, name, case):
                         finalized=int(pre.finalized_checkpoint.epoch))
         else:
             request = decoded(handler, spec.BuilderDepositRequest)
-            data.update(prefix=request.withdrawal_credentials[0], amount=int(request.amount))
+            data.update(prefix=request.withdrawal_credentials[0], amount=int(request.amount),
+                        credentials=int.from_bytes(bytes(request.withdrawal_credentials), "big"),
+                        verifiedSignature=None)
         data["pubkey"] = int.from_bytes(bytes(request.pubkey), "big")
+    control = None
     actual = replay(lib, data)
+    if actual.get("verifyBuilderSignature"):
+        raw = snappy.decompress(case[handler + ".ssz_snappy"])
+        version = bytes(spec.config.GENESIS_FORK_VERSION)
+        valid = lib.verify_builder_signature(raw, len(raw), version, len(version))
+        if valid not in (0, 1):
+            raise ValueError("invalid builder signature adapter input")
+        if name.endswith("/process_builder_deposit_request__new_builder"):
+            alternate = bytes([version[0] ^ 1]) + version[1:]
+            if valid != 1 or lib.verify_builder_signature(raw, len(raw), alternate, len(alternate)) != 0:
+                raise AssertionError("builder signing domain control failed")
+            control = "signature rejected with altered genesis fork version"
+        data["verifiedSignature"] = bool(valid)
+        actual = replay(lib, data)
     if "unsupported" in actual:
         return {"status": "unsupported", "dependency": actual["unsupported"]}
     expected = decoded("post", spec.BeaconState)
-    control = None
     if name.endswith("/process_builder_pending_payments_queue_rotation"):
         half = int(spec.SLOTS_PER_EPOCH)
         wrong = {**actual, "payments": actual["payments"][half:] + actual["payments"][:half]}
@@ -185,6 +206,20 @@ DEPENDENCIES = {
     "rewards": "full validator participation, reward and penalty accounting",
     "operations": "complete pinned operation and its validation rules",
     "epoch_processing": "complete pinned epoch sub-transition",
+}
+
+
+HANDLER_DEPENDENCIES = {
+    ("operations", "attestation"): "committee shuffling, indexed aggregate signature checks, participation flags and proposer rewards",
+    ("operations", "parent_execution_payload"): "payload binding, parent execution requests, and composed availability/payment updates",
+    ("operations", "withdrawals"): "validator and builder sweeps, queue limits and withdrawal-index transitions",
+    ("operations", "payload_attestation"): "payload-timeliness committee derivation and aggregate signature verification",
+    ("operations", "proposer_slashing"): "signed conflicting headers and the complete validator slashing transition",
+    ("operations", "attester_slashing"): "indexed attestation signatures, slashability and validator balance updates",
+    ("operations", "sync_aggregate"): "sync committee aggregate signature, participation rewards and penalties",
+    ("operations", "execution_payload_bid"): "bid validity, builder signatures, consensus binding and pending-payment insertion",
+    ("epoch_processing", "pending_deposits"): "pending deposit queue, churn budget and validator activation accounting",
+    ("epoch_processing", "registry_updates"): "validator eligibility, ejection and churn-limited activation",
 }
 
 
@@ -247,7 +282,7 @@ def main():
                 elif f"{runner}/{handler}" in HANDLERS:
                     selected.append(name)
                 else:
-                    results[name] = {"status": "unsupported", "dependency": DEPENDENCIES[runner]}
+                    results[name] = {"status": "unsupported", "dependency": HANDLER_DEPENDENCIES.get((runner, handler), DEPENDENCIES[runner])}
             check_archive(lib, spec, args.archives / f"{preset}.tar.gz", static, results)
             for name, case in read_cases(args.archives / f"{preset}.tar.gz", selected).items():
                 try:
@@ -262,6 +297,10 @@ def main():
                 raise ValueError(f"no matching pinned generator candidate for {name}")
             results[name]["generator_candidates"] = sorted(sources[name])
     report["counts"] = dict(Counter(r["status"] for r in results.values()))
+    by_handler = defaultdict(Counter)
+    for name, row in results.items():
+        by_handler["/".join(name.split("/")[:4])][row["status"]] += 1
+    report["by_preset_runner_handler"] = dict(by_handler)
     print(report["counts"])
     args.report.write_text(json.dumps(report, sort_keys=True, indent=2) + "\n")
     baselines = {status: fingerprint(k for k, r in results.items() if r["status"] == status)

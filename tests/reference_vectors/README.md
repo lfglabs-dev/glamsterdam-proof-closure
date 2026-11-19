@@ -29,8 +29,8 @@ Payment processing replaces both payment queues. Exit and top-up processing
 replace the builder registry. The SSZ adapter encodes these replacements on the
 pre-state and compares the complete resulting BeaconState bytes against the
 official post-state. It does not copy any fields from the expected state.
-New builder registrations requiring BLS verification are explicitly unsupported.
-Negative controls swap the payment halves or drop a registry update.
+New registrations use the Lean signing root and registry transition. The pinned blst library checks compressed points, subgroup membership, infinity and the BLS signature. Set GLOAS_BLST_DIR to a built checkout of blst v0.3.16 at e7f90de551e8df682f3cc99067d204d8b90d27ad, or build it in .blst as in CI.
+Negative controls swap the payment halves, drop a registry update, or verify a valid builder signature with a different genesis fork version.
 
 The baseline pins the exact case-ID set for each disposition; any coverage change
 requires review. CI also fails on digest or generator mismatches, missing cases,
