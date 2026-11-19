@@ -823,21 +823,26 @@ def run_sstore_set_clear_loop (m : D13AMeter) : Nat → Option D13AMeter
           let m4 := refill_state_d13a m3 STATE_GAS_STORAGE_SET
           run_sstore_set_clear_loop m4 n
 
-/-- **Property 4a (`t_12582_prop4_revert_vs_refill_drawn_asymmetry`)**:
-1. **Refills never restore allowance**: A `50,000`-gas child frame (`allowance = 382,500`) that
-   repeatedly sets and clears the same warm storage slot (`0 -> 1 -> 0`) draws `87,920` from the
-   reservoir on each of the first `4` iterations (`4 × 87,920 = 351,680 ≤ 382,500`, spending only
-   `20,200` execution gas per cycle? No: wait — with `200,000` gas, `allowance = 1,530,000`; with
-   `50,000` gas and `300,000` pre-drawn, remaining allowance is `82,500`). Specifically, when a
-   `200,000`-gas child frame has already drawn `1,450,000` of its `1,530,000` allowance (`80,000`
-   allowance remaining), `1` cycle of `SSTORE 0 -> 1 -> 0` draws `80,000` from the reservoir and
-   spills `7,920` + `10,000` legacy share from `gasLeft` (exhausting the `1,530,000` ceiling) and
-   refills `97,920` into the reservoir, leaving `remaining_allowance = some 0`; a `2`nd cycle of
-   `SSTORE 0 -> 1 -> 0` draws **`0`** from the reservoir and pays the full `97,920` state gas from
-   `gasLeft`!
-2. **Reverts DO restore allowance**: By contrast, if a child frame draws `87,920` from the
-   reservoir and then `REVERT`s, `exit_child_d13a` restores `stateGasDrawn` to `drawnSnapshot`, so
-   the parent retains 100% of its allowance! -/
+/-- INV-4 under the normative allowance proposal. A child receives 50,000 gas
+from a parent with an empty reservoir. Frame entry succeeds, but the first
+warm write of a fresh slot fails. Funding the reservoir makes the identical
+write succeed. The allowance is a ceiling on available funds. -/
+theorem t_12582_fixed_budget_empty_reservoir :
+    let childWithReservoir := fun reservoir =>
+      enter_child_d13a .d13a_normative .call (init_top_meter 100000 reservoir) 50000 50000
+    let freshWarmWrite : Nat → Option D13AMeter := fun reservoir => do
+      let (child, _) ← childWithReservoir reservoir
+      let afterExec ← charge_exec_d13a child (GAS_WARM_ACCESS + GAS_STORAGE_WRITE)
+      charge_state_d13a afterExec STATE_GAS_STORAGE_SET LEGACY_SHARE_STORAGE_SET
+    (childWithReservoir 0).isSome = true ∧
+    freshWarmWrite 0 = none ∧
+    (freshWarmWrite STATE_GAS_STORAGE_SET).isSome = true := by
+  decide
+
+/-- Two concrete #12582 traces distinguish a storage refill from a revert.
+After one set/clear cycle the prepared child has exhausted its allowance.
+The next cycle spends execution gas despite a replenished reservoir. On the
+separate revert trace the parent recovers its entry value of stateGasDrawn. -/
 theorem t_12582_prop4_revert_vs_refill_drawn_asymmetry :
     let top := init_top_meter 1000000 10000000
     let child200k : D13AMeter :=
