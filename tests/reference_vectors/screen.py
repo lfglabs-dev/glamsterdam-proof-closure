@@ -44,6 +44,35 @@ def screen_blocks(spec, runner, files):
             "operations_in_final_rejected_block": dict(final_candidates),
             "dependency": "Whole-chain slot, epoch and block execution. No intermediate state was supplied to Lean."}
 
+def check_onboarding(lib, spec, pre, expected, replay):
+    validators = {bytes(v.pubkey) for v in pre.validators}
+    balances = {}
+    pending = []
+    existing_builder_topups = 0
+    for deposit in pre.pending_deposits:
+        key = bytes(deposit.pubkey)
+        registered = key in balances
+        if key in validators or (not registered and spec.is_pending_validator(pending, deposit.pubkey)):
+            pending.append(deposit)
+            continue
+        prefix = bytes(deposit.withdrawal_credentials)[0]
+        valid = (not registered and prefix == spec.BUILDER_WITHDRAWAL_PREFIX[0]
+                 and spec.is_valid_deposit_signature(deposit.pubkey, deposit.withdrawal_credentials,
+                                                      deposit.amount, deposit.signature))
+        consume, amount = replay(lib, dict(handler="onboard", registered=registered, prefix=prefix,
+                                           valid=bool(valid), balance=balances.get(key, 0), amount=int(deposit.amount)))
+        if not consume:
+            pending.append(deposit)
+        elif registered or valid:
+            balances[key] = amount
+            existing_builder_topups += int(registered)
+    if list(balances.items()) != [(bytes(b.pubkey), int(b.balance)) for b in expected.builders]:
+        raise ValueError("fork onboarding: first mismatch in builder keys or balances")
+    if [p.encode_bytes() for p in pending] != [p.encode_bytes() for p in expected.pending_deposits]:
+        raise ValueError("fork onboarding: first mismatch in remaining deposits")
+    return existing_builder_topups
+
+
 def screen_state(lib, spec, name, files, replay, queues):
     handler = name.split("/")[3]
     def decode(key, typ):
@@ -57,9 +86,12 @@ def screen_state(lib, spec, name, files, replay, queues):
         bit = replay(lib, {"handler": handler, "size": int(spec.SLOTS_PER_HISTORICAL_ROOT), "slot": int(pre.slot)})
         if bit is not bool(expected.execution_payload_availability[pre.slot % spec.SLOTS_PER_HISTORICAL_ROOT]):
             raise ValueError("fork slot availability bit")
-        return {"status": "partial_pass", "evidence": "lean_fields", "lean_fields": ["fork slot availability bit"],
+        topups = check_onboarding(lib, spec, pre, expected, replay)
+        return {"status": "partial_pass", "evidence": "lean_fields",
+                "lean_fields": ["fork slot availability bit", "builder balances after deposit routing"],
+                "existing_builder_topups": topups,
                 "pending_deposits_at_fork": len(pre.pending_deposits),
-                "dependency": "Full fork upgrade and registry onboarding"}
+                "dependency": "Python supplies validator membership, pending-validator lookup and signatures; other upgrade fields are outside the projection"}
     pre = decode("pre", spec.BeaconState)
     if handler == "withdrawals":
         full = pre.latest_block_hash == pre.latest_execution_payload_bid.block_hash

@@ -18,6 +18,7 @@ import snappy
 from inventory import inventory
 from screen import screen_cases, screen_blocks, screen_state
 from boundary_checks import additional_checks
+from claim_sources import source_manifest
 from static_ssz import check_archive, check_codec_controls
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -434,6 +435,34 @@ def fingerprint(ids):
     return hashlib.sha256(("\n".join(sorted(ids)) + "\n").encode()).hexdigest()
 
 
+def check_claim_paths(results, supplemental):
+    """Keep strong evidence from turning into a no-op with unchanged pass counts."""
+    att = [row for key, row in results.items() if "/operations/attestation/" in key]
+    bid = [row for key, row in results.items() if "/operations/execution_payload_bid/" in key]
+    parent = [row for key, row in results.items() if "/operations/parent_execution_payload/" in key]
+    evidence = {
+        "fork_cases_with_existing_builder_topups": sum(r.get("existing_builder_topups", 0) > 0 for r in results.values()),
+        "withdrawal_cases_with_builder_debits": sum(r.get("builder_debits", 0) > 0 for r in results.values()),
+        "slashing_cases_clearing_payment_entries": sum(r.get("changed_entries", 0) > 0 for r in results.values()),
+        "ordinary_attestations": len(att),
+        "positive_weight_changes": sum(row.get("credited_weight", 0) > 0 for row in att),
+        "coverage_guard_accepted": sum(row.get("lean_coverage_guard") is True for row in bid),
+        "coverage_guard_rejected": sum(row.get("lean_coverage_guard") is False for row in bid),
+        "positive_bid_entries": sum(row.get("positive_payment_recorded", False) for row in bid),
+        "parent_paths": dict(Counter(row.get("path") for row in parent)),
+        "supplemental_sequences_and_controls": sum(map(len, supplemental.values())),
+    }
+    expected = {"fork_cases_with_existing_builder_topups": 6, "withdrawal_cases_with_builder_debits": 42,
+                "slashing_cases_clearing_payment_entries": 6, "ordinary_attestations": 127, "positive_weight_changes": 6,
+                "coverage_guard_accepted": 8, "coverage_guard_rejected": 6, "positive_bid_entries": 6,
+                "parent_paths": {"current_epoch": 26, "previous_epoch": 2, "older_parent": 6, "empty_parent": 4,
+                                 "reject_empty_requests": 2, "reject_limit": 8},
+                "supplemental_sequences_and_controls": 8}
+    if evidence != expected:
+        raise ValueError(f"claim path evidence changed: {evidence}")
+    return evidence
+
+
 def collect_sources(directory):
     module = importlib.import_module("eth_consensus_specs.gloas.minimal")
     cwd = Path(subprocess.check_output(["git", "rev-parse", "--show-toplevel"],
@@ -465,6 +494,7 @@ def main():
     report = {"spec": SPEC, "proof_commit": subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(), "archives": archives,
         "case_id_sha256": fingerprint(cases), "cases": {}}
+    report["claim_source_review"] = source_manifest(importlib.import_module("eth_consensus_specs.gloas.minimal"))
     results = report["cases"]
     with tempfile.TemporaryDirectory() as tmp:
         sources, report["gloas_python_only"] = collect_sources(Path(tmp))
@@ -525,6 +555,7 @@ def main():
     for name, row in results.items():
         by_handler["/".join(name.split("/")[:4])][row["status"]] += 1
     report["by_preset_runner_handler"] = dict(by_handler)
+    report["claim_paths"] = check_claim_paths(results, report["supplemental_checks"])
     print(report["counts"])
     args.report.write_text(json.dumps(report, sort_keys=True, indent=2) + "\n")
     baselines = {status: fingerprint(k for k, r in results.items() if r["status"] == status)

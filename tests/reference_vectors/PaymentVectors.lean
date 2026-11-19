@@ -62,6 +62,13 @@ private def applyAttestation (json : Json) (i : Input) : Except String Json := d
 
 private def applyCase (json : Json) : Except String Json := do
   let handler ← json.getObjValAs? String "handler"
+  if handler == "onboard" then
+    let registered ← json.getObjValAs? Bool "registered"
+    let credentialPrefix ← json.getObjValAs? Nat "prefix"
+    let valid ← json.getObjValAs? Bool "valid"
+    let balance ← json.getObjValAs? Nat "balance"
+    let amount ← json.getObjValAs? Nat "amount"
+    return toJson (onboard_pending_deposit_fork_v170_beta4 ⟨registered, credentialPrefix, valid, balance, amount⟩)
   if handler == "fork" then
     let size ← json.getObjValAs? Nat "size"
     let ring : AvailabilityRing := { size }
