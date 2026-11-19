@@ -25,7 +25,6 @@ jobs:
           python3 -m pip install PyYAML pytest
           elan toolchain install "$(cat lean-toolchain)"
           elan toolchain install leanprover/lean4:v4.35.0
-          lake build
 
       - name: Cache the pinned verifier binary
         id: verifier
@@ -59,9 +58,9 @@ jobs:
         uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
         with:
           path: ${{ runner.temp }}/glamsterdam.tlpack
-          key: proofs-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.TURBO_REV }}-${{ hashFiles('lean-toolchain', 'lakefile.lean', 'lake-manifest.json') }}-${{ github.sha }}
+          key: proofs-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.TURBO_REV }}-${{ hashFiles('lean-toolchain', 'lakefile.lean', 'lake-manifest.json') }}-${{ github.sha }}
           restore-keys: |
-            proofs-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.TURBO_REV }}-${{ hashFiles('lean-toolchain', 'lakefile.lean', 'lake-manifest.json') }}-
+            proofs-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.TURBO_REV }}-${{ hashFiles('lean-toolchain', 'lakefile.lean', 'lake-manifest.json') }}-
 
       - name: Import cached verification artifacts
         if: steps.proofs.outputs.cache-matched-key != ''
@@ -81,7 +80,7 @@ jobs:
           if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
             turbo-lean --json pr-verify --mode untrusted --base "$BASE_SHA" "${args[@]}"
           else
-            turbo-lean --json ci-verify --mode trusted "${args[@]}"
+            turbo-lean --json ci-verify --mode trusted --seed-shards "${args[@]}"
           fi
 
       - name: Run turbo-lean spec audit on all audit domains
@@ -96,7 +95,9 @@ jobs:
 
       - name: Export the verified main cache
         if: github.event_name == 'push' && steps.proofs.outputs.cache-hit != 'true'
-        run: turbo-lean --json export -o "$RUNNER_TEMP/glamsterdam.tlpack"
+        run: |
+          turbo-lean --json export -o "$RUNNER_TEMP/glamsterdam.tlpack" | tee "$RUNNER_TEMP/export.json"
+          jq -e '.exported_actions > 0 and .exported_blobs > 0 and .raw_bytes > 0' "$RUNNER_TEMP/export.json"
 
       - name: Share the verified main cache with subsequent PRs
         if: github.event_name == 'push' && steps.proofs.outputs.cache-hit != 'true'
