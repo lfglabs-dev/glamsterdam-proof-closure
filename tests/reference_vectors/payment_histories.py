@@ -102,9 +102,12 @@ def replay_history(lib, spec, files, adapter, identity_controls=False):
                                    amount=int(w.amount), recipient=bytes(w.address).hex()))
             else:
                 spec.decrease_balance(st, w.validator_index, w.amount)
-        balances = adapter.replay(lib, dict(handler="withdrawals", balances=[int(b.balance) for b in st.builders], debits=debits))
-        for index, _ in debits:
+        before = [int(b.balance) for b in st.builders]
+        balances = adapter.replay(lib, dict(handler="withdrawals", balances=before, debits=debits))
+        for index in sorted({index for index, _ in debits}):
             st.builders[index].balance = balances[index]
+            events.append(dict(operation="builder_balance_change", slot=int(st.slot), builder=index,
+                               before=before[index], after=balances[index]))
         if st.encode_bytes() != expected.encode_bytes():
             raise ValueError("payment history diverged at withdrawal application")
 
@@ -166,6 +169,9 @@ def equal_amount_history(lib, spec, official_pre, adapter):
     events = result["events"]
     ids = [(e["builder"], e["recipient"], e["amount"]) for e in events if e["operation"] == "debit"]
     expected = [(i, (bytes([0xA1 + i]) * 20).hex(), amount) for i in (0, 1)]
+    changes = [(e["builder"], e["before"] - e["after"]) for e in events if e["operation"] == "builder_balance_change"]
+    if changes != [(0, amount), (1, amount)]:
+        raise ValueError(f"wrong per-builder debit: {changes}")
     if ids != expected or result["identity_controls"] != ["feeRecipient", "builderIndex"]:
         raise ValueError(f"unexpected equal-amount payment history: {ids}")
     if not any(e["operation"] == "epoch_quorum" and e["settled"] for e in events):
