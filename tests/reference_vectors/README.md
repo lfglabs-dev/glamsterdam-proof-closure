@@ -46,7 +46,7 @@ and reads the expected root. It performs no SSZ decoding or tree hashing for
 these cases. Lean checks field widths, bitlist terminators, collection limits
 and variable offsets, rebuilds the serialization and compares it byte-for-byte.
 Lean builds the bounded or progressive Merkle tree and mixes in lengths or
-active-field masks. OpenSSL supplies SHA-256 for pairs of chunks.
+active-field masks. Lean computes SHA-256 for each pair of chunks.
 
 The official format allows the binary round trip plus the expected tree root
 for a binary-only codec. The runner does not claim to implement the optional

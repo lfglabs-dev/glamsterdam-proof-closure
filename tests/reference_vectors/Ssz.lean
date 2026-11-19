@@ -4,10 +4,78 @@ namespace GloasSsz
 
 open Lean
 
-/-- Native SHA-256 compresses precisely two 32-byte roots. Tree construction,
-padding, collection limits, offsets, and length/field mix-ins are all in Lean. -/
-@[extern "gloas_ssz_sha_pair"]
-opaque shaPair (left right : @& ByteArray) : ByteArray
+/-! FIPS 180-4 SHA-256 specialized to pairs of 32-byte SSZ roots. -/
+@[inline] private def rotr32 (x : UInt32) (n : UInt32) : UInt32 :=
+  (x >>> n) ||| (x <<< (32 - n))
+
+private def sha256K : Array UInt32 := #[
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+]
+
+private def schedule (block : ByteArray) : Array UInt32 := Id.run do
+  let mut w := Array.replicate 64 (0 : UInt32)
+  for i in [0:16] do
+    let b0 := block[4 * i]!.toUInt32
+    let b1 := block[4 * i + 1]!.toUInt32
+    let b2 := block[4 * i + 2]!.toUInt32
+    let b3 := block[4 * i + 3]!.toUInt32
+    w := w.set! i ((b0 <<< 24) ||| (b1 <<< 16) ||| (b2 <<< 8) ||| b3)
+  for i in [16:64] do
+    let w15 := w[i - 15]!
+    let w2  := w[i - 2]!
+    let s0 := rotr32 w15 7 ^^^ rotr32 w15 18 ^^^ (w15 >>> 3)
+    let s1 := rotr32 w2 17 ^^^ rotr32 w2 19 ^^^ (w2 >>> 10)
+    w := w.set! i (w[i - 16]! + s0 + w[i - 7]! + s1)
+  return w
+
+private def compress (h w : Array UInt32) : Array UInt32 := Id.run do
+  let mut a := h[0]!
+  let mut b := h[1]!
+  let mut c := h[2]!
+  let mut d := h[3]!
+  let mut e := h[4]!
+  let mut f := h[5]!
+  let mut g := h[6]!
+  let mut hh := h[7]!
+  for i in [0:64] do
+    let s1 := rotr32 e 6 ^^^ rotr32 e 11 ^^^ rotr32 e 25
+    let ch := (e &&& f) ^^^ ((~~~e) &&& g)
+    let temp1 := hh + s1 + ch + sha256K[i]! + w[i]!
+    let s0 := rotr32 a 2 ^^^ rotr32 a 13 ^^^ rotr32 a 22
+    let maj := (a &&& b) ^^^ (a &&& c) ^^^ (b &&& c)
+    let temp2 := s0 + maj
+    hh := g
+    g := f
+    f := e
+    e := d + temp1
+    d := c
+    c := b
+    b := a
+    a := temp1 + temp2
+  #[h[0]! + a, h[1]! + b, h[2]! + c, h[3]! + d,
+    h[4]! + e, h[5]! + f, h[6]! + g, h[7]! + hh]
+
+private def iv : Array UInt32 := #[
+  0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+  0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]
+
+-- Every SSZ node has exactly 512 message bits. The second SHA block is constant.
+private def paddingSchedule := schedule <|
+  ⟨(Array.replicate 64 (0 : UInt8)).set! 0 0x80 |>.set! 62 2⟩
+
+private def shaPair (left right : ByteArray) : ByteArray := Id.run do
+  let digest := compress (compress iv (schedule (left ++ right))) paddingSchedule
+  let mut out := ByteArray.emptyWithCapacity 32
+  for word in digest do
+    for shift in [24,16,8,0] do out := out.push ((word >>> shift).toUInt8)
+  return out
 
 inductive Size where
   | fixed (length : Nat)
@@ -71,18 +139,23 @@ private def chunks (b : ByteArray) : Array ByteArray := Id.run do
     out := out.push (if part.size == 32 then part else part ++ little 0 (32-part.size))
   return out
 
+private def zeroRoots : Array ByteArray := Id.run do
+  let mut roots := #[zero]
+  for _ in [:64] do roots := roots.push (shaPair roots.back! roots.back!)
+  return roots
+
 private def merkleize (leaves : Array ByteArray) (limit : Nat) : ByteArray := Id.run do
   let mut layer := leaves
-  let mut padding := zero
+  let mut height := 0
   let mut capacity := 1
   while capacity < limit do
     let mut next := Array.emptyWithCapacity (ceilDiv layer.size 2)
     for i in [:ceilDiv layer.size 2] do
-      next := next.push (shaPair layer[2*i]! (layer[2*i+1]?.getD padding))
-    padding := shaPair padding padding
+      next := next.push (shaPair layer[2*i]! (layer[2*i+1]?.getD zeroRoots[height]!))
+    height := height+1
     layer := next
     capacity := capacity*2
-  return layer[0]?.getD padding
+  return layer[0]?.getD zeroRoots[height]!
 
 private partial def progressiveRoot (leaves : Array ByteArray) (start width : Nat) : ByteArray :=
   if start ≥ leaves.size then zero else

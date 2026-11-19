@@ -41,7 +41,7 @@ def compile_bridge(directory):
     so = directory / "payments.so"
     subprocess.run(["cc", "-O2", "-fPIC", "-shared", f"-I{prefix / 'include'}",
                     HERE / "bridge.c", HERE / "ssz_bridge.c", ssz_c, generated, ir / "Common/Prelude.c", ir / "Common/MetaSpec.c",
-                    ir / "Gloas7732/Spec.c", ir / "Gloas7732/BuilderRequests.c", f"-L{runtime}", "-lleanshared", "-lcrypto",
+                    ir / "Gloas7732/Spec.c", ir / "Gloas7732/BuilderRequests.c", f"-L{runtime}", "-lleanshared",
                     f"-Wl,-rpath,{runtime}", "-o", so], check=True)
     lib = ctypes.CDLL(str(so))
     lib.initialize_vectors.argtypes = []
