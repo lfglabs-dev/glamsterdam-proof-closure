@@ -1,4 +1,4 @@
-name: Official Gloas builder-payment vectors
+name: Official Gloas reference-suite coverage
 on:
   pull_request:
     paths:
@@ -44,19 +44,30 @@ jobs:
           cd .reference
           uv sync --frozen --extra test --python 3.12
           uv run --no-sync python -m pysetup.generate_specs --all-forks
+      - name: Cache compiled Lean modules and generated C
+        uses: actions/cache@v4
+        with:
+          path: .lake/build
+          key: gloas-vector-lean-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('lean-toolchain', 'lakefile.lean', 'Glamsterdam/**/*.lean') }}
+      - name: Cache digest-checked release archives
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/payment-vectors
+          key: gloas-archives-v1.7.0-beta.4-${{ hashFiles('tests/reference_vectors/inventory.py') }}
       - name: Fetch official v1.7.0-beta.4 archives
         run: |
-          mkdir "$RUNNER_TEMP/payment-vectors"
-          for preset in minimal mainnet; do
+          mkdir -p "$RUNNER_TEMP/payment-vectors"
+          for preset in minimal mainnet general comptests; do
+            if test -f "$RUNNER_TEMP/payment-vectors/$preset.tar.gz"; then continue; fi
             curl --fail --location --retry 3 --silent --show-error \
               "https://github.com/ethereum/consensus-specs/releases/download/v1.7.0-beta.4/$preset.tar.gz" \
               --output "$RUNNER_TEMP/payment-vectors/$preset.tar.gz"
           done
-      - name: Verify archive digests and replay every case in the handler
+      - name: Verify archive digests and classify every published case and replay supported transitions
         run: .reference/.venv/bin/python tests/reference_vectors/check_payments.py "$RUNNER_TEMP/payment-vectors" payment-results.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: official-builder-payment-results
+          name: official-gloas-coverage
           path: payment-results.json
           if-no-files-found: error
