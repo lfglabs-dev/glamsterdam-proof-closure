@@ -209,7 +209,7 @@ def settle_slot_bid_lifecycle
     let (_, _, w2) := process_builder_pending_payments quorum first1 second1 w1
     w2
   | .confirmedNextEpoch =>
-    let (first1, second1, w1) := process_builder_pending_payments quorum [{}] [mkPayment 0] []
+    let (first1, second1, w1) := process_builder_pending_payments quorum [{}] [mkPayment attestedWeight] []
     let (clearedSlot, wChild) :=
       match first1 with
       | p :: _ => settle_builder_payment p w1
@@ -220,6 +220,22 @@ def settle_slot_bid_lifecycle
     let (first1, second1, w1) := process_builder_pending_payments quorum [{}] [mkPayment 0] []
     let (_, _, w2) := process_builder_pending_payments quorum first1 second1 w1
     appendOlderBid w2 bid
+
+/-- A fresh positive bid crosses two boundaries with no intervening blocks. The
+first rotation preserves the complete entry; the second evicts it without paying.
+The only weight used here comes from bid creation, and each boundary may have a
+different positive quorum. This is the tracked-slot projection, not a fork-choice
+or whole-BeaconState reachability theorem. -/
+theorem fresh_bid_across_two_empty_epochs (bid : BuilderPendingWithdrawal)
+    (proposer firstQuorum secondQuorum : Nat) (existing : List BuilderPendingWithdrawal)
+    (hbid : 0 < bid.amount) (hfirst : 0 < firstQuorum) (hsecond : 0 < secondQuorum) :
+    let entry := paymentForBid bid proposer 0
+    let (first, second, ws) := process_builder_pending_payments firstQuorum [{}] [entry] existing
+    let (_, _, next) := process_builder_pending_payments secondQuorum first second ws
+    first = [entry] ∧ entry.weight = 0 ∧ next = existing ∧
+      appendOlderBid next bid = existing ++ [bid] := by
+  simp [process_builder_pending_payments, paymentForBid, appendOlderBid, hbid,
+    Nat.not_le_of_lt hfirst, Nat.not_le_of_lt hsecond]
 
 /-- T-7732-SINGLE-SETTLEMENT: Across all four `ChildConfirmationTiming` cases (`notConfirmed`,
 `confirmedSameEpoch`, `confirmedNextEpoch`, `confirmedAfterTwoEpochs`), every committed builder bid
