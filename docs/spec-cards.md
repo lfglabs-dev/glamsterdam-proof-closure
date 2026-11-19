@@ -140,51 +140,17 @@ Read in this order: **Card 1 → Card 3 → Card 2 → Card 4 → Card 7 → Car
 - **Assumptions.** The clear happens in a helper/`DELEGATECALL` subcall for the D13S band; same-frame for the simple form.
 - **Reviewer checklist.** Is this card kept separate from the 7702 replay card (Card 12)? Are the two hazards not conflated?
 
-## Card 9 — EIP-8246: ETH conservation across clear/destroy
+## Card 9 — EIP-8246 cleanup
 
-- **Claim.** Clearing a destroyed account preserves its balance; `SELFDESTRUCT` conserves ETH; no state-gas refund is created by the clear; storage clears are recorded in the BAL.
-- **Lean signature (target).**
-  ```lean
-  theorem eip8246_eth_conservation
-    (s : PreState) (tx : Transaction) :
-    sumBalances (execute tx s).post = sumBalances s.pre
-  ```
-- **Source.** `state_tracker.py:494–516`, `fork.py`; `Glamsterdam/Eip8246/Spec.lean`.
-- **Witness.** `t_8246_eth_conservation`, `t_8246_selfdestruct_conservation`, `t_8246_storage_clears_recorded_in_bal`.
-- **Mutant.** Let `clear_account_preserving_balance` zero the balance; conservation must fail.
-- **Assumptions.** No fee burn in the conservation statement; fees are a separate theorem.
-- **Reviewer checklist.** Is fee settlement separated from balance conservation? Is the BAL patch included?
+Use the execution-layer declarations below. Transaction-state cleanup, fee accounting and per-slot BAL replay each have a different observable result.
 
-## Card 10 — EIP-7732: single settlement and payment guarantee
+## Card 10 — EIP-7732 settlement
 
-- **Claim.** A committed builder bid is settled at most once; if the block is confirmed or reaches quorum, the proposer receives exactly `bidValue`; builder balance never underflows.
-- **Lean signature (target).**
-  ```lean
-  theorem eip7732_single_settlement
-    (s : BeaconState) (bid : ExecutionPayloadBid) :
-    settleCount s bid ≤ 1 ∧
-    (confirmed s bid ∨ quorum s bid) → paid s bid = bid.value
-  ```
-- **Source.** `specs/gloas/beacon-chain.md:1538–1544,1719–1732,1784–1831`; `Glamsterdam/Gloas7732/Spec.lean`.
-- **Witness.** `t_7732_single_settlement`, `t_7732_payment_guarantee`, `t_7732_builder_solvency`.
-- **Mutant.** Allow settlement on both parent-confirmation and pending-payment paths; double-count must appear.
-- **Assumptions.** `can_builder_cover_bid`; the four `ChildConfirmationTiming` cases.
-- **Reviewer checklist.** Are all four timing cases enumerated? Is the slashed-proposer case separate (Card 10b)?
+Use the consensus declarations below. Bid coverage is a precondition of the supply theorem. The lifecycle theorems count withdrawals queued for one bid.
 
-## Card 11 — EIP-8282: FIFO queue safety into 7732
+## Card 11 — EIP-8282 requests at the consensus boundary
 
-- **Claim.** Deposit/exit queue operations remain FIFO and safe when bridged into the 7732 builder-payment path; no index aliasing; no truncating `saturating_sub`.
-- **Lean signature (target).**
-  ```lean
-  theorem eip8282_fifo_safety
-    (q : Queue) (op : QueueOp) :
-    FIFO q → FIFO (apply q op) ∧ noAliasing (apply q op)
-  ```
-- **Source.** `specs/gloas/fork.md`; `Glamsterdam/Gloas7732/Spec.lean`.
-- **Witness.** `t_8282_7732_queue_safety`, `P-SUBMIT-1`, `P-DRAIN-1`, `P-CONTROL-1`.
-- **Mutant.** Reorder two queue entries; FIFO must fail.
-- **Assumptions.** The queue is the 8282 predeploy queue; the 7732 path is the only consumer.
-- **Reviewer checklist.** Are the three FIFO properties named? Is the queue boundary explicit?
+An empty parent requires empty requests. A full parent requires the requests root committed in the bid. The separate contract audit owns evidence about FIFO ordering inside the EIP-8282 contract.
 
 ## Card 12 — EIP-7702: delegation OOG and replay
 
@@ -207,3 +173,48 @@ Read in this order: **Card 1 → Card 3 → Card 2 → Card 4 → Card 7 → Car
 - `MetaSpec` combinators, `WitnessRefuter` machinery, and the audit linter stay in `audit/tools/`; they are review tooling, not proof assumptions.
 - The seven fork variants collapse into `ForkParams`; only the fields that change `D0` vs `D13S` behaviour are trusted.
 - Client-level behaviour (geth/reth/nethermind), RPC estimators, and deployed-contract prevalence are outside these cards and must be cited as external evidence, not as Lean guarantees.
+
+## Proof destinations for the internal notes
+
+The reviewed notes are pinned at `11649a0`. The consensus reference is Gloas `aa16bb4c` and the execution reference is Amsterdam `16898000`. The [source map](../audit/source-map.yaml) identifies upstream symbols and distinguishes translations from projections. Each link below opens the declaration at this revision.
+
+### Consensus
+
+| Observable result and scope | Declaration or test |
+| --- | --- |
+| One covered bid conserves the modeled builder debit plus queued amount. | [t_7732_no_eth_minting](../Glamsterdam/Gloas7732/Spec.lean#L331) |
+| Positive quorum, one slot, four confirmation timings. Bound both the amount and the number of entries. | [t_7732_single_settlement](../Glamsterdam/Gloas7732/Spec.lean#L228) · [t_7732_single_withdrawal_entry](../Glamsterdam/Gloas7732/Spec.lean#L247) |
+| A positive confirmed or quorum-qualified bid queues its exact amount for the bid’s fee recipient. The balance check covers existing obligations and this bid at admission. | [t_7732_payment_guarantee](../Glamsterdam/Gloas7732/Spec.lean#L263) · [t_7732_builder_solvency](../Glamsterdam/Gloas7732/Spec.lean#L305) · [t_7732_builder_withdrawal_no_underflow](../Glamsterdam/Gloas7732/Spec.lean#L319) |
+| Repeated participation by a validator within the modeled epoch contributes at most one effective balance. | [t_7732_quorum_weight_unconditional](../Glamsterdam/Gloas7732/Spec.lean#L419) · [t_7732_quorum_no_double_count](../Glamsterdam/Gloas7732/Spec.lean#L402) |
+| Three projected roots survive parent-payment processing. Exit initiation requires zero pending amount. | [t_7732_pinned_payment_frame](../Glamsterdam/Gloas7732/Spec.lean#L666) · [t_7732_frame](../Glamsterdam/Gloas7732/Spec.lean#L658) · [t_7732_exit_safety](../Glamsterdam/Gloas7732/Spec.lean#L363) |
+| A competing same-slot payload cannot pass the commitment under the stated hash uniqueness hypothesis. Network visibility and fork choice are outside the transition. | [t_7732_same_slot_unbundling](../Glamsterdam/Gloas7732/Spec.lean#L468) |
+| Issue #5754. Compare the beta.4 witness and composed trace with the proposed transition’s queue equality. | [f_7732_slashed_payment_resurrection_refuter](../Glamsterdam/Gloas7732/Spec.lean#L572) · [t_7732_composed_trace_resurrects_slashed_payment](../Glamsterdam/Gloas7732/Spec.lean#L629) · [t_7732_slashed_no_resurrection](../Glamsterdam/Gloas7732/Spec.lean#L561) · [test_vendored_gloas_slashed_payment_resurrection_trace](../tests/differential/test_glamsterdam_differential.py#L588) |
+| Fork-slot initialization, ring index aliasing, and the two credential checks each have a concrete witness. | [f_7732_fork_slot_availability_refuter](../Glamsterdam/Gloas7732/Spec.lean#L855) · [f_7732_availability_ring_buffer_clobber_refuter](../Glamsterdam/Gloas7732/Spec.lean#L897) · [t_7732_mainnet_ring_alias](../Glamsterdam/Gloas7732/Spec.lean#L912) · [f_8282_topup_credential_prefix_drop_refuter](../Glamsterdam/Gloas7732/Spec.lean#L737) · [f_7732_fork_onboard_cross_credential_refuter](../Glamsterdam/Gloas7732/Spec.lean#L781) |
+| Consensus acceptance of parent execution requests. | [t_8282_7732_queue_safety](../Glamsterdam/Gloas7732/Spec.lean#L688) |
+
+### Execution gas
+
+| Observable result and scope | Declaration or test |
+| --- | --- |
+| Charges and reservoir return on success, error and revert. | [t_8037_charge_gas_sound](../Glamsterdam/Gas/Spec.lean#L76) · [t_8037_reservoir_roundtrip_success](../Glamsterdam/Gas/Spec.lean#L92) · [t_8037_reservoir_roundtrip_error](../Glamsterdam/Gas/Spec.lean#L96) · [t_8037_meter_reservoir_roundtrip_on_revert](../Glamsterdam/Gas/Spec.lean#L106) |
+| Valid intrinsic costs, transaction allocation, system reservoir, block caps and access prices. | [t_8037_allocate_evm_gas_sound](../Glamsterdam/Gas/Spec.lean#L307) · [t_8037_sys_tx_reservoir_sound](../Glamsterdam/Gas/Spec.lean#L670) · [t_7778_8037_dual_cap](../Glamsterdam/Gas/Spec.lean#L359) · [t_8038_2780_warm_cold_bounds](../Glamsterdam/Gas/Spec.lean#L369) |
+| Root non-negativity on an abstract storage trace and a reset/refill witness. | [t_8038_refund_counter_telescope_trace_root_nonneg](../Glamsterdam/Gas/Spec.lean#L594) · [f_8038_7778_sstore_reset_refuter](../Glamsterdam/Gas/Spec.lean#L468) |
+| 50,000 granted gas and zero reservoir. D13 represents the #12581 refill behavior. #12582 enters the frame successfully. The same warm fresh-slot write succeeds when the reservoir is funded. | [t_calltree_e1_fixed_grant_starvation](../Glamsterdam/Gas/CallTree.lean#L332) · [t_calltree_d13_eq_eip12581_on_gas_and_reservoir](../Glamsterdam/Gas/CallTree.lean#L850) · [t_12582_fixed_budget_empty_reservoir](../Glamsterdam/Gas/Eip12582.lean#L830) |
+| #12582 library equality assumes successful execution, identical meter operations and full forwarding after call cost. The draw bound applies to non-inheriting calls. | [t_12582_prop1_delegatecall_frame_invariance](../Glamsterdam/Gas/Eip12582.lean#L430) · [t_12582_prop2_gas_left_non_increasing_in_frame](../Glamsterdam/Gas/Eip12582.lean#L543) · [t_12582_prop3b_untrusted_callee_reservoir_drain_bound](../Glamsterdam/Gas/Eip12582.lean#L726) · [t_12582_prop4_revert_vs_refill_drawn_asymmetry](../Glamsterdam/Gas/Eip12582.lean#L846) |
+| D13S sibling delta, helper failure and stranded CREATE gas are three different observations. | [t_calltree_e3_m4_sibling_underflow_and_d13s_break](../Glamsterdam/Gas/CallTree.lean#L591) · [t_calltree_d13s_reopens_t2_on_child_clear](../Glamsterdam/Gas/CallTree.lean#L647) · [t_calltree_d13s_failed_create_strands_gas](../Glamsterdam/Gas/CallTree.lean#L719) |
+| Abstract estimator and the 500k/16.9M comparison. | [estimator_unsound_above_2pow24](../Glamsterdam/Gas/Spec.lean#L840) · [estimator_unsound_above_2pow24_witness](../Glamsterdam/Gas/Spec.lean#L903) · [t_8037_c13_fixed_budget_subcall_tx_gas_dependent](../Glamsterdam/Gas/Spec.lean#L967) |
+| Prototype proxy comparison uses a modeled allowance rule. A current client run requires independent evidence. | [t_12582_prop1b_nethermind15187_proxied_factory_divergence](../Glamsterdam/Gas/Eip12582.lean#L531) |
+| Delegation OOG before recipient lookup and the empty-account distinction. | [f_2780_7928_set_delegation_oog_omits_recipient_refuter](../Glamsterdam/Gas/Spec.lean#L742) · [t_8037_7702_delegation_exists_eq_alive_under_invariant](../Glamsterdam/Gas/Spec.lean#L619) · [f_8037_7702_delegation_exists_vs_alive_refuter](../Glamsterdam/Gas/Spec.lean#L631) |
+
+### SELFDESTRUCT and the block access list
+
+| Observable result and scope | Declaration or test |
+| --- | --- |
+| Local transfers, rollback, SELFDESTRUCT, cleanup and fee accounting. Their composition across arbitrary bytecode is outside these declarations. | [move_ether_distinct_conserves_sum](../Glamsterdam/Common/ElCore.lean#L632) · [t_common_checkpoint_rollback](../Glamsterdam/Common/ElCore.lean#L616) · [t_8246_selfdestruct_conservation](../Glamsterdam/Eip8246/Spec.lean#L129) · [t_8246_eth_conservation](../Glamsterdam/Eip8246/Spec.lean#L283) · [t_8246_tx_fee_settlement_conservation](../Glamsterdam/Eip8246/Spec.lean#L260) |
+| Cleanup preserves balance, clears code/nonce/storage and passes the creation collision check. Successful initcode execution is a separate question. | [t_8246_tx_state_clear_exact](../Glamsterdam/Eip8246/Spec.lean#L57) · [t_8246_cleared_address_deployable](../Glamsterdam/Eip8246/Spec.lean#L75) · [t_8246_no_state_gas_refund](../Glamsterdam/Eip8246/Spec.lean#L181) |
+| The pinned write/clear trace diverges. Patched storage replay is proved at the modeled address/slot. | [t_8246_bal_tx_block_state_desync](../Glamsterdam/Eip8246/Spec.lean#L424) · [f_8246_bal_storage_clears_ignored_refuter](../Glamsterdam/Eip8246/Spec.lean#L393) · [t_8246_bal_patched_sound](../Glamsterdam/Eip8246/Spec.lean#L364) · [t_8246_storage_clears_recorded_in_bal](../Glamsterdam/Eip8246/Spec.lean#L462) |
+| Unchecked system-transaction cleanup omission in the modeled projection. | [f_8246_unchecked_sys_tx_drops_deletes_refuter](../Glamsterdam/Eip8246/Spec.lean#L511) |
+
+### Conformance evidence
+
+The [differential suite](../tests/differential/test_glamsterdam_differential.py) runs selected fixed and generated cases through the C ABI. The [pinned reference files](../audit/source-map.yaml) identify the source being compared. The suite does not enumerate an official EF vector release, count its expected cases, or reconcile skips. Its pass count establishes coverage of the cases actually exercised.
