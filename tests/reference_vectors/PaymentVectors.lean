@@ -48,7 +48,14 @@ private def applyCase (json : Json) : Except String Json := do
     let amount ← json.getObjValAs? Nat "amount"
     match applyBuilderTopUp builders pubkey credentialPrefix amount epoch delay with
     | some result => return Json.mkObj [("builders", toJson result)]
-    | none => return Json.mkObj [("unsupported", toJson "new-builder BLS verification and registration")]
+    | none =>
+      let valid ← json.getObjValAs? (Option Bool) "verifiedSignature"
+      match valid with
+      | none => return Json.mkObj [("verifyBuilderSignature", toJson true)]
+      | some result =>
+        let credentials ← json.getObjValAs? Nat "credentials"
+        return Json.mkObj [("builders", toJson
+          (registerBuilder builders pubkey credentials amount epoch result))]
   throw "unknown handler"
 
 /-- Compiled transitions emit replacements for the fields they own. Other SSZ

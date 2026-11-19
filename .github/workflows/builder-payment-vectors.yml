@@ -35,6 +35,14 @@ jobs:
           ref: aa16bb4c156184e9548a997d53efaf2a228a6304
           path: .reference
           persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: supranational/blst
+          ref: e7f90de551e8df682f3cc99067d204d8b90d27ad
+          path: .blst
+          persist-credentials: false
+      - name: Build pinned BLS verifier
+        run: cd .blst && ./build.sh
       - name: Prepare pinned decoder and compiler
         run: |
           sudo apt-get update -qq

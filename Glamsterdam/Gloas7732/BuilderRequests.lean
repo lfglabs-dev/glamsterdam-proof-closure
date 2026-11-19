@@ -27,4 +27,17 @@ def applyBuilderTopUp (builders : List Builder) (pubkey credentialPrefix amount 
     ⟨true, credentialPrefix, false, b.balance, amount⟩
   return builders.set index { b with balance, withdrawableEpoch := withdrawable }
 
+/-- After BLS verification, a new builder reuses the first eligible swept
+registry slot, or appends to the registry. The execution address comprises
+the last twenty bytes of the withdrawal credentials. -/
+def registerBuilder (builders : List Builder) (pubkey credentials amount epoch : Nat)
+    (signatureValid : Bool) : List Builder := Id.run do
+  if !signatureValid then return builders
+  let builder : Builder := {
+    pubkey, executionAddress := credentials % (2 ^ 160), balance := amount,
+    depositEpoch := epoch, withdrawableEpoch := FAR_FUTURE_EPOCH }
+  match builders.findIdx? (fun b => b.withdrawableEpoch ≤ epoch && b.balance == 0) with
+  | some index => return builders.set index builder
+  | none => return builders ++ [builder]
+
 end Glamsterdam.Gloas7732.Spec
