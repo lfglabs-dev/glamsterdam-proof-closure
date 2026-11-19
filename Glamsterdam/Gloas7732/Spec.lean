@@ -178,6 +178,15 @@ inductive ChildConfirmationTiming where
   | confirmedAfterTwoEpochs
   deriving Repr, DecidableEq, BEq
 
+/-- Positive bids record a payment. A zero-value bid contributes an empty entry
+to the single-slot lifecycle; the complete bid operation leaves the queue unchanged. -/
+def paymentForBid (bid : BuilderPendingWithdrawal) (proposer weight : Nat) : BuilderPendingPayment :=
+  if bid.amount > 0 then {weight := weight, withdrawal := bid, proposerIndex := proposer} else {}
+
+/-- Once the parent has left the two-epoch window, settlement uses its cached bid. -/
+def appendOlderBid (ws : List BuilderPendingWithdrawal) (bid : BuilderPendingWithdrawal) :=
+  if bid.amount > 0 then ws ++ [bid] else ws
+
 /-- Full 2-epoch slot settlement lifecycle combining all three `parent_epoch` branches of
 `apply_parent_execution_payload` (`settle_builder_payment:1538-1544`, `1799-1814`) and two
 epoch-boundary rotations of `process_builder_pending_payments` (`1719-1732`).
@@ -187,13 +196,8 @@ the rotated first-epoch entry. After two empty epochs the child uses the origina
 def settle_slot_bid_lifecycle
     (feeRecipient bidValue builderIdx proposerIdx attestedWeight quorum : Nat)
     (timing : ChildConfirmationTiming) : List BuilderPendingWithdrawal :=
-  let mkPayment (w : Nat) : BuilderPendingPayment :=
-    if bidValue > 0 then
-      { weight := w
-        withdrawal := ⟨feeRecipient, bidValue, builderIdx⟩
-        proposerIndex := proposerIdx }
-    else
-      {}
+  let bid := BuilderPendingWithdrawal.mk feeRecipient bidValue builderIdx
+  let mkPayment (w : Nat) := paymentForBid bid proposerIdx w
   match timing with
   | .notConfirmed =>
     let (first1, second1, w1) := process_builder_pending_payments quorum [{}] [mkPayment attestedWeight] []
@@ -215,10 +219,7 @@ def settle_slot_bid_lifecycle
   | .confirmedAfterTwoEpochs =>
     let (first1, second1, w1) := process_builder_pending_payments quorum [{}] [mkPayment 0] []
     let (_, _, w2) := process_builder_pending_payments quorum first1 second1 w1
-    if bidValue > 0 then
-      w2 ++ [⟨feeRecipient, bidValue, builderIdx⟩]
-    else
-      w2
+    appendOlderBid w2 bid
 
 /-- T-7732-SINGLE-SETTLEMENT: Across all four `ChildConfirmationTiming` cases (`notConfirmed`,
 `confirmedSameEpoch`, `confirmedNextEpoch`, `confirmedAfterTwoEpochs`), every committed builder bid
@@ -233,7 +234,7 @@ theorem t_7732_single_settlement
       (settle_slot_bid_lifecycle feeRecipient bidValue builderIdx proposerIdx
         attestedWeight quorum timing) ≤ bidValue := by
   have h_q0 : quorum ≠ 0 := by omega
-  dsimp [settle_slot_bid_lifecycle, settle_builder_payment, process_builder_pending_payments,
+  dsimp [settle_slot_bid_lifecycle, paymentForBid, appendOlderBid, settle_builder_payment, process_builder_pending_payments,
     sum_withdrawal_amounts]
   cases timing <;> by_cases h_bid : bidValue > 0 <;> simp [h_bid, h_q0]
   by_cases h_wt : attestedWeight ≥ quorum <;> simp [h_wt]
@@ -251,7 +252,7 @@ theorem t_7732_payment_guarantee
     settle_slot_bid_lifecycle feeRecipient bidValue builderIdx proposerIdx
       attestedWeight quorum timing = [⟨feeRecipient, bidValue, builderIdx⟩] := by
   have h_q0 : quorum ≠ 0 := by omega
-  dsimp [settle_slot_bid_lifecycle, settle_builder_payment, process_builder_pending_payments]
+  dsimp [settle_slot_bid_lifecycle, paymentForBid, appendOlderBid, settle_builder_payment, process_builder_pending_payments]
   cases timing
   · rcases h_timely with h_conf | h_att
     · contradiction
