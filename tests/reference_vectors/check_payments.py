@@ -12,6 +12,7 @@ import tarfile
 import tempfile
 from pathlib import Path
 
+from ruamel.yaml import YAML
 import snappy
 
 from inventory import inventory
@@ -24,11 +25,12 @@ HANDLERS = {
     "epoch_processing/builder_pending_payments",
     "operations/builder_deposit_request",
     "operations/builder_exit_request",
+    "operations/payload_attestation",
 }
 
 
 def compile_bridge(directory):
-    subprocess.run(["lake", "build", "Glamsterdam.Gloas7732.BuilderRequests"], cwd=ROOT, check=True)
+    subprocess.run(["lake", "build", "Glamsterdam.Gloas7732.BuilderRequests", "Glamsterdam.Gloas7732.PayloadAttestation"], cwd=ROOT, check=True)
     blst = Path(os.environ.get("GLOAS_BLST_DIR", ROOT / ".blst")).resolve()
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=blst, text=True).strip()
     if revision != "e7f90de551e8df682f3cc99067d204d8b90d27ad":
@@ -45,7 +47,7 @@ def compile_bridge(directory):
     so = directory / "payments.so"
     subprocess.run(["cc", "-O2", "-fPIC", "-shared", f"-I{prefix / 'include'}",
                     HERE / "bridge.c", HERE / "ssz_bridge.c", HERE / "bls_bridge.c", f"-I{blst / 'bindings'}", ssz_c, generated, ir / "Common/Prelude.c", ir / "Common/MetaSpec.c",
-                    ir / "Gloas7732/Spec.c", ir / "Gloas7732/BuilderRequests.c", f"-L{runtime}", blst / "libblst.a", "-lleanshared",
+                    ir / "Gloas7732/Spec.c", ir / "Gloas7732/BuilderRequests.c", ir / "Gloas7732/PayloadAttestation.c", f"-L{runtime}", blst / "libblst.a", "-lleanshared",
                     f"-Wl,-rpath,{runtime}", "-o", so], check=True)
     lib = ctypes.CDLL(str(so))
     lib.initialize_vectors.argtypes = []
@@ -58,6 +60,8 @@ def compile_bridge(directory):
         raise RuntimeError("Lean SSZ initialization failed")
     lib.verify_builder_signature.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_size_t]
     lib.verify_builder_signature.restype = ctypes.c_int
+    lib.verify_ptc_signature.argtypes = [ctypes.c_char_p, ctypes.c_size_t] * 5
+    lib.verify_ptc_signature.restype = ctypes.c_int
     lib.ssz_vector_root.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t]
     lib.ssz_vector_root.restype = ctypes.c_void_p
     lib.replay_vectors.argtypes = [ctypes.c_char_p]
@@ -73,7 +77,9 @@ def read_cases(archive, selected):
         for member in tar:
             path = member.name.removeprefix("tests/").split("/")
             name = "/".join(path[:-1])
-            if name not in cases or not member.isfile() or not path[-1].endswith(".ssz_snappy"):
+            if name not in cases or not member.isfile():
+                continue
+            if not path[-1].endswith(".ssz_snappy") and path[-1] not in {"config.yaml", "meta.yaml"}:
                 continue
             if path[-1] in {"pre_epoch.ssz_snappy", "post_epoch.ssz_snappy"}:
                 continue
@@ -131,6 +137,35 @@ def apply_output(spec, state, handler, actual):
             for b in actual["builders"]])
 
 
+def check_ptc(lib, spec, case, decoded, pre, data, config, meta):
+    att = decoded("payload_attestation", spec.PayloadAttestation)
+    as_int = lambda value: int.from_bytes(bytes(value), "big")
+    data.update(attestedSlot=int(att.data.slot), attestedRoot=as_int(att.data.beacon_block_root),
+                parentRoot=as_int(pre.latest_block_header.parent_root),
+                gloasEpoch=int(config.get("GLOAS_FORK_EPOCH", spec.config.GLOAS_FORK_EPOCH)),
+                window=[[int(i) for i in committee] for committee in pre.ptc_window],
+                bits=[bool(b) for b in att.aggregation_bits], pubkeys=[as_int(v.pubkey) for v in pre.validators],
+                currentVersion=as_int(pre.fork.current_version), previousVersion=as_int(pre.fork.previous_version),
+                forkEpoch=int(pre.fork.epoch), verifiedSignature=None)
+    actual = replay(lib, data)
+    if "signers" in actual:
+        args = [b"".join(key.to_bytes(48, "big") for key in actual["signers"]),
+                att.data.encode_bytes(), bytes(att.signature),
+                actual["version"].to_bytes(4, "big"), bytes(pre.genesis_validators_root)]
+        enabled = meta.get("bls_setting", 0) != 2
+        valid = lib.verify_ptc_signature(*(v for arg in args for v in (arg, len(arg)))) if enabled else 1
+        if valid not in (0, 1):
+            raise ValueError("malformed PTC BLS adapter input")
+        data["verifiedSignature"] = bool(valid)
+        actual = replay(lib, data)
+    accepted = actual["accepted"]
+    if accepted != ("post.ssz_snappy" in case):
+        raise ValueError(f"unexpected PTC acceptance: {accepted}")
+    if accepted and pre.encode_bytes() != snappy.decompress(case["post.ssz_snappy"]):
+        raise ValueError("read-only PTC operation disagrees with the official post-state")
+    return {"status": "full_pass", "outcome": "accepted" if accepted else "rejected"}
+
+
 def check_case(lib, spec, name, case):
     handler = name.split("/")[3]
     def decoded(field, typ):
@@ -138,13 +173,18 @@ def check_case(lib, spec, name, case):
     pre = decoded("pre", spec.BeaconState)
     data = queues(pre)
     data.update(handler=handler, slot=int(pre.slot), slotsPerEpoch=int(spec.SLOTS_PER_EPOCH))
+    yaml = YAML(typ="safe")
+    config = yaml.load(case.get("config.yaml", b"{}"))
+    meta = yaml.load(case.get("meta.yaml", b"{}"))
+    if handler == "payload_attestation":
+        return check_ptc(lib, spec, case, decoded, pre, data, config, meta)
     if handler == "builder_pending_payments":
         data.update(increment=int(spec.EFFECTIVE_BALANCE_INCREMENT), validators=[
             dict(activationEpoch=int(v.activation_epoch), exitEpoch=int(v.exit_epoch),
                  effectiveBalance=int(v.effective_balance)) for v in pre.validators])
     else:
         data.update(builders=[builder(b) for b in pre.builders],
-                    delay=int(spec.config.MIN_BUILDER_WITHDRAWABILITY_DELAY))
+                    delay=int(config.get("MIN_BUILDER_WITHDRAWABILITY_DELAY", spec.config.MIN_BUILDER_WITHDRAWABILITY_DELAY)))
         if handler == "builder_exit_request":
             request = decoded(handler, spec.BuilderExitRequest)
             data.update(source=int.from_bytes(bytes(request.source_address), "big"),

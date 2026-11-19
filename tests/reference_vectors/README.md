@@ -53,3 +53,12 @@ for a binary-only codec. The runner does not claim to implement the optional
 YAML value codec or complete beacon-state transitions through these tests.
 Local malformed-wire and length-mix-in controls are separate from the official
 denominator.
+
+Payload-attestation replay uses the official fixture's fork configuration.
+Lean checks the parent root and previous-slot rule, selects the PTC window and
+signers, and chooses the fork version for the attested epoch. The native BLS
+primitive verifies the resulting aggregate signature under the PTC domain.
+The valid operation has no state writes, so its complete pre-state encoding
+must equal the published post-state. Cases without a post-state must be rejected.
+These cases exercise payload-timeliness attestations. Ordinary beacon
+attestations have additional committee, participation and reward transitions.
