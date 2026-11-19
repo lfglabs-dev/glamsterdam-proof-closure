@@ -180,7 +180,10 @@ inductive ChildConfirmationTiming where
 
 /-- Full 2-epoch slot settlement lifecycle combining all three `parent_epoch` branches of
 `apply_parent_execution_payload` (`settle_builder_payment:1538-1544`, `1799-1814`) and two
-epoch-boundary rotations of `process_builder_pending_payments` (`1719-1732`). -/
+epoch-boundary rotations of `process_builder_pending_payments` (`1719-1732`).
+For an unconfirmed payload the first epoch boundary rotates the payment and the second checks quorum.
+Confirmation in the same epoch clears the second-epoch entry. Confirmation in the next epoch clears
+the rotated first-epoch entry. After two empty epochs the child uses the original positive bid value. -/
 def settle_slot_bid_lifecycle
     (feeRecipient bidValue builderIdx proposerIdx attestedWeight quorum : Nat)
     (timing : ChildConfirmationTiming) : List BuilderPendingWithdrawal :=
@@ -193,21 +196,15 @@ def settle_slot_bid_lifecycle
       {}
   match timing with
   | .notConfirmed =>
-    -- Epoch boundary 1 rotates `secondEpoch` -> `firstEpoch`; Epoch boundary 2 settles if `weight ≥ quorum`
     let (first1, second1, w1) := process_builder_pending_payments quorum [{}] [mkPayment attestedWeight] []
     let (_, _, w2) := process_builder_pending_payments quorum first1 second1 w1
     w2
   | .confirmedSameEpoch =>
-    -- Child block in `parent_epoch` calls `settle_builder_payment` on `secondEpoch`, clearing it to `{}`
     let (clearedSlot, wChild) := settle_builder_payment (mkPayment attestedWeight) []
     let (first1, second1, w1) := process_builder_pending_payments quorum [{}] [clearedSlot] wChild
     let (_, _, w2) := process_builder_pending_payments quorum first1 second1 w1
     w2
   | .confirmedNextEpoch =>
-    -- No block after `parent_slot` in `parent_epoch` (`weight = 0` at Epoch boundary 1);
-    -- Epoch boundary 1 rotates `secondEpoch` into `firstEpoch`; child block in `parent_epoch + 1`
-    -- calls `settle_builder_payment` on `firstEpoch` (clearing `amount = 0`, so `process_attestation:2464`
-    -- does not accrue weight); Epoch boundary 2 sees `{}`.
     let (first1, second1, w1) := process_builder_pending_payments quorum [{}] [mkPayment 0] []
     let (clearedSlot, wChild) :=
       match first1 with
@@ -216,8 +213,6 @@ def settle_slot_bid_lifecycle
     let (_, _, w2) := process_builder_pending_payments quorum [clearedSlot] second1 wChild
     w2
   | .confirmedAfterTwoEpochs =>
-    -- No block after `parent_slot` in `parent_epoch` or `parent_epoch + 1` (`weight = 0` across both
-    -- epoch boundaries); child block at `current_epoch ≥ parent_epoch + 2` enters `elif parent_bid.value > 0:`.
     let (first1, second1, w1) := process_builder_pending_payments quorum [{}] [mkPayment 0] []
     let (_, _, w2) := process_builder_pending_payments quorum first1 second1 w1
     if bidValue > 0 then
@@ -595,17 +590,11 @@ def f_7732_slashed_payment_resurrection_refuter :
 def trace_bid_slash_rotate_apply_v170_beta4
     (bidValue feeRecipient builderIdx headerProposer slashedIdx : Nat) :
     List BuilderPendingWithdrawal :=
-  let paymentAfterBid : BuilderPendingPayment :=
-    { weight := 0
-      withdrawal := ⟨feeRecipient, bidValue, builderIdx⟩
-      proposerIndex := headerProposer }
-  -- Step 2: `slash_validator` (`beacon-chain.md:1579-1581`)
+  let paymentAfterBid : BuilderPendingPayment := ⟨0, ⟨feeRecipient, bidValue, builderIdx⟩, headerProposer⟩
   let paymentsAfterSlash := slash_validator_pending_payments slashedIdx [paymentAfterBid]
-  let latestBidAfterSlash : Nat := bidValue -- `latest_execution_payload_bid.value` is NOT zeroed!
-  -- Step 3: Two epoch boundaries (`process_builder_pending_payments` with quorum = 1)
+  let latestBidAfterSlash : Nat := bidValue
   let (first1, second1, w1) := process_builder_pending_payments 1 [{}] paymentsAfterSlash []
   let (_, _, w2) := process_builder_pending_payments 1 first1 second1 w1
-  -- Step 4: `apply_parent_execution_payload` at `parentEpoch = 4, currentEpoch = 6`
   let s : GloasParentPaymentState := {
     parentEpoch := 4
     currentEpoch := 6
@@ -668,12 +657,11 @@ def valid_parent_execution_requests (isParentFull : Bool) (requestsEmpty : Bool)
     decide (requestsRoot = parentCommittedRoot)
 
 theorem t_8282_7732_queue_safety (isParentFull requestsEmpty : Bool)
-    (requestsRoot parentCommittedRoot : Nat)
-    (h : valid_parent_execution_requests isParentFull requestsEmpty requestsRoot parentCommittedRoot = true) :
-    (isParentFull = false → requestsEmpty = true) ∧
-    (isParentFull = true → requestsRoot = parentCommittedRoot) := by
-  unfold valid_parent_execution_requests at h
-  cases isParentFull <;> simp_all
+    (requestsRoot parentCommittedRoot : Nat) :
+    valid_parent_execution_requests isParentFull requestsEmpty requestsRoot parentCommittedRoot = true ↔
+      ((isParentFull = false → requestsEmpty = true) ∧
+       (isParentFull = true → requestsRoot = parentCommittedRoot)) := by
+  cases isParentFull <;> simp [valid_parent_execution_requests]
 
 /-- Input to `process_builder_deposit_request` (`beacon-chain.md:2334-2361`) and
 `onboard_builders_from_pending_deposits` (`fork.md:70-120`). -/
