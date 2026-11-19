@@ -69,6 +69,14 @@ theorem t_8246_tx_state_clear_exact (txState : TransactionState) (addr : Address
   · have h_pos : (get_account txState addr).balance > 0 := by omega
     simp [hb, h_pos, EMPTY_CODE_HASH]
 
+/-- After transaction cleanup, the address passes the pinned state tracker's
+nonce/code collision check even if its balance survives. This establishes
+eligibility for creation, independent of gas and initcode execution. -/
+theorem t_8246_cleared_address_deployable (txState : TransactionState) (addr : Address) :
+    account_deployable (clear_account_preserving_balance_tx txState addr) addr = true := by
+  obtain ⟨_, hn, hc, _⟩ := t_8246_tx_state_clear_exact txState addr 0
+  simp [account_deployable, hn, hc]
+
 /-! ## 2. Exact `selfdestruct` Instruction Transcription (`vm/instructions/system.py:706-779`) -/
 
 /-- Input parameters and pre-state for a single `SELFDESTRUCT` execution (`system.py:706-779`). -/

@@ -586,6 +586,14 @@ def test_differential_gloas7732():
 
 
 def test_vendored_gloas_slashed_payment_resurrection_trace():
+    check_late_child_payment(slash_parent=True)
+
+
+def test_vendored_gloas_late_child_single_payment():
+    check_late_child_payment(slash_parent=False)
+
+
+def check_late_child_payment(slash_parent: bool):
     """
     Executes the actual markdown-extracted `slash_validator`, `process_builder_pending_payments`,
     and `apply_parent_execution_payload` functions from `vendor/upstreams/consensus_specs/specs/gloas/beacon-chain.md`
@@ -663,10 +671,10 @@ def test_vendored_gloas_slashed_payment_resurrection_trace():
         },
     )()
 
-    # 1. `slash_validator` clears `builder_pending_payments[payment_idx]`
-    slash_validator(state, proposer_idx)
-    assert state.validators[proposer_idx].slashed is True
-    assert state.builder_pending_payments[spe + (parent_slot % spe)] == BuilderPendingPayment.empty()
+    if slash_parent:
+        slash_validator(state, proposer_idx)
+        assert state.validators[proposer_idx].slashed is True
+        assert state.builder_pending_payments[spe + (parent_slot % spe)] == BuilderPendingPayment.empty()
     assert state.latest_execution_payload_bid.value == bid_value
 
     # 2. Two epoch boundaries pass without a block
@@ -689,7 +697,7 @@ def test_vendored_gloas_slashed_payment_resurrection_trace():
     )()
     apply_parent_execution_payload(state, empty_requests)
 
-    # Unpatched v1.7.0-beta.4 resurrects the slashed proposer's payment from `parent_bid.value`
+    # With or without slashing, the late child queues exactly the original bid.
     assert state.builder_pending_withdrawals == [
         BuilderPendingWithdrawal(fee_recipient=fee_recipient, amount=bid_value, builder_index=0)
     ]
@@ -798,7 +806,8 @@ if __name__ == "__main__":
     test_differential_sstore_and_selfdestruct()
     test_differential_gloas7732()
     test_vendored_gloas_slashed_payment_resurrection_trace()
+    test_vendored_gloas_late_child_single_payment()
     test_differential_calltree_multi_frame()
     print(
-        "differential-tests ok: 100% agreement between Lean 4.31 C-ABI and vendored upstream specs."
+        "differential-tests ok: selected C-ABI comparisons and pinned reference traces passed."
     )

@@ -238,10 +238,28 @@ theorem t_7732_single_settlement
   cases timing <;> by_cases h_bid : bidValue > 0 <;> simp [h_bid, h_q0]
   by_cases h_wt : attestedWeight ≥ quorum <;> simp [h_wt]
 
-/-- T-7732-PAYMENT-GUARANTEE (Potuz Property 2): If a committed bid has `bidValue > 0` and
-`quorum > 0`, and the block's payload is either confirmed by the child block (`timing ≠ .notConfirmed`)
-or attested up to the payment quorum (`attestedWeight ≥ quorum`), the proposer's `feeRecipient`
-is guaranteed to receive the exact `BuilderPendingWithdrawal` of `amount = bidValue`. -/
+/-- At most one withdrawal *entry* is produced for a single modeled bid. Counting
+entries complements the amount bound in `t_7732_single_settlement`: two partial
+payments would satisfy an amount bound. The positive quorum prevents empty epoch
+entries from qualifying. In the late-child branch the parent entry rotates twice
+with zero weight, then the pinned direct-append rule runs (Gloas beacon-chain.md
+1719–1732, 1799–1814). This lifecycle does not include proposer slashing. -/
+theorem t_7732_single_withdrawal_entry
+    (feeRecipient bidValue builderIdx proposerIdx attestedWeight quorum : Nat)
+    (timing : ChildConfirmationTiming) (h_quorum : quorum > 0) :
+    (settle_slot_bid_lifecycle feeRecipient bidValue builderIdx proposerIdx
+      attestedWeight quorum timing).length ≤ 1 := by
+  have h_q0 : quorum ≠ 0 := by omega
+  cases timing <;> by_cases h_bid : bidValue > 0 <;> by_cases h_wt : attestedWeight ≥ quorum <;>
+    simp [settle_slot_bid_lifecycle, settle_builder_payment, process_builder_pending_payments,
+      h_bid, h_q0, h_wt]
+
+/-- “The proposer is paid the bid” at the queue boundary: the lifecycle of one
+positive, uncancelled bid produces exactly one pending withdrawal with the specified
+fee recipient, full bid value and builder index. Requires positive quorum and either
+child confirmation or sufficient attestation weight. Gloas beacon-chain.md
+1538–1544, 1719–1732 and 1799–1814 enqueue the withdrawal; this theorem ends
+before the withdrawal sweep or any execution-layer account credit. -/
 theorem t_7732_payment_guarantee
     (feeRecipient bidValue builderIdx proposerIdx attestedWeight quorum : Nat)
     (timing : ChildConfirmationTiming)
@@ -304,14 +322,12 @@ theorem t_7732_builder_withdrawal_no_underflow (builderBalance withdrawn : Nat)
   unfold saturatingSub
   split <;> omega
 
-/-- T-7732-NO-ETH-MINTING (Potuz Property 1 — Supply Neutrality of Builder Bids):
-For any committed builder bid validated by `can_builder_cover_bid` (`beacon-chain.md:1184-1193`,
-`2179`) and settled through `settle_slot_bid_lifecycle` (`apply_parent_execution_payload` /
-`process_builder_pending_payments`) and `apply_withdrawals` (`beacon-chain.md:1997-2007`),
-the builder's post-withdrawal Beacon Chain balance plus the execution-layer withdrawal credited
-to `feeRecipient` equals the builder's pre-settlement balance (`postBuilderBalance + settled =
-builderBalance`), and the builder's remaining balance stays at or above `MIN_DEPOSIT_AMOUNT +
-pendingToWithdraw`. Thus builder bids never mint or destroy ETH across CL + EL. -/
+/-- T-7732-NO-ETH-MINTING. The pinned bid-coverage check (1184-1193)
+reserves the deposit floor, existing obligations and the new bid.
+For a positive quorum, subtracting the amount queued by this bid from
+the builder balance conserves the sum and leaves the reserves intact.
+The two terms are a modeled debit and queued withdrawals. Actual delivery
+by the execution layer is a separate transition. -/
 theorem t_7732_no_eth_minting
     (builderBalance pendingToWithdraw feeRecipient bidValue builderIdx proposerIdx
       attestedWeight quorum : Nat)
@@ -637,10 +653,20 @@ def eip7732_frame_invariant : FrameInvariant GloasParentPaymentState Bool Untouc
     dsimp only [process_parent_payload_if_full, apply_parent_payment_patched]
     repeat (first | rfl | split)
 
+/-- Iterating the patched parent-payment transition leaves the three modeled
+consensus roots unchanged, for any sequence of full and empty parents. -/
 theorem t_7732_frame (s : GloasParentPaymentState) (steps : List Bool) :
     (steps.foldl (fun st isFull => process_parent_payload_if_full isFull st) s).untouchedCl =
       s.untouchedCl :=
   eip7732_frame_invariant.preserved_list s steps
+
+/-- The pinned beta.4 parent-payment operation also preserves the validator
+registry, BLS-to-execution and sync-committee projections in every timing
+branch. Other operations in a beacon block may update those fields. -/
+theorem t_7732_pinned_payment_frame (s : GloasParentPaymentState) :
+    (apply_parent_payment_v170_beta4_buggy s).untouchedCl = s.untouchedCl := by
+  dsimp only [apply_parent_payment_v170_beta4_buggy]
+  repeat (first | rfl | split)
 
 /-! ## 7. EIP-8282 -> EIP-7732 Builder Queue Closure (`T-8282-7732-QUEUE-SAFETY`) and
     Cross-Function Credential-Check Divergence (`beacon-chain.md:2334-2361` vs `fork.md:70-120`) -/
@@ -656,6 +682,9 @@ def valid_parent_execution_requests (isParentFull : Bool) (requestsEmpty : Bool)
   else
     decide (requestsRoot = parentCommittedRoot)
 
+/-- The consensus consumer checks an empty request list for an empty parent,
+or the committed requests root for a full parent (beacon-chain.md:1841-1854).
+This statement concerns acceptance of requests at the consensus boundary. -/
 theorem t_8282_7732_queue_safety (isParentFull requestsEmpty : Bool)
     (requestsRoot parentCommittedRoot : Nat) :
     valid_parent_execution_requests isParentFull requestsEmpty requestsRoot parentCommittedRoot = true ↔
@@ -876,6 +905,16 @@ def f_7732_availability_ring_buffer_clobber_refuter :
     simp
   killWitness := (64, 10, 74, true)
   mutant_refuted := by decide
+
+/-- At the mainnet ring size, every positive multiple of 8192 slots aliases
+the parent and child indices. After a full parent is applied, the pinned
+transition reads the child's availability as true (beacon-chain.md:1829). -/
+theorem t_7732_mainnet_ring_alias (parent missedPeriods : Nat) :
+    child_slot_availability_after_parent_apply_v170_beta4_buggy
+      8192 parent (parent + (missedPeriods + 1) * 8192) true = true := by
+  simp [child_slot_availability_after_parent_apply_v170_beta4_buggy,
+    process_slot_ring, apply_parent_payload_ring, AvailabilityRing.getBit,
+    AvailabilityRing.setBit, Nat.add_mod]
 
 @[inline, export glamsterdam_eip7732_can_cover_bid_cabi]
 def eip7732_can_cover_bid_cabi (builderBalance pendingToWithdraw bidAmount : UInt64) : Bool :=
