@@ -209,6 +209,20 @@ DEPENDENCIES = {
 }
 
 
+HANDLER_DEPENDENCIES = {
+    ("operations", "attestation"): "committee shuffling, indexed aggregate signature checks, participation flags and proposer rewards",
+    ("operations", "parent_execution_payload"): "payload binding, parent execution requests, and composed availability/payment updates",
+    ("operations", "withdrawals"): "validator and builder sweeps, queue limits and withdrawal-index transitions",
+    ("operations", "payload_attestation"): "payload-timeliness committee derivation and aggregate signature verification",
+    ("operations", "proposer_slashing"): "signed conflicting headers and the complete validator slashing transition",
+    ("operations", "attester_slashing"): "indexed attestation signatures, slashability and validator balance updates",
+    ("operations", "sync_aggregate"): "sync committee aggregate signature, participation rewards and penalties",
+    ("operations", "execution_payload_bid"): "bid validity, builder signatures, consensus binding and pending-payment insertion",
+    ("epoch_processing", "pending_deposits"): "pending deposit queue, churn budget and validator activation accounting",
+    ("epoch_processing", "registry_updates"): "validator eligibility, ejection and churn-limited activation",
+}
+
+
 def fingerprint(ids):
     return hashlib.sha256(("\n".join(sorted(ids)) + "\n").encode()).hexdigest()
 
@@ -268,7 +282,7 @@ def main():
                 elif f"{runner}/{handler}" in HANDLERS:
                     selected.append(name)
                 else:
-                    results[name] = {"status": "unsupported", "dependency": DEPENDENCIES[runner]}
+                    results[name] = {"status": "unsupported", "dependency": HANDLER_DEPENDENCIES.get((runner, handler), DEPENDENCIES[runner])}
             check_archive(lib, spec, args.archives / f"{preset}.tar.gz", static, results)
             for name, case in read_cases(args.archives / f"{preset}.tar.gz", selected).items():
                 try:
@@ -283,6 +297,10 @@ def main():
                 raise ValueError(f"no matching pinned generator candidate for {name}")
             results[name]["generator_candidates"] = sorted(sources[name])
     report["counts"] = dict(Counter(r["status"] for r in results.values()))
+    by_handler = defaultdict(Counter)
+    for name, row in results.items():
+        by_handler["/".join(name.split("/")[:4])][row["status"]] += 1
+    report["by_preset_runner_handler"] = dict(by_handler)
     print(report["counts"])
     args.report.write_text(json.dumps(report, sort_keys=True, indent=2) + "\n")
     baselines = {status: fingerprint(k for k, r in results.items() if r["status"] == status)
