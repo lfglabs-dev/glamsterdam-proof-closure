@@ -14,7 +14,7 @@ def screen_cases(path, selected):
             if name not in selected:
                 continue
             files = {m.name.rsplit("/", 1)[-1]: archive.extractfile(m).read() for m in members
-                     if m.isfile() and (m.name.endswith(".ssz_snappy") or m.name.endswith("meta.yaml"))}
+                     if m.isfile() and (m.name.endswith(".ssz_snappy") or m.name.endswith(("meta.yaml", "config.yaml")))}
             if files:
                 yield name, files
 
@@ -33,6 +33,7 @@ def screen_blocks(spec, runner, files):
         signed = spec.SignedBeaconBlock.decode_bytes(snappy.decompress(files[f"blocks_{i}.ssz_snappy"]))
         body = signed.message.body
         reached = operations if complete or i + 1 < meta["blocks_count"] else final_candidates
+        reached["nonzero_bids"] += int(body.signed_execution_payload_bid.message.value > 0)
         reached["parent_execution_payload"] += 1
         reached["execution_payload_bid"] += 1
         reached["ordinary_attestations"] += len(body.attestations)

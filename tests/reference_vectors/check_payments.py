@@ -17,6 +17,7 @@ import snappy
 
 from inventory import inventory
 from screen import screen_cases, screen_blocks, screen_state
+from payment_histories import replay_history, equal_amount_history
 from boundary_checks import additional_checks
 from claim_sources import source_manifest
 from static_ssz import check_archive, check_codec_controls
@@ -501,6 +502,7 @@ def main():
         lib = compile_bridge(Path(tmp))
         report["ssz_controls"] = check_codec_controls(lib)
         report["supplemental_checks"] = {}
+        report["generated_payment_histories"] = {}
         for preset in ("minimal", "mainnet"):
             spec = importlib.import_module(f"eth_consensus_specs.gloas.{preset}")
             revision = subprocess.check_output(["git", "rev-parse", "HEAD"],
@@ -534,7 +536,16 @@ def main():
                 if runner in {"operations", "fork"}:
                     results[name] = screen_state(lib, spec, name, case, replay, queues)
                 else:
-                    results[name] = screen_blocks(spec, runner, case)
+                    row = screen_blocks(spec, runner, case)
+                    ops = row["gloas_operations_in_valid_blocks"]
+                    if row["official_acceptance"] and ops.get("nonzero_bids", 0) and ops["execution_payload_bid"] >= 2:
+                        if runner == "transition":
+                            raise ValueError("new cross-fork paid history needs a pre-fork decoder")
+                        row = replay_history(lib, spec, case, sys.modules[__name__])
+                        if name.endswith("/builder_payment_after_missed_epochs"):
+                            report["generated_payment_histories"][preset] = equal_amount_history(
+                                lib, spec, case["pre.ssz_snappy"], sys.modules[__name__])
+                    results[name] = row
             for name, case in read_cases(args.archives / f"{preset}.tar.gz", selected).items():
                 try:
                     results[name] = check_case(lib, spec, name, case)
