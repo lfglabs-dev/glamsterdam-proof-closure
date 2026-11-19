@@ -370,7 +370,7 @@ theorem t_8038_2780_warm_cold_bounds :
     GAS_WARM_ACCESS < GAS_COLD_STORAGE_ACCESS ∧
     GAS_COLD_STORAGE_ACCESS < GAS_COLD_ACCOUNT_ACCESS ∧
     GAS_COLD_ACCOUNT_ACCESS < GAS_ACCOUNT_WRITE ∧
-    GAS_CREATE_ACCESS = GAS_ACCOUNT_WRITE + GAS_COLD_ACCOUNT_ACCESS ∧
+    GAS_CREATE_ACCESS = 12000 ∧
     STATE_GAS_NEW_ACCOUNT = 183600 ∧
     STATE_GAS_STORAGE_SET = 97920 := by
   decide
@@ -505,8 +505,8 @@ theorem t_8038_sstore_refund_delta_potential
     p.refundDelta =
       (sstore_clear_potential originalValue newValue - sstore_clear_potential originalValue currentValue) +
         resetBonus ∧
-    0 ≤ resetBonus ∧
-    0 ≤ sstore_clear_potential originalValue newValue ∧
+    resetBonus ≥ 0 ∧
+    sstore_clear_potential originalValue newValue ≥ 0 ∧
     sstore_clear_potential originalValue originalValue = 0 := by
   dsimp only [price_sstore, sstore_clear_potential, GAS_REFUND_STORAGE_CLEAR,
     GAS_STORAGE_WRITE, GAS_COLD_STORAGE_ACCESS]

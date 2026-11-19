@@ -9,17 +9,80 @@ jobs:
   prove:
     name: Verify Lean 4.31 Proofs & Audit Metadata (turbo-lean)
     runs-on: ubuntu-latest
+    env:
+      TURBO_REV: 718321581836ec27ff41814c1bd62f2085670e7d
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Verify Lean 4.31 proofs with turbo-lean
-        uses: Th0rgal/turbo-lean@main
         with:
-          project-dir: "."
-          command: ${{ github.event_name == 'pull_request' && 'pr-verify' || 'ci-verify' }}
-          mode: "auto"
-          receipt-path: "/tmp/glamsterdam-receipt.json"
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Lean toolchains for the project and verifier
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y elan bubblewrap
+          python3 -m pip install PyYAML pytest
+          elan toolchain install "$(cat lean-toolchain)"
+          elan toolchain install leanprover/lean4:v4.35.0
+          lake build
+
+      - name: Cache the pinned verifier binary
+        id: verifier
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: ${{ runner.temp }}/verifier-bin
+          key: verifier-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.TURBO_REV }}
+
+      - name: Check out the verifier on a cache miss
+        if: steps.verifier.outputs.cache-hit != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: Th0rgal/turbo-lean
+          ref: ${{ env.TURBO_REV }}
+          path: .ci-verifier
+          persist-credentials: false
+
+      - name: Build the verifier on a cache miss
+        if: steps.verifier.outputs.cache-hit != 'true'
+        run: |
+          mv .ci-verifier "$RUNNER_TEMP/verifier-src"
+          cd "$RUNNER_TEMP/verifier-src"
+          cargo build --locked --release --bin turbo-lean
+          install -D target/release/turbo-lean "$RUNNER_TEMP/verifier-bin/turbo-lean"
+
+      - name: Select the verifier
+        run: echo "$RUNNER_TEMP/verifier-bin" >> "$GITHUB_PATH"
+
+      - name: Restore compatible verification artifacts
+        id: proofs
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: ${{ runner.temp }}/glamsterdam.tlpack
+          key: proofs-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.TURBO_REV }}-${{ hashFiles('lean-toolchain', 'lakefile.lean', 'lake-manifest.json') }}-${{ github.sha }}
+          restore-keys: |
+            proofs-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.TURBO_REV }}-${{ hashFiles('lean-toolchain', 'lakefile.lean', 'lake-manifest.json') }}-
+
+      - name: Import cached verification artifacts
+        if: steps.proofs.outputs.cache-matched-key != ''
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            turbo-lean --json import "$RUNNER_TEMP/glamsterdam.tlpack" --trust-domain untrusted
+          else
+            turbo-lean --json import "$RUNNER_TEMP/glamsterdam.tlpack" --allow-unattested-trusted
+          fi
+
+      - name: Verify the Glamsterdam Lean library
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          # The audit directory also contains excerpts from a separate Lean package.
+          args=(--project-dir . --exclude 'audit/evm-gas-semantics-lean-phase2/**' --receipt /tmp/glamsterdam-receipt.json)
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            turbo-lean --json pr-verify --mode untrusted --base "$BASE_SHA" "${args[@]}"
+          else
+            turbo-lean --json ci-verify --mode trusted "${args[@]}"
+          fi
 
       - name: Run turbo-lean spec audit on all audit domains
         run: |
@@ -28,5 +91,16 @@ jobs:
           turbo-lean --json audit-spec Glamsterdam/Gas/Spec.lean
           turbo-lean --json audit-spec Glamsterdam/Gloas7732/Spec.lean
 
-      - name: Verify audit metadata and source-map pinning
-        run: python3 scripts/audit_metadata.py
+      - name: Verify differential tests, audit metadata and source pins
+        run: make diff-test audit-check
+
+      - name: Export the verified main cache
+        if: github.event_name == 'push' && steps.proofs.outputs.cache-hit != 'true'
+        run: turbo-lean --json export -o "$RUNNER_TEMP/glamsterdam.tlpack"
+
+      - name: Share the verified main cache with subsequent PRs
+        if: github.event_name == 'push' && steps.proofs.outputs.cache-hit != 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: ${{ runner.temp }}/glamsterdam.tlpack
+          key: ${{ steps.proofs.outputs.cache-primary-key }}

@@ -30,6 +30,7 @@ turbo-verify: prove
 	fi
 
 diff-test: prove
+	@lake build Glamsterdam # Restore generated C after turbo-verify rebuilds the Lean modules.
 	@python3 tests/differential/test_glamsterdam_differential.py
 	@pytest tests/ -v
 
