@@ -1,4 +1,6 @@
 """Additional differential and mutation checks, outside the official denominator."""
+from unittest.mock import patch
+
 import snappy
 
 
@@ -49,15 +51,19 @@ def additional_checks(lib, spec, name, files, replay, queues, apply_output, chec
                 check_parent(lib, spec, files, decode, start, data)
             else:
                 start = pre.model_copy(deep=True)
-            for _ in range(2):
-                data = dict(queues(start), handler="builder_pending_payments", slot=int(start.slot),
+            def rotate_with_lean(state):
+                data = dict(queues(state), handler="builder_pending_payments", slot=int(state.slot),
                             slotsPerEpoch=int(spec.SLOTS_PER_EPOCH), increment=int(spec.EFFECTIVE_BALANCE_INCREMENT),
                             validators=[dict(activationEpoch=int(v.activation_epoch), exitEpoch=int(v.exit_epoch),
-                                             effectiveBalance=int(v.effective_balance)) for v in start.validators])
-                result = replay(lib, data)
-                apply_output(spec, start, "builder_pending_payments", result)
-                spec.process_builder_pending_payments(ref)
+                                             effectiveBalance=int(v.effective_balance)) for v in state.validators])
+                apply_output(spec, state, "builder_pending_payments", replay(lib, data))
+            for _ in range(2):
+                boundary = spec.Slot((int(ref.slot) // int(spec.SLOTS_PER_EPOCH) + 1) * int(spec.SLOTS_PER_EPOCH))
+                spec.process_slots(ref, boundary)
+                with patch.object(spec, "process_builder_pending_payments", side_effect=rotate_with_lean) as rotate:
+                    spec.process_slots(start, boundary)
+                    rotate.assert_called_once()
                 if start.encode_bytes() != ref.encode_bytes():
-                    raise ValueError("payment queue rotation differs after confirmation or quorum processing")
-            controls.append(f"two queue rotations after {'confirmed' if confirmed else 'unconfirmed'} parent")
+                    raise ValueError(f"divergence at epoch boundary {boundary} after parent confirmation={confirmed}")
+            controls.append(f"two complete epoch rollovers after {'confirmed' if confirmed else 'unconfirmed'} parent")
     return controls
