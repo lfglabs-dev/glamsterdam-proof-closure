@@ -1,5 +1,6 @@
 import Lean.Data.Json
 import Glamsterdam.Gloas7732.BuilderRequests
+import Glamsterdam.Gloas7732.PayloadAttestation
 
 open Lean Glamsterdam.Gloas7732.Spec
 
@@ -35,6 +36,20 @@ private def applyCase (json : Json) : Except String Json := do
     let (first, second, withdrawals) := process_builder_pending_payments quorum
       (i.payments.take i.slotsPerEpoch) (i.payments.drop i.slotsPerEpoch) i.withdrawals
     return Json.mkObj [("payments", toJson (first ++ second)), ("withdrawals", toJson withdrawals)]
+  if i.handler == "payload_attestation" then
+    let attestedSlot ← json.getObjValAs? Nat "attestedSlot"
+    let indices := Glamsterdam.Gloas7732.payloadAttesters i.slot attestedSlot i.slotsPerEpoch
+      (← json.getObjValAs? Nat "gloasEpoch") (← json.getObjValAs? Nat "parentRoot")
+      (← json.getObjValAs? Nat "attestedRoot") (← json.getObjValAs? (Array (Array Nat)) "window")
+      (← json.getObjValAs? (Array Bool) "bits")
+    let some signers := indices | return Json.mkObj [("accepted", toJson false)]
+    if let some result ← json.getObjValAs? (Option Bool) "verifiedSignature" then
+      return Json.mkObj [("accepted", toJson result)]
+    let keys ← json.getObjValAs? (Array Nat) "pubkeys"
+    let some pubkeys := signers.mapM (fun index => keys[index]?) | throw "PTC index outside registry"
+    let forkEpoch ← json.getObjValAs? Nat "forkEpoch"
+    let versionField := if attestedSlot / i.slotsPerEpoch < forkEpoch then "previousVersion" else "currentVersion"
+    return Json.mkObj [("signers", toJson pubkeys), ("version", ← json.getObjVal? versionField)]
   let builders ← json.getObjValAs? (List Builder) "builders"
   let pubkey ← json.getObjValAs? Nat "pubkey"
   let delay ← json.getObjValAs? Nat "delay"
