@@ -397,7 +397,7 @@ guarantees:
     file: "Glamsterdam/Gas/Eip12582.lean"
     theorem: "t_12582_fixed_budget_empty_reservoir"
     status: "CHECKED"
-    statement: "A 50000-gas child with empty reservoir cannot pay the normative fresh-slot state charge."
+    statement: "A 50000-gas child enters successfully and its warm fresh-slot write fails with an empty reservoir and succeeds with a funded reservoir."
   - id: "T-7732-MAINNET-RING-ALIAS"
     domain: "EIP-7732"
     file: "Glamsterdam/Gloas7732/Spec.lean"

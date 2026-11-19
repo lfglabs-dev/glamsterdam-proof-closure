@@ -805,6 +805,23 @@ theorem t_12582_prop3b_untrusted_callee_reservoir_drain_bound
 /-! ## 6. Property 4: `revert` vs `SSTORE 1 -> 0` Asymmetry on `state_gas_drawn`,
 Clean-Trace Monotonicity, and Nethermind `#15187`'s 6 Regression Scenarios -/
 
+/-- Run the warm fresh-slot write through #12582 frame entry and both gas charges,
+holding the parent's execution gas and the child's grant fixed. -/
+def fixed_budget_fresh_write (reservoir : Nat) : Option D13AMeter := do
+  let (child, _) ← enter_child_d13a .d13a_normative .call (init_top_meter 100000 reservoir) 50000 50000
+  let afterExec ← charge_exec_d13a child (GAS_WARM_ACCESS + GAS_STORAGE_WRITE)
+  charge_state_d13a afterExec STATE_GAS_STORAGE_SET LEGACY_SHARE_STORAGE_SET
+
+/-- INV-4 under the normative allowance proposal. A child receives 50,000 gas
+from a parent with an empty reservoir. Frame entry succeeds, but the first
+warm write of a fresh slot fails. Funding the reservoir makes the identical
+write succeed. The allowance is a ceiling on available funds. -/
+theorem t_12582_fixed_budget_empty_reservoir :
+    (enter_child_d13a .d13a_normative .call (init_top_meter 100000 0) 50000 50000).isSome = true ∧
+    fixed_budget_fresh_write 0 = none ∧
+    (fixed_budget_fresh_write STATE_GAS_STORAGE_SET).isSome = true := by
+  decide
+
 /-- Execute `k` iterations of a warm `SSTORE 0 -> 1` followed by `SSTORE 1 -> 0` in the same frame
 (`10,100` exec gas + `97,920` state gas with `10,000` legacy share, then `100` exec gas + `97,920`
 refill). -/
@@ -822,22 +839,6 @@ def run_sstore_set_clear_loop (m : D13AMeter) : Nat → Option D13AMeter
         | some m3 =>
           let m4 := refill_state_d13a m3 STATE_GAS_STORAGE_SET
           run_sstore_set_clear_loop m4 n
-
-/-- INV-4 under the normative allowance proposal. A child receives 50,000 gas
-from a parent with an empty reservoir. Frame entry succeeds, but the first
-warm write of a fresh slot fails. Funding the reservoir makes the identical
-write succeed. The allowance is a ceiling on available funds. -/
-theorem t_12582_fixed_budget_empty_reservoir :
-    let childWithReservoir := fun reservoir =>
-      enter_child_d13a .d13a_normative .call (init_top_meter 100000 reservoir) 50000 50000
-    let freshWarmWrite : Nat → Option D13AMeter := fun reservoir => do
-      let (child, _) ← childWithReservoir reservoir
-      let afterExec ← charge_exec_d13a child (GAS_WARM_ACCESS + GAS_STORAGE_WRITE)
-      charge_state_d13a afterExec STATE_GAS_STORAGE_SET LEGACY_SHARE_STORAGE_SET
-    (childWithReservoir 0).isSome = true ∧
-    freshWarmWrite 0 = none ∧
-    (freshWarmWrite STATE_GAS_STORAGE_SET).isSome = true := by
-  decide
 
 /-- Two concrete #12582 traces distinguish a storage refill from a revert.
 After one set/clear cycle the prepared child has exhausted its allowance.
