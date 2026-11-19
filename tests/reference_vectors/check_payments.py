@@ -15,6 +15,7 @@ from pathlib import Path
 import snappy
 
 from inventory import inventory
+from static_ssz import check_archive, check_codec_controls
 
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
@@ -31,12 +32,15 @@ def compile_bridge(directory):
     generated = directory / "PaymentVectors.c"
     subprocess.run(["lake", "env", "lean", "-c", generated, "tests/reference_vectors/PaymentVectors.lean"],
                    cwd=ROOT, check=True)
+    ssz_c = directory / "Ssz.c"
+    subprocess.run(["lake", "env", "lean", "-c", ssz_c, "tests/reference_vectors/Ssz.lean"],
+                   cwd=ROOT, check=True)
     prefix = Path(subprocess.check_output(["lean", "--print-prefix"], text=True).strip())
     runtime = prefix / "lib/lean"
     ir = ROOT / ".lake/build/ir/Glamsterdam"
     so = directory / "payments.so"
     subprocess.run(["cc", "-O2", "-fPIC", "-shared", f"-I{prefix / 'include'}",
-                    HERE / "bridge.c", generated, ir / "Common/Prelude.c", ir / "Common/MetaSpec.c",
+                    HERE / "bridge.c", HERE / "ssz_bridge.c", ssz_c, generated, ir / "Common/Prelude.c", ir / "Common/MetaSpec.c",
                     ir / "Gloas7732/Spec.c", ir / "Gloas7732/BuilderRequests.c", f"-L{runtime}", "-lleanshared",
                     f"-Wl,-rpath,{runtime}", "-o", so], check=True)
     lib = ctypes.CDLL(str(so))
@@ -44,6 +48,12 @@ def compile_bridge(directory):
     lib.initialize_vectors.restype = ctypes.c_int
     if lib.initialize_vectors():
         raise RuntimeError("Lean initialization failed")
+    lib.initialize_ssz_vectors.argtypes = []
+    lib.initialize_ssz_vectors.restype = ctypes.c_int
+    if lib.initialize_ssz_vectors():
+        raise RuntimeError("Lean SSZ initialization failed")
+    lib.ssz_vector_root.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t]
+    lib.ssz_vector_root.restype = ctypes.c_void_p
     lib.replay_vectors.argtypes = [ctypes.c_char_p]
     lib.replay_vectors.restype = ctypes.c_void_p
     lib.release_output.argtypes = [ctypes.c_void_p]
@@ -217,6 +227,7 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         sources, report["gloas_python_only"] = collect_sources(Path(tmp))
         lib = compile_bridge(Path(tmp))
+        report["ssz_controls"] = check_codec_controls(lib)
         for preset in ("minimal", "mainnet"):
             spec = importlib.import_module(f"eth_consensus_specs.gloas.{preset}")
             revision = subprocess.check_output(["git", "rev-parse", "HEAD"],
@@ -224,16 +235,20 @@ def main():
             if revision != SPEC:
                 raise ValueError(f"{preset}: unexpected PySpec revision {revision}")
             selected = []
+            static = set()
             for name, scope in cases.items():
                 config, _, runner, handler, _, _ = name.split("/")
                 if config != preset:
                     continue
                 if scope == "compliance":
                     results[name] = {"status": "separate_compliance"}
+                elif runner == "ssz_static":
+                    static.add(name)
                 elif f"{runner}/{handler}" in HANDLERS:
                     selected.append(name)
                 else:
                     results[name] = {"status": "unsupported", "dependency": DEPENDENCIES[runner]}
+            check_archive(lib, spec, args.archives / f"{preset}.tar.gz", static, results)
             for name, case in read_cases(args.archives / f"{preset}.tar.gz", selected).items():
                 try:
                     results[name] = check_case(lib, spec, name, case)
