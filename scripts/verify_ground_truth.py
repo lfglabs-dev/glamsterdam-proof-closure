@@ -3,10 +3,10 @@ r"""
 Mechanical Ground-Truth Verifier (`verify_ground_truth.py`) for `glamsterdam-proof-closure`.
 
 Performs 6 structural & mechanical verification passes:
-1. Canonical 23-file SHA-256 manifest verification (`vendor/upstreams/SHA256SUMS`):
+1. Canonical 24-file SHA-256 manifest verification (`vendor/upstreams/SHA256SUMS`):
    - Validates line format (`<64-hex> <rel_path>`), rejects absolute paths, `..` traversal,
      symlinks, non-regular files, and paths resolving outside `vendor/upstreams/`.
-   - Enforces canonical-path uniqueness, exact cardinality (23 unique canonical files),
+   - Enforces canonical-path uniqueness, exact cardinality (24 unique canonical files),
      zero unlisted files in `vendor/upstreams/`, and exact SHA-256 match.
 2. Remediation Ledger validation (`audit/remediation-ledger.yaml`):
    - Validates schema, step assignments, canonical vendored upstream files and line ranges,
@@ -46,7 +46,7 @@ import yaml
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent.resolve()
 VENDOR_DIR = (ROOT / "vendor" / "upstreams").resolve()
-EXPECTED_VENDOR_FILE_COUNT = 23
+EXPECTED_VENDOR_FILE_COUNT = 24
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 LEAN_SYMBOL_RE = re.compile(r"^Glamsterdam(?:\.[A-Za-z0-9_]+){2,}$")
 EXPECTED_LEDGER_IDS = [

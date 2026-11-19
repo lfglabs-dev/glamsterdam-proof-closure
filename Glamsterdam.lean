@@ -6,4 +6,5 @@ import Glamsterdam.Gas.Spec
 import Glamsterdam.Gas.CallTree
 import Glamsterdam.Gas.Eip12582
 import Glamsterdam.Gloas7732.Spec
+import Glamsterdam.Eip8483.Spec
 import Glamsterdam.TestVectors
