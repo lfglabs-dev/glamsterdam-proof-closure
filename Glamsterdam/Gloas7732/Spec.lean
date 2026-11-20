@@ -237,11 +237,12 @@ theorem fresh_bid_across_two_empty_epochs (bid : BuilderPendingWithdrawal)
   simp [process_builder_pending_payments, paymentForBid, appendOlderBid, hbid,
     Nat.not_le_of_lt hfirst, Nat.not_le_of_lt hsecond]
 
-/-- T-7732-SINGLE-SETTLEMENT: Across all four `ChildConfirmationTiming` cases (`notConfirmed`,
-`confirmedSameEpoch`, `confirmedNextEpoch`, `confirmedAfterTwoEpochs`), every committed builder bid
-(`bidValue`) is settled at most once across `apply_parent_execution_payload` and
-`process_builder_pending_payments`: for any `quorum > 0`, the total withdrawal amount queued is at
-most `bidValue` (never double-settled as `2 * bidValue`). -/
+/-- **Single settlement (T-7732-SINGLE-SETTLEMENT)**
+
+*Natural property.* A committed bid can queue at most its value, across the confirmation and quorum paths of the modeled lifecycle.
+
+*Formal statement.* For any positive quorum and any of the four confirmation timings, the sum of withdrawal amounts produced by one bid is at most `bidValue`.
+-/
 theorem t_7732_single_settlement
     (feeRecipient bidValue builderIdx proposerIdx attestedWeight quorum : Nat)
     (timing : ChildConfirmationTiming)
@@ -255,10 +256,12 @@ theorem t_7732_single_settlement
   cases timing <;> by_cases h_bid : bidValue > 0 <;> simp [h_bid, h_q0]
   by_cases h_wt : attestedWeight ≥ quorum <;> simp [h_wt]
 
-/-- T-7732-PAYMENT-GUARANTEE (Potuz Property 2): If a committed bid has `bidValue > 0` and
-`quorum > 0`, and the block's payload is either confirmed by the child block (`timing ≠ .notConfirmed`)
-or attested up to the payment quorum (`attestedWeight ≥ quorum`), the proposer's `feeRecipient`
-is guaranteed to receive the exact `BuilderPendingWithdrawal` of `amount = bidValue`. -/
+/-- **Proposer payment guarantee (T-7732-PAYMENT-GUARANTEE)**
+
+*Natural property.* Child confirmation or sufficient ordinary beacon attestation weight queues the full bid for the designated fee recipient.
+
+*Formal statement.* For a positive bid and positive quorum, if the child confirms or `attestedWeight ≥ quorum`, the lifecycle returns exactly `[⟨feeRecipient, bidValue, builderIdx⟩]`. This is a pending withdrawal.
+-/
 theorem t_7732_payment_guarantee
     (feeRecipient bidValue builderIdx proposerIdx attestedWeight quorum : Nat)
     (timing : ChildConfirmationTiming)
@@ -299,8 +302,12 @@ def can_builder_cover_bid (builderBalance pendingToWithdraw bidAmount : Nat) : B
   if builderBalance < minBalance then false
   else decide (builderBalance - minBalance ≥ bidAmount)
 
-/-- T-7732-BUILDER-SOLVENCY: `can_builder_cover_bid = true` guarantees that the builder's
-balance covers `MIN_DEPOSIT_AMOUNT` plus all pending withdrawals/payments plus `bidAmount`. -/
+/-- **Builder solvency at bid admission (T-7732-BUILDER-SOLVENCY)**
+
+*Natural property.* A builder whose bid passes the coverage check can cover the bid, its pending obligations and the minimum deposit.
+
+*Formal statement.* If `can_builder_cover_bid builderBalance pendingToWithdraw bidAmount = true`, then `builderBalance ≥ MIN_DEPOSIT_AMOUNT + pendingToWithdraw + bidAmount`. Equality suffices.
+-/
 theorem t_7732_builder_solvency (builderBalance pendingToWithdraw bidAmount : Nat)
     (h : can_builder_cover_bid builderBalance pendingToWithdraw bidAmount = true) :
     builderBalance ≥ MIN_DEPOSIT_AMOUNT + pendingToWithdraw + bidAmount := by
@@ -321,14 +328,12 @@ theorem t_7732_builder_withdrawal_no_underflow (builderBalance withdrawn : Nat)
   unfold saturatingSub
   split <;> omega
 
-/-- T-7732-NO-ETH-MINTING (Potuz Property 1 — Supply Neutrality of Builder Bids):
-For any committed builder bid validated by `can_builder_cover_bid` (`beacon-chain.md:1184-1193`,
-`2179`) and settled through `settle_slot_bid_lifecycle` (`apply_parent_execution_payload` /
-`process_builder_pending_payments`) and `apply_withdrawals` (`beacon-chain.md:1997-2007`),
-the builder's post-withdrawal Beacon Chain balance plus the execution-layer withdrawal credited
-to `feeRecipient` equals the builder's pre-settlement balance (`postBuilderBalance + settled =
-builderBalance`), and the builder's remaining balance stays at or above `MIN_DEPOSIT_AMOUNT +
-pendingToWithdraw`. Thus builder bids never mint or destroy ETH across CL + EL. -/
+/-- **Supply neutrality for one builder bid (T-7732-NO-ETH-MINTING)**
+
+*Natural property.* The modeled builder debit exactly accounts for the amount queued for withdrawal. Within that accounting, no ETH is created or lost.
+
+*Formal statement.* Given bid coverage and a positive quorum, `postBuilderBalance + settled = builderBalance` and `postBuilderBalance ≥ MIN_DEPOSIT_AMOUNT + pendingToWithdraw`. Here `settled` sums the queued withdrawal amounts. Recipient balances and unrelated accounts are outside this statement.
+-/
 theorem t_7732_no_eth_minting
     (builderBalance pendingToWithdraw feeRecipient bidValue builderIdx proposerIdx
       attestedWeight quorum : Nat)
@@ -358,9 +363,12 @@ def is_active_builder (b : Builder) (finalizedEpoch : Nat) : Bool :=
 def can_builder_exit (isActive : Bool) (pendingToWithdraw : Nat) : Bool :=
   isActive && decide (pendingToWithdraw = 0)
 
-/-- T-7732-EXIT-SAFETY: `process_builder_exit_request` (`beacon-chain.md:2368-2384`) only initiates
-a builder exit when `pendingToWithdraw = 0`, preventing an exiting builder from defaulting on
-pending bids. -/
+/-- **Builder exit safety (T-7732-EXIT-SAFETY)**
+
+*Natural property.* A builder must be active and have no outstanding payment obligations to pass the exit-initiation check.
+
+*Formal statement.* If `can_builder_exit isActive pendingToWithdraw = true`, then `isActive = true ∧ pendingToWithdraw = 0`. The subsequent withdrawal of the stake is a separate operation.
+-/
 theorem t_7732_exit_safety (isActive : Bool) (pendingToWithdraw : Nat)
     (h : can_builder_exit isActive pendingToWithdraw = true) :
     isActive = true ∧ pendingToWithdraw = 0 := by
@@ -398,8 +406,12 @@ def accrue_attester_weight_trace
         st)
     (alreadyParticipated, currentWeight)
 
-/-- T-7732-QUORUM-NO-DOUBLE-COUNT: Two attestations from the same validator within the same epoch
-add `effectiveBalance` to `payment.weight` at most once (`beacon-chain.md:2447-2467`). -/
+/-- **Attestation weight counted once (T-7732-QUORUM-NO-DOUBLE-COUNT)**
+
+*Natural property.* Two weight updates for the same validator within one epoch contribute its effective balance once to the builder payment quorum.
+
+*Formal statement.* Starting with no prior participation and weight `w`, the first call to `accrue_attester_weight` sets the participation flag. The second uses that flag, so the final weight is `w + eb`.
+-/
 theorem t_7732_quorum_no_double_count (w eb : Nat) :
     let (flag1, w1) := accrue_attester_weight false w eb
     let (_, w2) := accrue_attester_weight flag1 w1 eb
@@ -455,17 +467,12 @@ take effect). -/
 def is_canonical_full_slot_payload (committedBidBlockHash : Nat) (candidate : SlotCandidatePayload) : Bool :=
   candidate.blockHash == committedBidBlockHash
 
-/-- T-7732-SAME-SLOT-UNBUNDLING (Potuz Property 3 — Same-Slot Unbundling Resistance):
-Suppose at slot `N`:
-1. The unique consensus block at slot `N` commits via `process_execution_payload_bid`
-   (`beacon-chain.md:2215`) to the builder's bid hash `committedBidBlockHash = builderPayload.blockHash`.
-2. `block_hash` is collision-resistant across candidate payloads at slot `N`
-   (`candidate.blockHash = builderPayload.blockHash → candidate = builderPayload`).
-Then for any candidate execution payload `candidate` that becomes canonical at slot `N`
-(`is_canonical_full_slot_payload committedBidBlockHash candidate = true`) and includes a private
-transaction `txPriv` (`txPriv ∈ candidate.transactions`), `candidate` is necessarily the builder's
-own committed payload (`candidate = builderPayload ∧ txPriv ∈ builderPayload.transactions`). No
-other canonical block at slot `N` can unbundle and include `txPriv`. -/
+/-- **Same-slot unbundling at the consensus boundary (T-7732-SAME-SLOT-UNBUNDLING)**
+
+*Natural property.* A candidate containing the transaction and matching the committed block hash must be the builder’s payload, assuming that hash identifies it uniquely among the candidates.
+
+*Formal statement.* Given the bid commitment, the hash-uniqueness premise, a matching candidate and `txPriv ∈ candidate.transactions`, the conclusion is `candidate = builderPayload ∧ txPriv ∈ builderPayload.transactions`. The model tracks transaction inclusion; it does not track who knew the transaction before reveal, gossip leakage or fork choice.
+-/
 theorem t_7732_same_slot_unbundling
     (committedBidBlockHash txPriv : Nat)
     (builderPayload candidate : SlotCandidatePayload)
@@ -556,9 +563,12 @@ def apply_parent_payment_patched (s : GloasParentPaymentState) : GloasParentPaym
   else
     { s with latestBidValue := bidValue }
 
-/-- T-7732-SLASHED-NO-RESURRECTION: On the patched specification, if `parentProposerSlashed = true`,
-`apply_parent_execution_payload` never appends a `BuilderPendingWithdrawal` regardless of how
-many epochs elapsed between the parent block and the child block. -/
+/-- **Slashed proposer payment revocation under the proposed fix (#5754) (T-7732-SLASHED-NO-RESURRECTION)**
+
+*Natural property.* Processing the slashed parent’s bid adds no withdrawal, however many epochs elapsed before the child arrived.
+
+*Formal statement.* If `s.parentProposerSlashed = true`, then `(apply_parent_payment_patched s).pendingWithdrawals = s.pendingWithdrawals`. This preserves entries already in the queue and concerns one application of the patched transition.
+-/
 theorem t_7732_slashed_no_resurrection (s : GloasParentPaymentState)
     (h_slashed : s.parentProposerSlashed = true) :
     (apply_parent_payment_patched s).pendingWithdrawals = s.pendingWithdrawals := by
@@ -654,6 +664,12 @@ def eip7732_frame_invariant : FrameInvariant GloasParentPaymentState Bool Untouc
     dsimp only [process_parent_payload_if_full, apply_parent_payment_patched]
     repeat (first | rfl | split)
 
+/-- **Preservation of unrelated modeled state (T-7732-FRAME)**
+
+*Natural property.* Processing a sequence of full or empty parents preserves the three consensus roots represented in the payment model.
+
+*Formal statement.* Folding `process_parent_payload_if_full` over any list of steps preserves `s.untouchedCl`: the validator registry root, BLS-to-execution root and sync committee root. The full-parent step uses the patched payment abstraction.
+-/
 theorem t_7732_frame (s : GloasParentPaymentState) (steps : List Bool) :
     (steps.foldl (fun st isFull => process_parent_payload_if_full isFull st) s).untouchedCl =
       s.untouchedCl :=
