@@ -274,9 +274,12 @@ def exec_sstore_frame (sched : ForkSchedule) (fm : CallFrameMeter)
       | some fm2 =>
         frame_charge_state sched fm2 p.stateGasCost 0
 
-/-- Theorem (`t_calltree_sstore_sentry_excludes_reservoir`, see `src/ethereum/forks/amsterdam/vm/instructions/storage.py:100-105`):
-Whenever `fm.meter.gasLeft ≤ 2300` (such as inside a 2,300-stipend value call), `exec_sstore_frame`
-halts with `none` (`OutOfGasError`) under every schedule and for every reservoir size `fm.meter.stateGasLeft`. -/
+/--
+**SSTORE 2,300-gas sentry excludes the state-gas reservoir (T-CALLTREE-SSTORE-SENTRY-EXCLUDES-RESERVOIR)**
+- *Natural property:* Whenever a frame's execution `gasLeft` is at or below the `2,300` call stipend (`GAS_SSTORE_SENTRY`), `SSTORE` halts with `OutOfGasError` regardless of fork schedule or how much state gas sits in `stateGasLeft`.
+- *Formal statement:* `fm.meter.gasLeft ≤ GAS_SSTORE_SENTRY → exec_sstore_frame sched fm isCold origVal currVal newVal = none`.
+- *Scope note:* Single-step `exec_sstore_frame` across all eight `ForkSchedule` variants (`osaka`, `D0..D13S`), matching `src/ethereum/forks/amsterdam/vm/instructions/storage.py:100-105`.
+-/
 theorem t_calltree_sstore_sentry_excludes_reservoir
     (sched : ForkSchedule) (fm : CallFrameMeter) (isCold : Bool) (origVal currVal newVal : Nat)
     (h_sentry : fm.meter.gasLeft ≤ GAS_SSTORE_SENTRY) :
@@ -284,10 +287,12 @@ theorem t_calltree_sstore_sentry_excludes_reservoir
   unfold exec_sstore_frame
   simp [h_sentry]
 
-/-- Theorem (`t_calltree_a1_frame_bound`, see `src/ethereum/forks/amsterdam/vm/gas.py:379-616`):
-Within a single frame under `amsterdamD0`, every execution charge (`charge_gas_from_meter`),
-state charge (`charge_state_gas_from_meter`), and in-frame state-gas refill (`credit_state_gas_refund`)
-preserves the upper bound `post.gasLeft + post.stateGasSpilled ≤ m.gasLeft + m.stateGasSpilled`. -/
+/--
+**Single-frame upper bound on gasLeft + stateGasSpilled (T-CALLTREE-A1-FRAME-BOUND)**
+- *Natural property:* Within a single frame under normative Amsterdam (`D0`), execution charges and state charges never increase `gasLeft + stateGasSpilled`, and LIFO state-gas refills preserve `gasLeft + stateGasSpilled` exactly.
+- *Formal statement:* `post.gasLeft + post.stateGasSpilled ≤ m.gasLeft + m.stateGasSpilled` across `charge_gas_from_meter` and `charge_state_gas_from_meter`, and `(credit_state_gas_refund m amount).gasLeft + (credit_state_gas_refund m amount).stateGasSpilled = m.gasLeft + m.stateGasSpilled`.
+- *Scope note:* Intra-frame `GasMeter` transitions (`src/ethereum/forks/amsterdam/vm/gas.py:379-616`); cross-frame child merges can still increase parent `gasLeft` as proved in `t_calltree_e3_m4_sibling_underflow_and_d13s_break`.
+-/
 theorem t_calltree_a1_frame_bound (m post : GasMeter) (amount : Nat) :
     (charge_gas_from_meter m amount = some post →
       post.gasLeft + post.stateGasSpilled ≤ m.gasLeft + m.stateGasSpilled) ∧
@@ -323,12 +328,12 @@ theorem t_calltree_a1_frame_bound (m post : GasMeter) (amount : Nat) :
 
 /-! ## 3. Multi-Frame Trace Models & Refill-Variant Theorems (`E1`, `M2`, `M3`, `M4`, `D13R`, `D13S`) -/
 
-/-- Theorem 1 (`t_calltree_e1_fixed_grant_starvation`):
-When `stateGasLeft = 0` (`tx.gas ≤ 2^24`), a fixed-grant child frame with `gasLeft = 50000`
-(above the `2300` sentry) that writes one warm fresh storage slot (`0 -> 1`, costing `20,100` on
-Osaka and `10,100 + 97,920 = 108,020` on Amsterdam) succeeds on `osaka` (`gasLeft = 29,900`) and
-deterministically runs out of gas (`none`) on EVERY Amsterdam refill variant (`D0`, `D1`, `D3`,
-`D4`, `D13`, `D13R`, `D13S`). -/
+/--
+**Fixed 50,000-gas child starvation on fresh SSTORE when reservoir is empty (T-CALLTREE-E1-FIXED-GRANT-STARVATION)**
+- *Natural property:* With an empty reservoir (`tx.gas ≤ 2^24`), a `50,000`-gas child frame writing one warm fresh storage slot (`0 -> 1`) succeeds under Osaka (`20,100` gas) but runs out of gas (`108,020` needed) under every Amsterdam refill variant (`D0` through `D13S`).
+- *Formal statement:* On `childInit := { meter := { gasLeft := 50000, stateGasLeft := 0, stateGasBaseline := 0 } }`, `(exec_sstore_frame .osaka childInit false 0 0 1).isSome = true` while `exec_sstore_frame sched childInit false 0 0 1 = none` for `D0, D1, D3, D4, D13, D13R, D13S`.
+- *Scope note:* Multi-schedule single-frame check at `stateGasLeft = 0` (`INV-4` fixed-budget pattern); `#12582` (`D13A`) with a non-empty reservoir is modeled in `Glamsterdam.Gas.Eip12582`.
+-/
 theorem t_calltree_e1_fixed_grant_starvation :
     let childInit : CallFrameMeter := { meter := { gasLeft := 50000, stateGasLeft := 0, stateGasBaseline := 0 } }
     (exec_sstore_frame .osaka childInit false 0 0 1).isSome = true ∧
@@ -404,21 +409,12 @@ def run_m2_set_call_clear_trace
               let fmTop := settle_top_frame sched fmDone
               ⟨true, cOk, fmTop.meter.gasLeft, fmTop.meter.stateGasLeft⟩
 
-/-- Theorem 2 (`t_calltree_e3_m2_dirty_clear_band_and_d13r_break`):
-On the `T2` (`M2` set-call-clear) trace model (`k = 3` slots, `entryGas = 550000`,
-`childExecNeed = 240000`, `postWorkExec = 50000`):
-1. Under `osaka`, the parent has `489,700` gas after setting the 3 slots, grants `482,049 ≥ 240,000`
-   to the child (`childSuccess = true`), and finishes with `outerSuccess = true`.
-2. Under `amsterdamD0`, setting the 3 slots spills `293,760` state gas from `gasLeft`, leaving only
-   `225,940` gas before the call; the child receives `222,410 < 240,000` and halts (`childSuccess = false`),
-   while clearing the 3 slots refills `293,760` into `gasLeft` so the parent's `50,000` post-call work
-   succeeds (`outerSuccess = true`).
-3. Under `amsterdamD1` and `amsterdamD13` (`flushCall = false`), the clear credits `stateGasLeft`
-   instead of `gasLeft`, so the parent only has `3,230 < 50,000` execution gas after the clear and
-   halts (`outerSuccess = false`).
-4. Under `amsterdamD13R` with a warm post-clear `STATICCALL` (`flushCall = true`, `T2f`), the flush
-   call triggers `repay_state_gas_spill` and moves `293,760` back into `gasLeft`, re-opening the
-   `outerSuccess = true ∧ childSuccess = false` outcome. -/
+/--
+**Set-call-clear silent child failure across Osaka, D0, D1/D13, and D13R (T-CALLTREE-E3-M2-DIRTY-CLEAR-AND-D13R-BREAK)**
+- *Natural property:* When a parent sets `3` fresh slots before `CALL(63/64)` and clears them afterward (`M2`/`T2`), `D0` starves the child yet refills `gasLeft` on clear so the parent finishes (`outerSuccess = true, childSuccess = false`); reservoir-only refills (`D1`, `D13`) close that silent-failure band, whereas `D13R` re-opens it whenever a post-clear subcall (`flushCall = true`) flushes the reservoir.
+- *Formal statement:* At `(550000, 3, 240000, 50000)`, `run_m2_set_call_clear_trace` returns `(true, true)` on `osaka`, `(true, false)` on `amsterdamD0`, `(false, false)` on `D1`, `D13`, and `D13R` without flush, and `(true, false)` on `D13R` with flush.
+- *Scope note:* Abstract two-frame `run_m2_set_call_clear_trace` trace at `stateGasLeft = 0`.
+-/
 theorem t_calltree_e3_m2_dirty_clear_band_and_d13r_break :
     let o := run_m2_set_call_clear_trace .osaka 550000 3 240000 50000 false
     let d0 := run_m2_set_call_clear_trace .amsterdamD0 550000 3 240000 50000 false
@@ -465,12 +461,12 @@ def run_t1_pre_call_set_clear_trace
           let fmTop := settle_top_frame sched fmDone
           ⟨true, cOk, fmTop.meter.gasLeft, fmTop.meter.stateGasLeft⟩
 
-/-- Theorem 2b (`t_calltree_d13r_introduces_new_t1_band`):
-At `entryGas = 170000`, `childExecNeed = 100000`, `postWorkExec = 50000`:
-- `amsterdamD0` succeeds in both child and parent (`outerSuccess = true ∧ childSuccess = true`).
-- `amsterdamD13R` starves the child (`childSuccess = false`) while the parent still succeeds
-  (`outerSuccess = true`) because `D13R` moves `97,920` into `gasLeft` upon the failed child's exit.
-- `amsterdamD13S` does not repay on failed child exit (`outerSuccess = false ∧ childSuccess = false`). -/
+/--
+**Pre-call set-and-clear silent child failure under D13R (T-CALLTREE-D13R-NEW-T1-BAND)**
+- *Natural property:* If a parent sets and clears a fresh slot (`0 -> 1 -> 0`) before `CALL(63/64)`, `D0` restores `97,920` to `gasLeft` before the call so both child and parent succeed, whereas `D13R` holds the refill in `stateGasLeft` across the call (starving the child) and flushes it into `gasLeft` upon the failed child's exit so the parent succeeds.
+- *Formal statement:* On `run_t1_pre_call_set_clear_trace _ 170000 100000 50000`, `amsterdamD0` returns `(true, true)`, `amsterdamD13R` returns `(true, false)`, and `amsterdamD13S` returns `(false, false)`.
+- *Scope note:* Abstract two-frame `T1` comparison trace across refill variants (`D0`, `D13R`, `D13S`).
+-/
 theorem t_calltree_d13r_introduces_new_t1_band :
     let d0 := run_t1_pre_call_set_clear_trace .amsterdamD0 170000 100000 50000
     let d13r := run_t1_pre_call_set_clear_trace .amsterdamD13R 170000 100000 50000
@@ -520,18 +516,12 @@ def run_m3_revert_restore_trace
           let fmTop := settle_top_frame sched fmDone
           ⟨true, false, fmTop.meter.gasLeft, fmTop.meter.stateGasLeft⟩
 
-/-- Theorem 3 (`t_calltree_e3_m3_revert_restore_catch_band`):
-When `entryGas = 400000`, `k = 3` slots (`293,760` state gas), `childOtherExec = 60000`, and
-`catchWorkExec = 50000`:
-- Under `amsterdamD0`, `amsterdamD1`, and `amsterdamD4`, `C` receives `393,750` (`6,250` withheld),
-  spends `30,300 + 60,000 = 90,300` execution gas, spills `293,760` state gas (leaving `9,690` in `C.gasLeft`),
-  and `REVERT`s; `restore_state_gas` returns `293,760` to `C.gasLeft`, so `P` has `6,250 + 9,690 + 293,760 = 309,700`
-  execution gas in the `catch` block and finishes `catchWorkExec = 50,000` with `finalGasLeft = 259,700`
-  (`outerSuccess = true`).
-- Under `amsterdamD3`, `amsterdamD13`, `amsterdamD13R`, and `amsterdamD13S`, `C`'s `293,760` spill
-  is deferred to end-of-transaction settlement (`deferredSpill = 293,760`), so `P` only has
-  `6,250 + 9,690 = 15,940 < 50,000` execution gas in the `catch` block (`finalGasLeft = 15940`,
-  `outerSuccess = false`). -/
+/--
+**Revert-restore catch-block funding across D0/D1/D4 vs. deferred-spill D3/D13/D13R/D13S (T-CALLTREE-E3-M3-REVERT-RESTORE-BAND)**
+- *Natural property:* When a child writes `3` fresh slots (`293,760` spilled state gas) and `REVERT`s, `D0`, `D1`, and `D4` return the spilled gas to `parent.gasLeft` (funding a `50,000`-gas `catch` block), whereas `D3`, `D13`, `D13R`, and `D13S` defer the reverted child's spill to transaction settlement so the `catch` block runs out of gas.
+- *Formal statement:* At `(400000, 3, 60000, 50000)`, `run_m3_revert_restore_trace` returns `⟨true, false, 259700, 0⟩` on `D0, D1, D4` and `⟨false, false, 15940, 0⟩` on `D3, D13, D13R, D13S`.
+- *Scope note:* Abstract two-frame `M3` revert-catch trace at `stateGasLeft = 0`.
+-/
 theorem t_calltree_e3_m3_revert_restore_catch_band :
     run_m3_revert_restore_trace .amsterdamD0 400000 3 60000 50000 = ⟨true, false, 259700, 0⟩ ∧
     run_m3_revert_restore_trace .amsterdamD1 400000 3 60000 50000 = ⟨true, false, 259700, 0⟩ ∧
@@ -582,12 +572,12 @@ def run_m4_sibling_delta_trace (sched : ForkSchedule) (entryGas c2Exec : Nat) : 
             let g2 := pAfterC2.meter.gasLeft
             some ⟨g1, g2, decide (g2 > g1)⟩
 
-/-- Theorem 4 (`t_calltree_e3_m4_sibling_underflow_and_d13s_break`):
-On the `M4` cross-sibling trace (`entryGas = 500000`, `c2Exec = 20000`):
-1. Under `osaka`, `amsterdamD1`, `amsterdamD4`, and `amsterdamD13`, `g2 ≤ g1` (`underflowPanic = false`).
-2. Under `amsterdamD0`, `amsterdamD3`, `amsterdamD13R`, **and `amsterdamD13S`**, Child 2's `1 -> 0`
-   clear yields `childExcess = 97,920 > 0`, which is moved into `P.gasLeft` upon Child 2's merge,
-   causing `g2 = 469,800 > g1 = 391,980` (`underflowPanic = true`). -/
+/--
+**Cross-sibling gasleft() rise and D13S regression on sibling clear (T-CALLTREE-E3-M4-SIBLING-AND-D13S-BREAK)**
+- *Natural property:* If Child 1 writes `0 -> 1` (leaving parent `stateGasSpilled = 97,920`) and sibling Child 2 clears `1 -> 0` while spending `20,000` execution gas, parent `gasLeft` after Child 2 (`g2 = 469,800`) exceeds parent `gasLeft` before Child 2 (`g1 = 391,980`) under `D0`, `D3`, `D13R`, and `D13S`, causing `g1 - g2` gas-delta checks to underflow.
+- *Formal statement:* On `run_m4_sibling_delta_trace _ 500000 20000`, `underflowPanic = false` (`g2 ≤ g1`) for `osaka, D1, D4, D13`, and `underflowPanic = true` (`g2 > g1`) for `D0, D3, D13R, D13S`.
+- *Scope note:* Three-frame (`Parent -> Child 1, Child 2`) `M4` regression trace; first of the three `D13S` comparison regressions.
+-/
 theorem t_calltree_e3_m4_sibling_underflow_and_d13s_break :
     (run_m4_sibling_delta_trace .osaka 500000 20000).map M4SiblingDeltaOutcome.underflowPanic = some false ∧
     (run_m4_sibling_delta_trace .amsterdamD1 500000 20000).map M4SiblingDeltaOutcome.underflowPanic = some false ∧
@@ -639,11 +629,12 @@ def run_t2_child_clear_trace
               let fmTop := settle_top_frame sched fmDone
               ⟨true, cOk, fmTop.meter.gasLeft, fmTop.meter.stateGasLeft⟩
 
-/-- Theorem 4b (`t_calltree_d13s_reopens_t2_on_child_clear`):
-When the 3 slots in `T2` are cleared by a helper subcall (`entryGas = 550000`, `k = 3`,
-`childExecNeed = 240000`, `postWorkExec = 50000`):
-- `amsterdamD1` and `amsterdamD13` remain safe (`outerSuccess = false ∧ childSuccess = false`).
-- `amsterdamD13S` re-opens the `outerSuccess = true ∧ childSuccess = false` band. -/
+/--
+**D13S regression: clearing slots in a helper subcall re-opens silent child failure (T-CALLTREE-D13S-REOPENS-T2-CHILD-CLEAR)**
+- *Natural property:* Under `D13S`, if a parent clears `3` previously set slots inside a helper subcall after the main child call OOGs, the helper exits with positive `childExcess = 293,760` and flushes that credit into `parent.gasLeft`, re-opening the `outerSuccess = true, childSuccess = false` silent-failure band that `D1` and `D13` close.
+- *Formal statement:* On `run_t2_child_clear_trace _ 550000 3 240000 50000`, `D1` and `D13` return `(false, false)` while `D13S` returns `(true, false)`.
+- *Scope note:* Three-frame (`Parent -> Child, Helper`) `T2_child_clear` regression trace; second of the three `D13S` comparison regressions.
+-/
 theorem t_calltree_d13s_reopens_t2_on_child_clear :
     let d1 := run_t2_child_clear_trace .amsterdamD1 550000 3 240000 50000
     let d13 := run_t2_child_clear_trace .amsterdamD13 550000 3 240000 50000
@@ -706,16 +697,12 @@ def run_t6_failed_create_trace (sched : ForkSchedule) (entryGas postCreateExec :
             | some fmAfterPost =>
               some (if applyTopExit then settle_top_frame sched fmAfterPost else fmAfterPost)
 
-/-- Theorem 4c (`t_calltree_d13s_failed_create_strands_gas`):
-On `entryGas = 1000000`, after a `CREATE` (`GAS_CREATE_ACCESS = 12,000`, `STATE_GAS_NEW_ACCOUNT = 183,600`)
-whose `init_code` immediately `REVERT`s (`0` gas spent in child) followed by a warm `STATICCALL` (`100` gas):
-1. Mid-frame (`postCreateExec = 0, applyTopExit = false`): `amsterdamD0` and `amsterdamD13R` have
-   `(gasLeft, stateGasLeft) = (987900, 0)`, whereas `amsterdamD13S` strands `183,600` in `stateGasLeft`
-   mid-frame (`(804300, 183600)`), which is only returned at `settle_top_frame` (`applyTopExit = true` -> `(987900, 0)`)
-   if the parent frame survives to top-exit without needing that gas.
-2. When the parent frame requires `postCreateExec = 850000` execution gas (`850,000 ∈ (804,300, 987,900]`)
-   after the `STATICCALL` (`applyTopExit = true`), `amsterdamD0` and `amsterdamD13R` succeed (`some (137900, 0)`),
-   whereas `amsterdamD13S` halts mid-frame with `OutOfGasError` (`none`) before `settle_top_frame` is reached! -/
+/--
+**D13S regression: failed CREATE strands 183,600 execution gas mid-frame (T-CALLTREE-D13S-FAILED-CREATE-STRANDS-GAS)**
+- *Natural property:* Because `generic_create` credits `183,600` `NEW_ACCOUNT` state gas back to the parent *after* `incorporate_child`, `D13S` parks that `183,600` in `stateGasLeft` alongside `stateGasSpilled = 183,600`; even a subsequent `STATICCALL` has `childExcess = 0` and cannot flush it, starving `850,000`-gas mid-frame parent work that succeeds under `D0` and `D13R`.
+- *Formal statement:* On `run_t6_failed_create_trace`, mid-frame `(gasLeft, stateGasLeft)` is `(987900, 0)` on `D0` and `D13R` vs `(804300, 183600)` on `D13S`, and with `postCreateExec = 850000`, `D0` and `D13R` finish at `some (137900, 0)` while `D13S` returns `none`.
+- *Scope note:* Gas-schedule projection of `generic_create` (`src/ethereum/forks/amsterdam/vm/instructions/system.py:107-180`); third of the three `D13S` comparison regressions.
+-/
 theorem t_calltree_d13s_failed_create_strands_gas :
     (run_t6_failed_create_trace .amsterdamD0 1000000 0 false).map (fun fm => (fm.meter.gasLeft, fm.meter.stateGasLeft)) =
       some (987900, 0) ∧
@@ -732,14 +719,12 @@ theorem t_calltree_d13s_failed_create_strands_gas :
     run_t6_failed_create_trace .amsterdamD13S 1000000 850000 true = none := by
   decide
 
-/-- Theorem 4d (`t_calltree_d13s_child_excess_repays_parent_spill_symbolic`):
-Universal symbolic (`∀`) characterization of `amsterdamD13S` vs `amsterdamD13` on cross-frame
-state-gas credits (`F-D13S-1` / `F-D13S-2` mechanism): for ANY parent frame `pWithheld` with drained
-reservoir (`stateGasLeft = 0`) and `refund ≤ pWithheld.meter.stateGasSpilled`, and ANY successful
-child frame `c` that entered with `stateGasBaseline = 0` and exits with `stateGasLeft = refund` and
-`stateGasSpilled = 0`, `exit_child_frame .amsterdamD13S` transfers `refund` into `gasLeft`
-(`pWithheld.meter.gasLeft + c.meter.gasLeft + refund`), whereas `amsterdamD13` keeps `gasLeft` at
-`pWithheld.meter.gasLeft + c.meter.gasLeft`. -/
+/--
+**Symbolic characterization of cross-frame spill repayment under D13S vs. D13**
+- *Natural property:* Whenever a parent frame has `stateGasLeft = 0` and `refund ≤ stateGasSpilled`, and a successful child enters with `stateGasBaseline = 0` and exits with `stateGasLeft = refund`, `D13S` flushes `refund` into `parent.gasLeft`, whereas `D13` keeps `gasLeft` at `pWithheld.gasLeft + c.gasLeft`.
+- *Formal statement:* Under those hypotheses, `(exit_child_frame .amsterdamD13S pWithheld c .success).meter.gasLeft = pWithheld.meter.gasLeft + c.meter.gasLeft + refund`, whereas `(exit_child_frame .amsterdamD13 pWithheld c .success).meter.gasLeft = pWithheld.meter.gasLeft + c.meter.gasLeft`.
+- *Scope note:* Universal symbolic mechanism underlying `t_calltree_e3_m4_sibling_underflow_and_d13s_break` and `t_calltree_d13s_reopens_t2_on_child_clear`.
+-/
 theorem t_calltree_d13s_child_excess_repays_parent_spill_symbolic
     (pWithheld c : CallFrameMeter) (refund : Nat)
     (hp_res : pWithheld.meter.stateGasLeft = 0)
@@ -757,16 +742,12 @@ theorem t_calltree_d13s_child_excess_repays_parent_spill_symbolic
   rw [hp_res, hc_base, hc_left, hc_spill]
   omega
 
-/-- Theorem 4e (`t_calltree_d13s_post_merge_refund_stranded_symbolic`):
-Universal symbolic (`∀`) characterization of `amsterdamD13S` on post-merge parent-frame state-gas
-refunds (`F-D13S-3` mechanism): for ANY parent frame `pAfterMerge` that receives
-`frame_credit_state_refund .amsterdamD13S pAfterMerge refund` after child merge (such as
-`credit_state_gas_refund` after `incorporate_child` in `generic_create`), and ANY subsequent
-subcall spawned via `enter_child_frame (frame_credit_state_refund .amsterdamD13S pAfterMerge refund) childCost childGas = some (sInit, pWithheld)`
-that exits cleanly at `sExit` with preserved baseline (`sExit.meter.stateGasBaseline = sInit.meter.stateGasBaseline`)
-and no net state-gas gain (`sExit.meter.stateGasLeft ≤ sInit.meter.stateGasBaseline`), `childExcess = 0`,
-so `exit_child_frame .amsterdamD13S pWithheld sExit .success` transfers `0` gas from `stateGasLeft`
-into `gasLeft` (`gasLeft = pWithheld.meter.gasLeft + sExit.meter.gasLeft`). -/
+/--
+**Symbolic characterization of stranded post-merge parent refunds under D13S**
+- *Natural property:* Under `D13S`, a state-gas refund credited to a parent *after* child merge raises `sInit.stateGasBaseline` on every subsequent subcall, so any subcall exiting without net state-gas gain has `childExcess = 0` and transfers `0` gas from `stateGasLeft` back to `gasLeft`.
+- *Formal statement:* Given `enter_child_frame (frame_credit_state_refund .amsterdamD13S pAfterMerge refund) childCost childGas = some (sInit, pWithheld)` and `sExit.meter.stateGasLeft ≤ sInit.meter.stateGasBaseline`, `(exit_child_frame .amsterdamD13S pWithheld sExit .success).meter.gasLeft = pWithheld.meter.gasLeft + sExit.meter.gasLeft`.
+- *Scope note:* Universal symbolic mechanism underlying `t_calltree_d13s_failed_create_strands_gas`.
+-/
 theorem t_calltree_d13s_post_merge_refund_stranded_symbolic
     (pAfterMerge sInit pWithheld sExit : CallFrameMeter) (refund childCost childGas : Nat)
     (h_enter : enter_child_frame (frame_credit_state_refund .amsterdamD13S pAfterMerge refund) childCost childGas =
@@ -786,19 +767,12 @@ theorem t_calltree_d13s_post_merge_refund_stranded_symbolic
     dsimp only [exit_child_frame, repay_state_gas_spill_capped] at *
     omega
 
-/-- Theorem 4f (`t_calltree_d0_preserves_spill_invariant_and_d13s_violates`, relating
-`GasMeter.SpillInvariant` to the identical `EvmGasSemantics.Meter.Discipline` predicate in
-`fradamt/evm-gas-semantics-lean/EvmGasSemantics/Theorems/Meter.lean` line 95 and
-`Theorems/MeterReach.lean` lines 270-279, 545):
-1. Under `amsterdamD0` and `amsterdamD13R`, `exit_child_frame` on `.success` unconditionally
-   establishes `GasMeter.SpillInvariant` (`stateGasLeft = 0 ∨ stateGasSpilled = 0`) for any
-   `pWithheld` and `c` (and under `amsterdamD0`, both LIFO `credit_state_gas_refund` and failed-child
-   merges preserve `SpillInvariant` throughout execution).
-2. Under `amsterdamD13S`, reservoir-only refills create mid-frame `stateGasLeft > 0 ∧ stateGasSpilled > 0`
-   states, and because `repay_state_gas_spill_capped` caps child-exit repayment by
-   `childExcess = c.stateGasLeft - c.stateGasBaseline`, even after a subsequent `.success` child exit
-   (`run_t6_failed_create_trace .amsterdamD13S 1000000 0 false`) `GasMeter.SpillInvariant` remains
-   violated with `stateGasLeft = 183600 > 0` and `stateGasSpilled = 183600 > 0` simultaneously. -/
+/--
+**Spill-invariant preservation on child merge under D0/D13R vs. violation under D13S**
+- *Natural property:* Successful child merges under `D0` and `D13R` unconditionally establish `GasMeter.SpillInvariant` (`stateGasLeft = 0 ∨ stateGasSpilled = 0`), whereas `D13S` capped repayment leaves `stateGasLeft = 183,600` and `stateGasSpilled = 183,600` simultaneously after a failed `CREATE` and subsequent `STATICCALL`.
+- *Formal statement:* `(exit_child_frame .amsterdamD0 pWithheld c .success).meter.SpillInvariant ∧ (exit_child_frame .amsterdamD13R pWithheld c .success).meter.SpillInvariant` while `run_t6_failed_create_trace .amsterdamD13S 1000000 0 false` yields `(stateGasLeft, stateGasSpilled) = (183600, 183600)`.
+- *Scope note:* Relates `GasMeter.SpillInvariant` across `D0`, `D13R`, and `D13S` multi-frame exits.
+-/
 theorem t_calltree_d0_preserves_spill_invariant_and_d13s_violates
     (pWithheld c : CallFrameMeter) :
     (exit_child_frame .amsterdamD0 pWithheld c .success).meter.SpillInvariant ∧
@@ -821,13 +795,12 @@ def run_same_child_set_clear_trace (sched : ForkSchedule) (childEntryGas : Nat) 
   | none => none
   | some c1 => exec_sstore_frame sched c1 false 0 1 0
 
-/-- Theorem 4g (`t_calltree_eip12581_same_child_clear_tradeoff`):
-Under `amsterdamD13` (which has the exact `(gasLeft, stateGasLeft)` transition rules of
-`ethereum/EIPs#12581` @ `b86de3f4`, Option C: reservoir-only refills and no child-merge spill
-repayment), a same-child `0 -> 1 -> 0` sequence on `childEntryGas = 200000` with `0` initial
-reservoir credits `97,920` into `stateGasLeft` while leaving `stateGasSpilled = 97,920`
-(`(gasLeft, stateGasLeft, stateGasSpilled) = (91880, 97920, 97920)`), whereas `amsterdamD0`
-restores the `97,920` spill directly into `gasLeft` (`(189800, 0, 0)`). -/
+/--
+**Same-frame 0 -> 1 -> 0 refill tradeoff between D0 and EIPs#12581 (D13)**
+- *Natural property:* Within a `200,000`-gas frame starting with an empty reservoir, setting and clearing a warm fresh slot (`0 -> 1 -> 0`) restores `97,920` directly to `gasLeft` under `D0` (`gasLeft = 189,800`), whereas reservoir-only refills under `D13` (`EIPs#12581`) credit `stateGasLeft` (`gasLeft = 91,880, stateGasLeft = 97,920`).
+- *Formal statement:* `run_same_child_set_clear_trace .amsterdamD0 200000` yields `(189800, 0, 0)` on `(gasLeft, stateGasLeft, stateGasSpilled)`, while `.amsterdamD13` yields `(91880, 97920, 97920)`.
+- *Scope note:* Single-frame `SSTORE` set-and-clear trace comparing `D0` against `D13` (pre-legacy-share `#12581` Option C reservoir mechanics).
+-/
 theorem t_calltree_eip12581_same_child_clear_tradeoff :
     (run_same_child_set_clear_trace .amsterdamD0 200000).map
       (fun fm => (fm.meter.gasLeft, fm.meter.stateGasLeft, fm.meter.stateGasSpilled)) =
@@ -837,16 +810,12 @@ theorem t_calltree_eip12581_same_child_clear_tradeoff :
         some (91880, 97920, 97920) := by
   decide
 
-/-- Theorem 4h (`t_calltree_d13_eq_eip12581_on_gas_and_reservoir`):
-Formal correspondence between `ForkSchedule.amsterdamD13` and `ethereum/EIPs#12581` (`b86de3f4`,
-Option C):
-1. State-gas refills (`frame_credit_state_refund .amsterdamD13`) credit `stateGasLeft`
-   (`state_gas_reservoir`) exclusively and leave `gasLeft` and `stateGasSpilled` untouched.
-2. Child exit on `.success` (`exit_child_frame .amsterdamD13 _ _ .success`) merges `gasLeft`,
-   `stateGasLeft`, and `stateGasSpilled` without `repay_state_gas_spill`.
-3. Child exit on `.revert` and `.halt` (`exit_child_frame .amsterdamD13`) restores `stateGasLeft`
-   to `pWithheld.meter.stateGasLeft + c.meter.stateGasBaseline` (`reservoir_snapshot`) and never
-   returns `c.meter.stateGasSpilled` into `gasLeft`. -/
+/--
+**Correspondence of ForkSchedule.amsterdamD13 with EIPs#12581 reservoir-only transitions**
+- *Natural property:* Under `amsterdamD13`, state-gas refills credit only `stateGasLeft`, successful child exits merge `gasLeft` and `stateGasLeft` without spill repayment, and reverting or halting child exits restore `stateGasLeft` to its entry snapshot without returning spilled gas to `gasLeft`.
+- *Formal statement:* `refilled.meter = (fm.gasLeft, fm.stateGasLeft + amount, fm.stateGasSpilled)`, `onSucc.meter = (p + c)` without `repay_state_gas_spill`, and `onRev`/`onHalt` restore `pWithheld.stateGasLeft + c.stateGasBaseline`.
+- *Scope note:* Transition-level equivalence for `(gasLeft, stateGasLeft)` with `ethereum/EIPs#12581` Option C (`b86de3f4`); `#12581` with `legacy_share` and `#12582` allowances are formalized in `Glamsterdam.Gas.Eip12582`.
+-/
 theorem t_calltree_d13_eq_eip12581_on_gas_and_reservoir
     (fm pWithheld c : CallFrameMeter) (amount : Nat) :
     let refilled := frame_credit_state_refund .amsterdamD13 fm amount
