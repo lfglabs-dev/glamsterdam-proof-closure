@@ -16,6 +16,10 @@ from ruamel.yaml import YAML
 import snappy
 
 from inventory import inventory
+from screen import screen_cases, screen_blocks, screen_state
+from payment_histories import replay_history, equal_amount_history
+from boundary_checks import additional_checks
+from claim_sources import source_manifest
 from static_ssz import check_archive, check_codec_controls
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -26,6 +30,9 @@ HANDLERS = {
     "operations/builder_deposit_request",
     "operations/builder_exit_request",
     "operations/payload_attestation",
+    "operations/parent_execution_payload",
+    "operations/execution_payload_bid",
+    "operations/attestation",
 }
 
 
@@ -163,7 +170,162 @@ def check_ptc(lib, spec, case, decoded, pre, data, config, meta):
         raise ValueError(f"unexpected PTC acceptance: {accepted}")
     if accepted and pre.encode_bytes() != snappy.decompress(case["post.ssz_snappy"]):
         raise ValueError("read-only PTC operation disagrees with the official post-state")
-    return {"status": "full_pass", "outcome": "accepted" if accepted else "rejected"}
+    return {"status": "full_pass", "outcome": "accepted" if accepted else "rejected",
+            "evidence": "lean_complete_post_state" if accepted else "lean_rejection"}
+
+
+def check_parent(lib, spec, case, decoded, state, data):
+    block = decoded("block", spec.BeaconBlock)
+    bid = state.latest_execution_payload_bid
+    requests = block.body.parent_execution_requests
+    limits = [(len(getattr(requests, field)), int(getattr(spec, limit))) for field, limit in (
+        ("withdrawals", "MAX_WITHDRAWAL_REQUESTS_PER_PAYLOAD"),
+        ("consolidations", "MAX_CONSOLIDATION_REQUESTS_PER_PAYLOAD"),
+        ("builder_deposits", "MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD"),
+        ("builder_exits", "MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD"))]
+    parent_slot = int(state.latest_block_header.slot)
+    data.update(parentHash=int.from_bytes(bytes(bid.block_hash), "big"),
+                bidParentHash=int.from_bytes(bytes(block.body.signed_execution_payload_bid.message.parent_block_hash), "big"),
+                emptyRequests=requests == spec.ExecutionRequests.empty(),
+                requestsRoot=bytes(spec.hash_tree_root(requests)).hex(),
+                requestsCommitment=bytes(bid.execution_requests_root).hex(), requestLimits=limits,
+                parentSlot=parent_slot, parentBid={"feeRecipient": int.from_bytes(bytes(bid.fee_recipient), "big"),
+                "amount": int(bid.value), "builderIndex": int(bid.builder_index)})
+    actual = replay(lib, data)
+    path = actual["path"]
+    rejected = path.startswith("reject_")
+    if rejected != ("post.ssz_snappy" not in case):
+        raise ValueError(f"parent result disagrees with fixture on path {path}")
+    if rejected:
+        return {"status": "full_pass", "evidence": "lean_rejection", "path": path}
+    queued = 0 if path == "empty_parent" else len(actual["withdrawals"]) - len(data["withdrawals"])
+    if path != "empty_parent":
+        apply_output(spec, state, "builder_pending_payments", actual)
+        # Nested request processing is outside the parent settlement theorem.
+        for operations, process in (
+            (requests.deposits, spec.process_deposit_request),
+            (requests.withdrawals, spec.process_withdrawal_request),
+            (requests.consolidations, spec.process_consolidation_request),
+            (requests.builder_deposits, spec.process_builder_deposit_request),
+            (requests.builder_exits, spec.process_builder_exit_request),
+        ):
+            for operation in operations:
+                process(state, operation)
+        state.execution_payload_availability[parent_slot % spec.SLOTS_PER_HISTORICAL_ROOT] = True
+        state.latest_block_hash = bid.block_hash
+    expected = decoded("post", spec.BeaconState)
+    if state.encode_bytes() != expected.encode_bytes():
+        field = next(f for f in spec.BeaconState.model_fields if getattr(state, f) != getattr(expected, f))
+        raise ValueError(f"{path}: first differing BeaconState field: {field}")
+    return {"status": "hybrid_pass", "evidence": "hybrid_complete_post_state", "path": path,
+            "withdrawals_appended": queued,
+            "lean_fields": [] if path == "empty_parent" else ["builder_pending_payments", "builder_pending_withdrawals"]}
+
+
+def check_bid(lib, spec, case, decoded, state, data, meta):
+    signed = decoded("execution_payload_bid", spec.SignedExecutionPayloadBid)
+    bid = signed.message
+    index = int(bid.builder_index)
+    data["bid"] = {"feeRecipient": int.from_bytes(bytes(bid.fee_recipient), "big"),
+                   "amount": int(bid.value), "builderIndex": index}
+    covered = None
+    if index == spec.BUILDER_INDEX_SELF_BUILD:
+        valid = bid.value == 0 and signed.signature == spec.bls.G2_POINT_AT_INFINITY
+    else:
+        valid = (index < len(state.builders) and spec.is_active_builder(state, index)
+                 and state.builders[index].version == spec.PAYLOAD_BUILDER_VERSION)
+        if valid:
+            covered = replay(lib, dict(data, phase="coverage", balance=int(state.builders[index].balance)))["covered"]
+            valid = covered and (meta.get("bls_setting") == 2 or spec.verify_execution_payload_bid_signature(state, signed))
+    valid = (valid and len(bid.blob_kzg_commitments) <= spec.get_blob_parameters(spec.get_current_epoch(state)).max_blobs_per_block
+             and bid.slot == state.slot and state.slot > spec.GENESIS_SLOT
+             and bid.parent_block_hash == state.latest_block_hash and bid.block_hash != bid.parent_block_hash
+             and bid.parent_block_root == spec.get_block_root_at_slot(state, state.slot - 1)
+             and bid.prev_randao == spec.get_randao_mix(state, spec.get_current_epoch(state)))
+    if bool(valid) != ("post.ssz_snappy" in case):
+        raise ValueError(f"unexpected bid acceptance {valid}; builder coverage {covered}")
+    if not valid:
+        return {"status": "full_pass" if covered is False else "python_rejection",
+                "evidence": "lean_rejection" if covered is False else "python_rejection",
+                "lean_coverage_guard": covered}
+    output = replay(lib, dict(data, phase="record", proposer=int(spec.get_beacon_proposer_index(state))))
+    apply_output(spec, state, "builder_pending_payments", output)
+    state.latest_execution_payload_bid = bid
+    expected = decoded("post", spec.BeaconState)
+    if state.encode_bytes() != expected.encode_bytes():
+        field = next(f for f in spec.BeaconState.model_fields if getattr(state, f) != getattr(expected, f))
+        raise ValueError(f"accepted bid: first differing field {field}")
+    return {"status": "hybrid_pass", "evidence": "hybrid_complete_post_state",
+            "lean_coverage_guard": covered, "positive_payment_recorded": bool(bid.value)}
+
+
+def check_attestation(lib, spec, case, decoded, state, data, meta):
+    att = decoded("attestation", spec.Attestation)
+    vote = att.data
+    epoch = spec.get_current_epoch(state)
+    delay = int(state.slot) - int(vote.slot)
+    def reject(reason, lean=False, after_lean=False):
+        if "post.ssz_snappy" in case:
+            raise ValueError(f"unexpected attestation rejection at {reason}")
+        return {"status": "full_pass" if lean else "python_rejection",
+                "evidence": "lean_rejection" if lean else "python_rejection", "reason": reason,
+                "lean_flag_validation_ran": lean or after_lean}
+    if (vote.target.epoch not in (spec.get_previous_epoch(state), epoch)
+            or vote.target.epoch != spec.compute_epoch_at_slot(vote.slot)
+            or delay < spec.MIN_ATTESTATION_INCLUSION_DELAY or vote.index >= 2):
+        return reject("epoch, inclusion delay or payload index")
+    offset = 0
+    for ci in spec.get_committee_indices(att.committee_bits):
+        if ci >= spec.get_committee_count_per_slot(state, vote.target.epoch):
+            return reject("committee index")
+        committee = spec.get_beacon_committee(state, vote.slot, ci)
+        bits = list(att.aggregation_bits)[offset:offset + len(committee)]
+        if not any(bits):
+            return reject("empty committee participation")
+        offset += len(committee)
+    if len(att.aggregation_bits) != offset:
+        return reject("committee bit count")
+    current = vote.target.epoch == epoch
+    participation = state.current_epoch_participation if current else state.previous_epoch_participation
+    justified = state.current_justified_checkpoint if current else state.previous_justified_checkpoint
+    indices = sorted(spec.get_attesting_indices(state, att))
+    data.update(voteSlot=int(vote.slot), targetEpoch=int(vote.target.epoch), head=bytes(vote.beacon_block_root).hex(),
+                slotRoot=bytes(spec.get_block_root_at_slot(state, vote.slot)).hex(),
+                prevRoot=bytes(spec.get_block_root_at_slot(state, vote.slot - 1)).hex() if vote.slot else "",
+                payloadIndex=int(vote.index), source=vote.source.encode_bytes().hex(),
+                justified=justified.encode_bytes().hex(), target=bytes(vote.target.root).hex(),
+                targetRoot=bytes(spec.get_block_root(state, vote.target.epoch)).hex(),
+                minDelay=int(spec.MIN_ATTESTATION_INCLUSION_DELAY),
+                available=bool(state.execution_payload_availability[meta["parent_slot"] % spec.SLOTS_PER_HISTORICAL_ROOT]),
+                attesters=[dict(index=int(v), flags=int(participation[v]), balance=int(state.validators[v].effective_balance))
+                           for v in indices])
+    result = replay(lib, data)
+    if not result["accepted"]:
+        return reject("source or same-slot payload index", lean=True)
+    indexed = spec.get_indexed_attestation(state, att)
+    if not indexed.attesting_indices or (meta.get("bls_setting") != 2 and not spec.is_valid_indexed_attestation(state, indexed)):
+        return reject("indexed attestation or signature", after_lean=True)
+    if "post.ssz_snappy" not in case:
+        raise ValueError("unexpected attestation acceptance")
+    participation = state.current_epoch_participation if result["current"] else state.previous_epoch_participation
+    numerator = 0
+    for index, flags in result["flags"]:
+        new_bits = int(participation[index]) ^ flags
+        for flag, weight in enumerate(spec.PARTICIPATION_FLAG_WEIGHTS):
+            if new_bits & (1 << flag):
+                numerator += int(spec.get_base_reward(state, index)) * int(weight)
+        participation[index] = flags
+    payment = state.builder_pending_payments[result["index"]]
+    delta = result["weight"] - int(payment.weight)
+    payment.weight = result["weight"]
+    denominator = (spec.WEIGHT_DENOMINATOR - spec.PROPOSER_WEIGHT) * spec.WEIGHT_DENOMINATOR // spec.PROPOSER_WEIGHT
+    spec.increase_balance(state, spec.get_beacon_proposer_index(state), spec.Gwei(numerator // denominator))
+    expected = decoded("post", spec.BeaconState)
+    if state.encode_bytes() != expected.encode_bytes():
+        field = next(f for f in spec.BeaconState.model_fields if getattr(state, f) != getattr(expected, f))
+        raise ValueError(f"attestation: first differing field {field}")
+    return {"status": "hybrid_pass", "evidence": "hybrid_complete_post_state",
+            "credited_weight": delta, "participants": len(indices), "payment_index": result["index"]}
 
 
 def check_case(lib, spec, name, case):
@@ -176,6 +338,12 @@ def check_case(lib, spec, name, case):
     yaml = YAML(typ="safe")
     config = yaml.load(case.get("config.yaml", b"{}"))
     meta = yaml.load(case.get("meta.yaml", b"{}"))
+    if handler == "attestation":
+        return check_attestation(lib, spec, case, decoded, pre, data, meta)
+    if handler == "execution_payload_bid":
+        return check_bid(lib, spec, case, decoded, pre, data, meta)
+    if handler == "parent_execution_payload":
+        return check_parent(lib, spec, case, decoded, pre, data)
     if handler == "payload_attestation":
         return check_ptc(lib, spec, case, decoded, pre, data, config, meta)
     if handler == "builder_pending_payments":
@@ -229,7 +397,8 @@ def check_case(lib, spec, name, case):
     if pre.encode_bytes() != expected.encode_bytes():
         field = next(f for f in spec.BeaconState.model_fields if getattr(pre, f) != getattr(expected, f))
         raise ValueError(f"first differing BeaconState field: {field}")
-    return {"status": "full_pass", **({"negative_control": control} if control else {})}
+    return {"status": "full_pass", "evidence": "lean_complete_post_state",
+            **({"negative_control": control} if control else {})}
 
 
 DEPENDENCIES = {
@@ -267,6 +436,34 @@ def fingerprint(ids):
     return hashlib.sha256(("\n".join(sorted(ids)) + "\n").encode()).hexdigest()
 
 
+def check_claim_paths(results, supplemental):
+    """Keep strong evidence from turning into a no-op with unchanged pass counts."""
+    att = [row for key, row in results.items() if "/operations/attestation/" in key]
+    bid = [row for key, row in results.items() if "/operations/execution_payload_bid/" in key]
+    parent = [row for key, row in results.items() if "/operations/parent_execution_payload/" in key]
+    evidence = {
+        "fork_cases_with_existing_builder_topups": sum(r.get("existing_builder_topups", 0) > 0 for r in results.values()),
+        "withdrawal_cases_with_builder_debits": sum(r.get("builder_debits", 0) > 0 for r in results.values()),
+        "slashing_cases_clearing_payment_entries": sum(r.get("changed_entries", 0) > 0 for r in results.values()),
+        "ordinary_attestations": len(att),
+        "positive_weight_changes": sum(row.get("credited_weight", 0) > 0 for row in att),
+        "coverage_guard_accepted": sum(row.get("lean_coverage_guard") is True for row in bid),
+        "coverage_guard_rejected": sum(row.get("lean_coverage_guard") is False for row in bid),
+        "positive_bid_entries": sum(row.get("positive_payment_recorded", False) for row in bid),
+        "parent_paths": dict(Counter(row.get("path") for row in parent)),
+        "supplemental_sequences_and_controls": sum(map(len, supplemental.values())),
+    }
+    expected = {"fork_cases_with_existing_builder_topups": 6, "withdrawal_cases_with_builder_debits": 42,
+                "slashing_cases_clearing_payment_entries": 6, "ordinary_attestations": 127, "positive_weight_changes": 6,
+                "coverage_guard_accepted": 8, "coverage_guard_rejected": 6, "positive_bid_entries": 6,
+                "parent_paths": {"current_epoch": 26, "previous_epoch": 2, "older_parent": 6, "empty_parent": 4,
+                                 "reject_empty_requests": 2, "reject_limit": 8},
+                "supplemental_sequences_and_controls": 8}
+    if evidence != expected:
+        raise ValueError(f"claim path evidence changed: {evidence}")
+    return evidence
+
+
 def collect_sources(directory):
     module = importlib.import_module("eth_consensus_specs.gloas.minimal")
     cwd = Path(subprocess.check_output(["git", "rev-parse", "--show-toplevel"],
@@ -298,11 +495,14 @@ def main():
     report = {"spec": SPEC, "proof_commit": subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(), "archives": archives,
         "case_id_sha256": fingerprint(cases), "cases": {}}
+    report["claim_source_review"] = source_manifest(importlib.import_module("eth_consensus_specs.gloas.minimal"))
     results = report["cases"]
     with tempfile.TemporaryDirectory() as tmp:
         sources, report["gloas_python_only"] = collect_sources(Path(tmp))
         lib = compile_bridge(Path(tmp))
         report["ssz_controls"] = check_codec_controls(lib)
+        report["supplemental_checks"] = {}
+        report["generated_payment_histories"] = {}
         for preset in ("minimal", "mainnet"):
             spec = importlib.import_module(f"eth_consensus_specs.gloas.{preset}")
             revision = subprocess.check_output(["git", "rev-parse", "HEAD"],
@@ -311,22 +511,47 @@ def main():
                 raise ValueError(f"{preset}: unexpected PySpec revision {revision}")
             selected = []
             static = set()
+            screened = set()
             for name, scope in cases.items():
                 config, _, runner, handler, _, _ = name.split("/")
                 if config != preset:
                     continue
                 if scope == "compliance":
-                    results[name] = {"status": "separate_compliance"}
+                    results[name] = {"status": "separate_compliance", "evidence": "outside_scope"}
                 elif runner == "ssz_static":
                     static.add(name)
+                elif (runner, handler) in {("fork", "fork"), ("operations", "withdrawals"), ("operations", "proposer_slashing")}:
+                    screened.add(name)
+                elif (runner, handler) == ("sanity", "blocks") or runner in {"transition", "random", "finality"}:
+                    screened.add(name)
                 elif f"{runner}/{handler}" in HANDLERS:
                     selected.append(name)
                 else:
-                    results[name] = {"status": "unsupported", "dependency": HANDLER_DEPENDENCIES.get((runner, handler), DEPENDENCIES[runner])}
+                    results[name] = {"status": "unsupported", "evidence": "outside_scope", "dependency": HANDLER_DEPENDENCIES.get((runner, handler), DEPENDENCIES[runner])}
             check_archive(lib, spec, args.archives / f"{preset}.tar.gz", static, results)
+            for name, case in screen_cases(args.archives / f"{preset}.tar.gz", screened):
+                if name in results:
+                    raise ValueError(f"duplicate screened case {name}")
+                runner = name.split("/")[2]
+                if runner in {"operations", "fork"}:
+                    results[name] = screen_state(lib, spec, name, case, replay, queues)
+                else:
+                    row = screen_blocks(spec, runner, case)
+                    ops = row["gloas_operations_in_valid_blocks"]
+                    if row["official_acceptance"] and ops.get("nonzero_bids", 0) and ops["execution_payload_bid"] >= 2:
+                        if runner == "transition":
+                            raise ValueError("new cross-fork paid history needs a pre-fork decoder")
+                        row = replay_history(lib, spec, case, sys.modules[__name__])
+                        if name.endswith("/builder_payment_after_missed_epochs"):
+                            report["generated_payment_histories"][preset] = equal_amount_history(
+                                lib, spec, case["pre.ssz_snappy"], sys.modules[__name__])
+                    results[name] = row
             for name, case in read_cases(args.archives / f"{preset}.tar.gz", selected).items():
                 try:
                     results[name] = check_case(lib, spec, name, case)
+                    controls = additional_checks(lib, spec, name, case, replay, queues, apply_output, check_case, check_parent)
+                    if controls:
+                        report["supplemental_checks"][name] = controls
                 except Exception as exc:
                     results[name] = {"status": "failed", "error": repr(exc)}
     if set(results) != set(cases):
@@ -341,6 +566,7 @@ def main():
     for name, row in results.items():
         by_handler["/".join(name.split("/")[:4])][row["status"]] += 1
     report["by_preset_runner_handler"] = dict(by_handler)
+    report["claim_paths"] = check_claim_paths(results, report["supplemental_checks"])
     print(report["counts"])
     args.report.write_text(json.dumps(report, sort_keys=True, indent=2) + "\n")
     baselines = {status: fingerprint(k for k, r in results.items() if r["status"] == status)

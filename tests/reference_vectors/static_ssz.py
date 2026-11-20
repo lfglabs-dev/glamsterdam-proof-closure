@@ -61,7 +61,7 @@ def check_static(lib, spec, name, parts):
     actual = lean_root(lib, desc, binary)
     if actual != expected:
         raise ValueError(f"{typ}: expected root {expected}, Lean returned {actual}")
-    return {"status": "full_pass"}
+    return {"status": "full_pass", "evidence": "lean_binary_roundtrip_and_tree_root"}
 
 
 def check_archive(lib, spec, path, selected, results):

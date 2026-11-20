@@ -62,3 +62,16 @@ The valid operation has no state writes, so its complete pre-state encoding
 must equal the published post-state. Cases without a post-state must be rejected.
 These cases exercise payload-timeliness attestations. Ordinary beacon
 attestations have additional committee, participation and reward transitions.
+
+## ePBS claim audit
+
+The three additional operation handlers run 48 parent-payload, 40 bid, and 127 ordinary attestation cases. The report distinguishes a complete hybrid post-state from a Lean rejection and a Python rejection. A Python rejection may occur before Lean runs, or after Lean accepts a builder's coverage check. Each bid row records which happened.
+
+| Handler | Computed by Lean | Supplied by pinned Python |
+| --- | --- | --- |
+| Parent payload | Full/empty hash comparison, request commitment equality, request count limits, payment-window index, clearing an entry and appending its withdrawal or settling an older bid | SSZ roots, nested execution requests after settlement, availability bit and latest hash |
+| Execution payload bid | Outstanding obligations in both queues, the coverage guard, the pending entry for a positive bid | Builder eligibility and version, signature, block context and proposer index, latest bid assignment |
+| Ordinary attestation | Same-slot eligibility, source/target/head flags, prior participation, payment index, exact weight and participation updates | Committee assignment, signature, historical roots, reward calculation and proposer balance update |
+| Surrounding cases | Selected builder debits, slashing's pending-payment projection, fork-slot availability | Withdrawal selection, validity of slashing inputs, registry onboarding, unrelated state fields |
+
+For multi-block fixtures the report identifies the operations present in valid Gloas blocks. The final block of a rejected sequence is listed separately because the body cannot establish how far execution proceeded. All valid multi-block histories that record a positive bid and have at least two Gloas blocks are replayed with the compiled payment operations. Each successful row records checked intermediate operations, complete signed-block execution and official final-state equality. Screening alone adds no whole-chain passes. Supplemental sequences and mutation checks have their own report section.
