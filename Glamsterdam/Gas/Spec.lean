@@ -70,9 +70,12 @@ def MAX_BLOB_GAS_PER_BLOCK : Nat := 21 * 131072 -- 2,752,512
 
 /-! ## 2. Two-Leg Gas Charging & Reservoir Forwarding (`T-8037-CHARGE-GAS-SOUND` & `T-8037-RESERVOIR-ROUNDTRIP`) -/
 
-/-- T-8037-CHARGE-GAS-SOUND: Whenever `charge_gas frame regularGas stateGas = some post`,
-the combined gas (`gasLeft + stateGasReservoir`) decreases by exactly `regularGas + stateGas`,
-and `post.gasLeft ≤ frame.gasLeft` and `post.stateGasReservoir ≤ frame.stateGasReservoir`. -/
+/--
+**Two-dimensional gas charging conservation and monotonicity (T-8037-CHARGE-GAS-SOUND)**
+- *Natural property:* Whenever a coupled execution-gas and state-gas charge succeeds, the sum of execution gas and reservoir gas drops by the exact combined charge and neither counter increases or underflows.
+- *Formal statement:* `charge_gas frame regularGas stateGas = some post` implies `post.gasLeft + post.stateGasReservoir + regularGas + stateGas = frame.gasLeft + frame.stateGasReservoir ∧ post.gasLeft ≤ frame.gasLeft ∧ post.stateGasReservoir ≤ frame.stateGasReservoir`.
+- *Scope note:* Single-step accounting on `EvmGasFrame` (`vm/gas.py:379-436`).
+-/
 theorem t_8037_charge_gas_sound (frame post : EvmGasFrame) (regularGas stateGas : Nat)
     (h : charge_gas frame regularGas stateGas = some post) :
     post.gasLeft + post.stateGasReservoir + regularGas + stateGas =
@@ -86,23 +89,32 @@ theorem t_8037_charge_gas_sound (frame post : EvmGasFrame) (regularGas stateGas 
     simp only
     omega
 
-/-- T-8037-RESERVOIR-ROUNDTRIP: Parent forwards 100% of `stateGasReservoir` to child
-(`childInit.stateGasReservoir = parentAfterCharge.stateGasReservoir`) and zeroed parent
-reservoir is restored from `child.stateGasReservoir` on both success and error. -/
+/--
+**State-gas reservoir roundtrip on child success (T-8037-RESERVOIR-ROUNDTRIP)**
+- *Natural property:* A parent frame whose state-gas reservoir was drained into a child frame adopts the child's remaining reservoir intact when the child succeeds.
+- *Formal statement:* `(incorporate_child_on_success { parent with stateGasReservoir := 0 } child).stateGasReservoir = child.stateGasReservoir`.
+- *Scope note:* Frame-boundary reservoir handoff on `EvmGasFrame`; full 6-field `GasMeter` spill rollback on revert is proved in `t_8037_meter_reservoir_roundtrip_on_revert`.
+-/
 theorem t_8037_reservoir_roundtrip_success (parent child : EvmGasFrame) :
     (incorporate_child_on_success { parent with stateGasReservoir := 0 } child).stateGasReservoir =
       child.stateGasReservoir := rfl
 
+/--
+**State-gas reservoir roundtrip on child error (T-8037-RESERVOIR-ROUNDTRIP-ERROR)**
+- *Natural property:* A parent frame whose state-gas reservoir was drained into a child frame recovers the child's restored reservoir intact when the child fails.
+- *Formal statement:* `(incorporate_child_on_error { parent with stateGasReservoir := 0 } child).stateGasReservoir = child.stateGasReservoir`.
+- *Scope note:* Frame-boundary error handoff on `EvmGasFrame`.
+-/
 theorem t_8037_reservoir_roundtrip_error (parent child : EvmGasFrame) :
     (incorporate_child_on_error { parent with stateGasReservoir := 0 } child).stateGasReservoir =
       child.stateGasReservoir := rfl
 
-/-- Exact 6-field `GasMeter` roundtrip theorem (`vm/gas.py:689-710, 493-517` & `vm/__init__.py:188-245`):
-When a parent drains its `stateGasLeft` into a child (`drain_state_gas_reservoir`), the child
-executes an arbitrary state-gas charge `childStateCharge` (possibly spilling out of the reservoir
-into `child.gasLeft`!), and the child then reverts (`restore_state_gas` followed by
-`incorporate_child_meter parentAfterDrain childRestored true`), the parent's `stateGasLeft` is
-restored to `parent.stateGasLeft` and all spilled execution gas is returned to `gasLeft`! -/
+/--
+**Six-field GasMeter reservoir and spill restoration on child revert (T-8037-METER-RESERVOIR-ROUNDTRIP-REVERT)**
+- *Natural property:* When a parent drains its reservoir into a child frame, the child charges state gas (even spilling into execution gas), and the child reverts, the parent's execution gas, state-gas reservoir, spill counter, and refund counter all return to their exact pre-call values.
+- *Formal statement:* After `drain_state_gas_reservoir`, `charge_state_gas_from_meter ... childStateCharge = some childAfterCharge`, `restore_state_gas`, and `incorporate_child_meter ... true`, `parentFinal.stateGasLeft = parent.stateGasLeft ∧ parentFinal.gasLeft = parent.gasLeft ∧ parentFinal.stateGasSpilled = parent.stateGasSpilled ∧ parentFinal.refundCounter = parent.refundCounter`.
+- *Scope note:* Single parent-child revert roundtrip on the 6-field `GasMeter` (`vm/gas.py:493-517, 689-710`) with zero child execution-gas burn; execution-gas burn before revert is modeled in `Glamsterdam.Gas.CallTree`.
+-/
 theorem t_8037_meter_reservoir_roundtrip_on_revert
     (parent childAfterCharge : GasMeter) (childGrant childStateCharge : Nat)
     (h_withhold : childGrant ≤ parent.gasLeft)
@@ -158,10 +170,12 @@ def calculate_message_call_gas
     let cappedGas := min gas (max_message_call_gas (gasLeft - memoryCost - extraGas))
     ⟨cappedGas + extraGas, cappedGas + stipend⟩
 
-/-- Theorem: Whenever `gasLeft ≥ extraGas + memoryCost`, `calculate_message_call_gas` guarantees
-that `cost + memoryCost ≤ gasLeft`, and whenever `gasLeft < extraGas + memoryCost`,
-`calculate_message_call_gas` returns `cost = gas + extraGas` (so `cost + memoryCost > gasLeft` and
-the subsequent `charge_gas_from_meter` deterministically raises `OutOfGasError`). -/
+/--
+**Message-call gas cap affordability and OOG trigger**
+- *Natural property:* Whenever a frame can afford a call's extra gas and memory expansion cost, `calculate_message_call_gas` caps the call cost within `gasLeft`; otherwise it returns an uncapped cost that deterministically triggers `OutOfGasError` on the subsequent charge.
+- *Formal statement:* `(extraGas + memoryCost ≤ gasLeft → cost + memoryCost ≤ gasLeft) ∧ (gasLeft < extraGas + memoryCost → cost = gas + extraGas)`.
+- *Scope note:* Single-call gas calculation (`vm/gas.py:801-844`) enforcing the EIP-150 `63/64` cap (`max_message_call_gas`).
+-/
 theorem calculate_message_call_gas_affordable
     (value gas gasLeft memoryCost extraGas stipend : Nat) :
     (extraGas + memoryCost ≤ gasLeft →
@@ -207,9 +221,12 @@ def create_child_gas_cap_valid (f : EvmGasFrame) (reg st : Nat) (out : Option (N
   | none, none => true
   | _, _ => false
 
-/-- T-8037-CREATE-ORDER: When `stateCreateGas` spills out of `stateGasReservoir`,
-charging `stateCreateGas` before the `63/64` cap strictly bounds `childGas` by
-`63/64` of the post-spill `gasLeft`, and refutes `create_child_gas_cap_mutant`. -/
+/--
+**CREATE state-gas charge ordering before the 63/64 child cap (T-8037-CREATE-ORDER)**
+- *Natural property:* `CREATE` and `CREATE2` deduct `stateCreateGas` (`183,600`) before computing the `63/64` child execution-gas cap, preventing a reservoir spill from over-granting execution gas to `init_code`.
+- *Formal statement:* `WitnessRefuter` proving `create_child_gas_cap` satisfies `cg = post.gasLeft - post.gasLeft / 64` after `charge_gas f reg st = some post`, while `create_child_gas_cap_mutant` fails on `(⟨1000, 0, 0⟩, 0, 640)`.
+- *Scope note:* Single `CREATE`/`CREATE2` spawn step (`vm/instructions/system.py:107-113`).
+-/
 def m_8037_1_refuter : WitnessRefuter (EvmGasFrame × Nat × Nat) (Option (Nat × EvmGasFrame))
     (fun ⟨f, reg, st⟩ out => create_child_gas_cap_valid f reg st out = true) where
   reference := fun ⟨f, reg, st⟩ => create_child_gas_cap f reg st
@@ -299,11 +316,12 @@ def allocate_evm_gas (txGas : Nat) (intrinsic : IntrinsicGasCost) : EvmGasAlloca
   let stateGasReservoir := evmGas - executionGas
   ⟨executionGas, stateGasReservoir⟩
 
-/-- Theorem (`T-8037-ALLOCATE-EVM-GAS-CONSERVATION`): Whenever `intrinsic.execution ≤ txGas` and
-`intrinsic.execution ≤ TX_MAX_GAS_LIMIT` (guaranteed by `validate_transaction`),
-`allocate_evm_gas` partitions `txGas` without loss or overflow:
-`intrinsic.execution + alloc.executionGas + alloc.stateGasReservoir = txGas` and
-`intrinsic.execution + alloc.executionGas ≤ TX_MAX_GAS_LIMIT`. -/
+/--
+**Transaction gas split between execution budget and state-gas reservoir (T-8037-ALLOCATE-EVM-GAS-SOUND)**
+- *Natural property:* For any valid transaction, `allocate_evm_gas` partitions `txGas` without loss or overflow into intrinsic execution gas, the EVM execution budget (bounded so total execution gas never exceeds `TX_MAX_GAS_LIMIT = 2^24`), and the state-gas reservoir.
+- *Formal statement:* Given `intrinsic.execution ≤ txGas` and `intrinsic.execution ≤ TX_MAX_GAS_LIMIT`, `intrinsic.execution + alloc.executionGas + alloc.stateGasReservoir = txGas ∧ intrinsic.execution + alloc.executionGas ≤ TX_MAX_GAS_LIMIT`.
+- *Scope note:* Transaction-entry allocation (`vm/gas.py:1105-1138`) under `validate_transaction` preconditions.
+-/
 theorem t_8037_allocate_evm_gas_sound (txGas : Nat) (intrinsic : IntrinsicGasCost)
     (h_gas : intrinsic.execution ≤ txGas)
     (h_cap : intrinsic.execution ≤ TX_MAX_GAS_LIMIT) :
@@ -353,9 +371,12 @@ def settle_transaction_gas_int
     TxGasSettlement :=
   settle_transaction_gas txGas calldataFloor gasLeft stateGasLeft refundCounter stateGasUsed.toNat
 
-/-- T-7778-8037-DUAL-CAP: Block gas bottleneck `max(executionGasUsed, stateGasUsed)`
-always upper-bounds both dimensions, and block `executionGasUsed` is invariant with
-respect to `refundCounter`. -/
+/--
+**EIP-7778 / EIP-8037 dual block gas bottleneck and refund invariance (T-7778-8037-DUAL-CAP)**
+- *Natural property:* At transaction settlement, the block bottleneck gas `max(executionGasUsed, stateGasUsed)` upper-bounds both gas dimensions, and block `executionGasUsed` is completely invariant to `refundCounter`.
+- *Formal statement:* `s1.executionGasUsed ≤ s1.blockBottleneckGas ∧ s1.stateGasUsed ≤ s1.blockBottleneckGas ∧ s1.executionGasUsed = s2.executionGasUsed` for any refund counters `r1, r2`.
+- *Scope note:* Transaction-level settlement (`vm/gas.py:1163-1228`); sender receipt `gasUsed` still applies the `1/5` refund cap.
+-/
 theorem t_7778_8037_dual_cap (txGas floor gasLeft stateGasLeft r1 r2 stateGasUsed : Nat) :
     let s1 := settle_transaction_gas txGas floor gasLeft stateGasLeft r1 stateGasUsed
     let s2 := settle_transaction_gas txGas floor gasLeft stateGasLeft r2 stateGasUsed
@@ -365,7 +386,12 @@ theorem t_7778_8037_dual_cap (txGas floor gasLeft stateGasLeft r1 r2 stateGasUse
   dsimp only [settle_transaction_gas]
   refine ⟨?_, ?_, rfl⟩ <;> omega
 
-/-- T-8038-2780-WARM-COLD: Pinned warm/cold access and write gas bounds (`vm/gas.py:47-90`). -/
+/--
+**EIP-8038 / EIP-2780 warm-cold access ordering and state-byte pricing constants (T-8038-2780-WARM-COLD)**
+- *Natural property:* Pinned Amsterdam gas constants strictly order warm access (`100`) below cold storage access (`2,100`), cold account access (`3,000`), and account write (`9,000`), and match the derived creation and storage-set state-gas schedules.
+- *Formal statement:* `GAS_WARM_ACCESS < GAS_COLD_STORAGE_ACCESS < GAS_COLD_ACCOUNT_ACCESS < GAS_ACCOUNT_WRITE ∧ GAS_CREATE_ACCESS = 12000 ∧ STATE_GAS_NEW_ACCOUNT = 183600 ∧ STATE_GAS_STORAGE_SET = 97920`.
+- *Scope note:* Constant-schedule verification against `vm/gas.py:47-90` (`COST_PER_STATE_BYTE = 1,530`).
+-/
 theorem t_8038_2780_warm_cold_bounds :
     GAS_WARM_ACCESS < GAS_COLD_STORAGE_ACCESS ∧
     GAS_COLD_STORAGE_ACCESS < GAS_COLD_ACCOUNT_ACCESS ∧
@@ -462,9 +488,12 @@ def sstore_dirty_reset_settlement_direct (baseTxExecGas : Nat) : TxGasSettlement
   let netStateGas := p1.stateGasCost - p2.stateGasRefundCredited
   settle_transaction_gas netExecCharged 0 0 0 0 netStateGas
 
-/-- Explicit `WitnessRefuter` for `F-8038-7778-SSTORE-RESET-REFUND-CAP-AND-BLOCK-GAS`:
-On `baseTxExecGas = 15000`, `sstore_dirty_reset_settlement_v16898000` charges the user `20,160` gas
-and charges the block `25,200` execution gas, whereas the direct reset charges `15,200` for both. -/
+/--
+**Counterexample refuter: SSTORE 0 -> X -> 0 reset routed through capped refund_counter (F-8038-7778-SSTORE-RESET-REFUND-CAP-AND-BLOCK-GAS)**
+- *Natural property:* On a same-transaction warm `0 -> 1 -> 0` dirty reset, state gas (`97,920`) is refilled directly, whereas the `10,000` `STORAGE_WRITE` reset credit goes into `refund_counter`, where the `1/5` refund cap can clip it for the sender and EIP-7778 omits it from block `execution_gas_used`.
+- *Formal statement:* `WitnessRefuter` at `baseTxExecGas = 15000` showing `sstore_dirty_reset_settlement_v16898000 15000` charges `gasUsed = 20160` and `executionGasUsed = 25200` instead of `15200`.
+- *Scope note:* Two-write `SSTORE` settlement trace (`vm/instructions/storage.py:68-162` and `vm/gas.py:1211-1222`).
+-/
 def f_8038_7778_sstore_reset_refuter :
     WitnessRefuter Nat TxGasSettlement
       (fun baseTx out => out.gasUsed = baseTx + 200 ∧ out.executionGasUsed = baseTx + 200) where
@@ -489,14 +518,12 @@ def sstore_clear_potential (originalValue currentValue : Nat) : Int :=
   else
     0
 
-/-- Theorem (`t_8038_sstore_refund_delta_potential`, `vm/instructions/storage.py:126-139`):
-Every single `SSTORE` transition from `currentValue` to `newValue` (with transaction-original value
-`originalValue`) satisfies the exact telescoping decomposition:
-`refundDelta = (Φ(orig, new) - Φ(orig, curr)) + [curr ≠ new ∧ orig = new] * STORAGE_WRITE`.
-Consequently, while a child frame's local `refundCounter` can be negative (e.g. `-11,616` or `-1,616`
-when a parent cleared an originally non-zero slot `1 -> 0` and the child re-dirties it `0 -> 2` or
-`0 -> 1`), the quantity `refundCounter - Φ(orig, curr)` is monotonically non-decreasing across every
-`SSTORE` (`postRefund - Φ(orig, new) ≥ preRefund - Φ(orig, curr)`). -/
+/--
+**Telescoping potential decomposition for single-step SSTORE refund deltas**
+- *Natural property:* Every `SSTORE` refund delta decomposes into the exact change in a non-negative clear potential plus a non-negative `STORAGE_WRITE` reset bonus, so `refundCounter - sstore_clear_potential orig curr` never decreases across any `SSTORE`.
+- *Formal statement:* `p.refundDelta = (sstore_clear_potential originalValue newValue - sstore_clear_potential originalValue currentValue) + resetBonus` with `resetBonus ≥ 0`, `sstore_clear_potential originalValue newValue ≥ 0`, and `sstore_clear_potential originalValue originalValue = 0`.
+- *Scope note:* Single-slot `SSTORE` pricing (`vm/instructions/storage.py:126-139`); lifts to multi-step traces by telescoping summation across independent slots.
+-/
 theorem t_8038_sstore_refund_delta_potential
     (isCold : Bool) (originalValue currentValue newValue : Nat) :
     let p := price_sstore isCold originalValue currentValue newValue
@@ -518,19 +545,12 @@ theorem t_8038_sstore_refund_delta_potential
     simp [h_orig, h_curr, h_new, h_cn, h_on] <;>
     omega
 
-/-- Theorem (`t_8038_refund_counter_telescope_nonneg`, two-step lemma for
-`EvmGasSemantics/Meter.lean` line 62, `EvmGasSemantics/Rules/Setup.lean` line 60, and
-`EvmGasSemantics/Exec.lean` lines 170-174 in `fradamt/evm-gas-semantics-lean`, plus EELS
-`src/ethereum/forks/amsterdam/vm/gas.py:1168`):
-Starting from transaction entry where `currentValue = originalValue` and `refundCounter = 0`,
-two consecutive `SSTORE` transitions `orig -> v1 -> v2` on a slot preserve
-`refundCounter ≥ Φ(orig, curr) ≥ 0` (generalized to arbitrary `List SstoreTraceStep` sequences
-with reverting child frames in `t_8038_refund_counter_telescope_trace_root_nonneg` below).
-In particular:
-1. A child frame entering at `curr = 0` (`orig ≠ 0`) and writing `0 -> 2` has negative local
-   `child.refundDelta = -11616 < 0` (or `-1616 < 0` on `0 -> 1`),
-2. Yet when merged with the parent that performed `orig -> 0` (`parent.refundDelta = +11616`),
-   the combined transaction `refundCounter` is `0 ≥ Φ(orig, 2) = 0` (or `10000 ≥ Φ(orig, 1) = 0`). -/
+/--
+**Two-step SSTORE refund-counter non-negativity with negative child delta**
+- *Natural property:* Although a child frame re-dirtying an originally non-zero cleared slot incurs a negative local `refundDelta` (`-11,616` or `-1,616`), merging it with the parent's prior clear (`+11,616`) keeps the transaction-wide `refundCounter` non-negative.
+- *Formal statement:* If `r0 ≥ sstore_clear_potential orig orig`, two steps `orig -> v1 -> v2` satisfy `r0 + d1 + d2 ≥ sstore_clear_potential orig v2 ≥ 0`, while `(price_sstore false 1 0 2).refundDelta = -11616` and `(price_sstore false 1 0 1).refundDelta = -1616`.
+- *Scope note:* Two-step single-slot lemma; generalized to arbitrary trace lengths and reverting children in `t_8038_refund_counter_telescope_trace_root_nonneg`.
+-/
 theorem t_8038_refund_counter_telescope_nonneg
     (isCold1 isCold2 : Bool) (orig v1 v2 : Nat) (r0 : Int)
     (h_inv0 : r0 ≥ sstore_clear_potential orig orig) :
@@ -564,12 +584,12 @@ def run_sstore_refund_trace (origVal : Nat) : List SstoreTraceStep → Nat × In
   | (.revertedChild _) :: rest, (currVal, r) =>
     run_sstore_refund_trace origVal rest (currVal, r)
 
-/-- Theorem (`t_8038_refund_counter_telescope_trace_nonneg`):
-For ANY finite sequence `trace : List SstoreTraceStep` of committed `SSTORE`s (which includes
-merged successful child frames by associativity of `+`) and reverted/halted child frames, starting
-from any state `(curr, r)` satisfying `r ≥ sstore_clear_potential orig curr`, the post-trace state
-`(curr', r')` satisfies `r' ≥ sstore_clear_potential orig curr' ≥ 0`. In particular, starting from
-transaction entry `(orig, 0)`, the root `refundCounter` is unconditionally `≥ 0`. -/
+/--
+**Inductive potential invariant across multi-frame SSTORE traces**
+- *Natural property:* Any sequence of committed `SSTORE` steps and reverted/halted child frames preserves the lower bound `refundCounter ≥ sstore_clear_potential orig curr ≥ 0`.
+- *Formal statement:* Given `r ≥ sstore_clear_potential orig curr`, `let (curr', r') := run_sstore_refund_trace orig trace (curr, r)` satisfies `r' ≥ sstore_clear_potential orig curr' ∧ sstore_clear_potential orig curr' ≥ 0`.
+- *Scope note:* Single-slot `SstoreTraceStep` trace model; successful child frames fold into `.sstore` steps by associativity of integer addition.
+-/
 theorem t_8038_refund_counter_telescope_trace_inv
     (orig : Nat) (trace : List SstoreTraceStep) (curr : Nat) (r : Int)
     (h_inv : r ≥ sstore_clear_potential orig curr) :
@@ -591,6 +611,12 @@ theorem t_8038_refund_counter_telescope_trace_inv
       dsimp [run_sstore_refund_trace]
       exact ih curr r h_inv
 
+/--
+**Root refund-counter non-negativity at transaction settlement**
+- *Natural property:* Starting from transaction entry (`curr = orig`, `refundCounter = 0`), any finite trace of committed `SSTORE` writes and reverted/halted child frames finishes with a non-negative root `refundCounter`.
+- *Formal statement:* `(run_sstore_refund_trace orig trace (orig, 0)).2 ≥ 0` for all `orig : Nat` and `trace : List SstoreTraceStep`.
+- *Scope note:* Abstract `SstoreTraceStep` model (lifting across independent storage slots since EIP-8246 `SELFDESTRUCT` grants `0` refund); does not model arbitrary EVM opcodes outside `SSTORE` and frame rollback.
+-/
 theorem t_8038_refund_counter_telescope_trace_root_nonneg
     (orig : Nat) (trace : List SstoreTraceStep) :
     (run_sstore_refund_trace orig trace (orig, 0)).2 ≥ 0 := by
@@ -613,9 +639,12 @@ charging sites (`call`, `generic_create`, `selfdestruct`, `charge_value_transfer
 def set_delegation_charges_new_account_alive (txState : TransactionState) (authority : Address) : Bool :=
   !is_account_alive txState authority
 
-/-- Theorem: On every `TransactionState` satisfying `NoEmptyAccountLeaves` (which is preserved by all
-`state_tracker.py` mutators via `no_empty_account_leaves_preserved`), `set_delegation_charges_new_account_v16898000`
-and `set_delegation_charges_new_account_alive` are observationally identical. -/
+/--
+**Equivalence of account_exists and is_account_alive in set_delegation under pruned state (T-8037-7702-DELEGATION-INVARIANT-EQUIV)**
+- *Natural property:* Whenever the state trie contains no unpruned empty account leaves (`NoEmptyAccountLeaves`), `set_delegation`'s `not account_exists` check charges `NEW_ACCOUNT` state gas on the exact same states as `not is_account_alive`.
+- *Formal statement:* Under `NoEmptyAccountLeaves txState authority`, `set_delegation_charges_new_account_v16898000 txState authority = set_delegation_charges_new_account_alive txState authority`.
+- *Scope note:* Holds on all states reachable through `state_tracker.py` mutators (`no_empty_account_leaves_preserved`); diverges only on synthetic pre-states containing an unpruned `EMPTY_ACCOUNT` leaf (`f_8037_7702_delegation_exists_vs_alive_refuter`).
+-/
 theorem t_8037_7702_delegation_exists_eq_alive_under_invariant
     (txState : TransactionState) (authority : Address)
     (h_wf : NoEmptyAccountLeaves txState authority) :
@@ -624,10 +653,12 @@ theorem t_8037_7702_delegation_exists_eq_alive_under_invariant
   dsimp only [set_delegation_charges_new_account_v16898000, set_delegation_charges_new_account_alive]
   rw [account_exists_iff_alive_of_no_empty_leaves txState authority h_wf]
 
-/-- Explicit `WitnessRefuter` for `F-8037-7702-DELEGATION-ACCOUNT-EXISTS-VS-ALIVE`:
-Only when `authority` is present in `PreState` as an unpruned `EMPTY_ACCOUNT` leaf (violating
-`NoEmptyAccountLeaves`, e.g. in a synthetic EEST fixture) does `account_exists` return `true`
-while `is_account_alive` returns `false`. -/
+/--
+**Counterexample refuter: set_delegation skips NEW_ACCOUNT charge on unpruned empty leaf (F-8037-7702-DELEGATION-ACCOUNT-EXISTS-VS-ALIVE)**
+- *Natural property:* If a pre-state contains an explicit unpruned `EMPTY_ACCOUNT` leaf for `authority`, `account_exists` returns `true` while `is_account_alive` returns `false`, skipping the `183,600` `NEW_ACCOUNT` state-gas charge in `set_delegation`.
+- *Formal statement:* `WitnessRefuter` on `accounts := [(0xdead, EMPTY_ACCOUNT)]` where `set_delegation_charges_new_account_v16898000` returns `false` while `!is_account_alive` is `true`.
+- *Scope note:* Synthetic fixture boundary violating `NoEmptyAccountLeaves` (`vm/eoa_delegation.py:295`).
+-/
 def f_8037_7702_delegation_exists_vs_alive_refuter :
     WitnessRefuter (TransactionState × Address) Bool
       (fun ⟨st, auth⟩ charged => charged = !is_account_alive st auth) where
@@ -662,11 +693,12 @@ def process_unchecked_system_transaction_meter : GasMeter :=
     stateGasLeft := SYSTEM_TRANSACTION_STATE_GAS_RESERVOIR
     stateGasBaseline := SYSTEM_TRANSACTION_STATE_GAS_RESERVOIR }
 
-/-- Theorem (`t_8037_sys_tx_reservoir_sound`, `fork.py:107-108, 756-761`):
-`process_unchecked_system_transaction` provisions `execution_gas_grant = 30,000,000` and
-`state_gas_reservoir = 1,566,720` (`16 * STATE_GAS_STORAGE_SET`), satisfying `GasMeter.SpillInvariant`
-and covering up to `16` new storage slot writes (`k ≤ SYSTEM_MAX_SSTORES_PER_CALL`) purely from
-`stateGasLeft` with `stateGasSpilled = 0`. -/
+/--
+**System-transaction execution gas and state-gas reservoir provisioning (T-8037-SYS-TX-RESERVOIR-SOUND)**
+- *Natural property:* Unchecked system transactions initialize `GasMeter` with `30,000,000` execution gas and a `1,566,720` (`16 × 97,920`) state-gas reservoir, satisfying the spill invariant and funding up to `16` fresh storage writes purely from `stateGasLeft` with zero execution-gas spill.
+- *Formal statement:* For any `k ≤ SYSTEM_MAX_SSTORES_PER_CALL` (`16`), `process_unchecked_system_transaction_meter` has `gasLeft = 30000000`, `stateGasLeft = 1566720`, `SpillInvariant`, and `charge_state_gas_from_meter ... (k * STATE_GAS_STORAGE_SET) = some post` with `post.gasLeft = 30000000` and `post.stateGasSpilled = 0`.
+- *Scope note:* System-transaction meter initialization (`fork.py:107-108, 756-761`).
+-/
 theorem t_8037_sys_tx_reservoir_sound (k : Nat) (h_k : k ≤ SYSTEM_MAX_SSTORES_PER_CALL) :
     process_unchecked_system_transaction_meter.gasLeft = 30000000 ∧
     process_unchecked_system_transaction_meter.stateGasLeft = 1566720 ∧
@@ -739,6 +771,12 @@ def top_level_delegation_patched (authority recipient : Address) (newAccountChar
       let mHalted := forfeit_remaining_gas (restore_state_gas_to_entry sErr.meter s.meter.stateGasBaseline)
       .err () { sErr with meter := mHalted }
 
+/--
+**Counterexample refuter: set_delegation OOG omits tx.recipient from Block Access List reads (F-2780-7928-SET-DELEGATION-OOG-OMITS-RECIPIENT-READ)**
+- *Natural property:* Because `create_evm` executes `set_delegation` before reading `tx_env.recipient`, an `OutOfGasError` during `set_delegation` aborts `process_top_level` before `recipient` is recorded in `account_reads` for the EIP-7928 Block Access List, even though intrinsic gas already charged `COLD_ACCOUNT_ACCESS`.
+- *Formal statement:* `WitnessRefuter` on `gasLeft = 10000, stateGasLeft = 0, charge = STATE_GAS_NEW_ACCOUNT` showing `top_level_delegation_v16898000` halts with `recipient ∉ res.state.accountReads`.
+- *Scope note:* Top-level EIP-7702 / EIP-7928 ordering projection (`vm/interpreter.py:133-196, 235-288`); does not model cross-transaction authorization replay (`INV-8`).
+-/
 def f_2780_7928_set_delegation_oog_omits_recipient_refuter :
     WitnessRefuter (TopLevelDelegationState × Address × Address × Nat) (Result Unit TopLevelDelegationState Unit)
       (fun ⟨s0, _, recipient, charge⟩ res =>
@@ -837,6 +875,12 @@ def acceptsAtDelta (e e' : Estimator) : Prop :=
   e'.reservoir = (allocate_evm_gas e'.cap ⟨e'.intrinsicExec, 0⟩).stateGasReservoir ∧
   e'.ok = budgetFits e'.cap e'.intrinsicExec e'.callGas e'.stateGas
 
+/--
+**Abstract gas-estimator unsoundness above 2^24**
+- *Natural property:* When a probe runs at `cap > TX_MAX_GAS_LIMIT` (`2^24`), `allocate_evm_gas` provisions a positive state-gas reservoir invisible to a `gasleft()`-delta estimator; replaying at `cap' = intrinsicExec + delta ≤ 2^24` zeroes the reservoir and causes the state-allocating execution to fail.
+- *Formal statement:* Given `e.cap > TX_MAX_GAS_LIMIT`, `observedBudget e`, `e.ok = true`, and `e.delta < e.callGas + e.stateGas`, `e.reservoir > 0` and there exists `e'` with `acceptsAtDelta e e'`, `e'.cap ≤ TX_MAX_GAS_LIMIT`, `e'.reservoir = 0`, and `e'.ok = false`.
+- *Scope note:* Abstract budget-allocation and `gasleft()`-delta estimator model; does not model live client RPC (`eth_estimateGas`) binary search.
+-/
 theorem estimator_unsound_above_2pow24
     (e : Estimator)
     (hcap : e.cap > TX_MAX_GAS_LIMIT)
@@ -900,6 +944,12 @@ def reducedBudgetCandidateWitness : Estimator :=
     reservoir := alloc.stateGasReservoir
     ok := budgetFits cap highBudgetProbeWitness.intrinsicExec highBudgetProbeWitness.callGas highBudgetProbeWitness.stateGas }
 
+/--
+**Concrete 16.9M-to-121k witness for abstract estimator unsoundness**
+- *Natural property:* A probe at `cap = 16,900,000` (`reservoir = 122,784`) succeeds on a `100,000`-execution-gas + `97,920`-state-gas operation while reporting `delta = 100,000`, so the candidate budget `cap' = 121,000 ≤ 2^24` gets `reservoir = 0` and fails.
+- *Formal statement:* `highBudgetProbeWitness.ok = true ∧ highBudgetProbeWitness.reservoir = 122784 ∧ acceptsAtDelta highBudgetProbeWitness reducedBudgetCandidateWitness ∧ reducedBudgetCandidateWitness.cap = 121000 ∧ reducedBudgetCandidateWitness.reservoir = 0 ∧ reducedBudgetCandidateWitness.ok = false`.
+- *Scope note:* Concrete witness paired with `estimator_unsound_above_2pow24` and negative control `allocation_zero_reservoir_below_2pow24`.
+-/
 theorem estimator_unsound_above_2pow24_witness :
     highBudgetProbeWitness.cap > TX_MAX_GAS_LIMIT ∧
     observedBudget highBudgetProbeWitness ∧
@@ -914,6 +964,12 @@ theorem estimator_unsound_above_2pow24_witness :
   refine ⟨by decide, ⟨by decide, by decide, rfl, rfl, rfl⟩, by decide, by decide, by decide,
     ⟨by decide, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩, by decide, by decide, by decide, by decide⟩
 
+/--
+**Zero state-gas reservoir below or at the 2^24 execution gas cap**
+- *Natural property:* Whenever `txGas ≤ TX_MAX_GAS_LIMIT` (`16,777,216`), `allocate_evm_gas` assigns `0` to `stateGasReservoir` and routes all post-intrinsic gas into `executionGas`.
+- *Formal statement:* Given `intrinsic.execution ≤ txGas ≤ TX_MAX_GAS_LIMIT`, `(allocate_evm_gas txGas intrinsic).stateGasReservoir = 0 ∧ (allocate_evm_gas txGas intrinsic).executionGas = txGas - intrinsic.execution`.
+- *Scope note:* Negative control for `estimator_unsound_above_2pow24` on `vm/gas.py:1105-1138`.
+-/
 theorem allocation_zero_reservoir_below_2pow24 (txGas : Nat) (intrinsic : IntrinsicGasCost)
     (h_lo : intrinsic.execution ≤ txGas)
     (h_hi : txGas ≤ TX_MAX_GAS_LIMIT) :
@@ -964,6 +1020,12 @@ def run_fixed_budget_caught_subcall
           let parentFinal := incorporate_child_meter parentAfterDrain childHalted true
           some ⟨true, false, parentFinal.gasLeft, parentFinal.stateGasLeft⟩
 
+/--
+**Transaction-gas dependence of fixed-budget caught subcalls**
+- *Natural property:* A caught child call capped at `150,000` execution gas that requires `60,000` execution gas plus one fresh storage slot (`97,920` state gas) fails at `txGas = 500,000` (`reservoir = 0`) yet succeeds at `txGas = 16,900,000` (`reservoir = 122,784`) because the forwarded reservoir covers the state-gas charge.
+- *Formal statement:* `run_fixed_budget_caught_subcall 500000 21000 50000 150000 60000 STATE_GAS_STORAGE_SET` yields `some (true, false)`, whereas `txGas = 16900000` yields `some (true, true)`.
+- *Scope note:* Two-frame `GasMeter` model capturing the Uniswap v4 `notifyUnsubscribe` fixed-budget pattern; does not replay live EVM bytecode.
+-/
 theorem t_8037_c13_fixed_budget_subcall_tx_gas_dependent :
     (run_fixed_budget_caught_subcall 500000 21000 50000 150000 60000 STATE_GAS_STORAGE_SET).map
       (fun o => (o.txSuccess, o.subcallSuccess)) = some (true, false) ∧

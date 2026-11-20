@@ -12,7 +12,7 @@ bootstrap:
 prove:
 	@lake build
 	@python3 scripts/audit_metadata.py
-	@printf '%s\n' 'prove ok: Common EL core, Eip8246, Gas (8037/8038/2780/7778), Gloas7732 (+8282), and TestVectors compiled with 0 sorryAx, 0 axiom, 0 native_decide'
+	@printf '%s\n' 'prove ok: Common EL core, Eip8246, Eip8483, Gas (8037/8038/2780/7778), Gloas7732 (+8282), and TestVectors compiled with 0 sorryAx, 0 axiom, 0 native_decide'
 
 turbo-verify: prove
 	@turbo-lean --json ci-verify --project-dir . --mode trusted --scope Glamsterdam --receipt .lake/turbo-receipt.json
@@ -22,6 +22,7 @@ turbo-verify: prove
 		turbo-lean --json audit-spec Glamsterdam/Common/MetaSpec.lean; \
 		turbo-lean --json audit-spec Glamsterdam/Common/ElCore.lean; \
 		turbo-lean --json audit-spec Glamsterdam/Eip8246/Spec.lean; \
+		turbo-lean --json audit-spec Glamsterdam/Eip8483/Spec.lean; \
 		turbo-lean --json audit-spec Glamsterdam/Gas/Spec.lean; \
 		turbo-lean --json audit-spec Glamsterdam/Gas/CallTree.lean; \
 		turbo-lean --json audit-spec Glamsterdam/Gas/Eip12582.lean; \

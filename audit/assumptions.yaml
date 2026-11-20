@@ -9,6 +9,9 @@ assumptions:
   - id: "A-SAME-SLOT-UNBUNDLING-BOUNDARY"
     domain: "Gloas EIP-7732"
     description: "For same-slot unbundling resistance (t_7732_same_slot_unbundling): (1) a private transaction txPriv is known only to the builder of slot N prior to payload envelope reveal, (2) there is no competing consensus block at slot N prior to the attestation deadline other than the block committing to bid.block_hash via process_execution_payload_bid, and (3) ExecutionPayload.block_hash is collision-resistant."
+  - id: "A-8483-REGISTRATIONS"
+    domain: "EIP-8483"
+    description: "Decoded request fields preserve equality and the EL supplies the authentic source address. Registrations have unique keys, are observed by pubkey, and an authorized append fits in the SSZ list."
 exclusions:
   - id: "X-GLOAS-FORK-CHOICE"
     domain: "Gloas EIP-7732"
@@ -19,3 +22,6 @@ exclusions:
   - id: "X-EIP-8253-COLLISION-WIPE"
     domain: "EIP-8246"
     description: "EIP-8253 storage wipe on deployment collision (scheduled for Hegota) is excluded from EIP-8246 scope per Paweł Bylica."
+  - id: "X-8483-REGISTRATION-TRANSPORT"
+    domain: "EIP-8483"
+    description: "EL admission, SSZ, eligibility for exit or index replacement, queue scheduling and migration-fork use of the material are outside this dequeue-step model."
