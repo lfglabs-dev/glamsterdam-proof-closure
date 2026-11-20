@@ -37,23 +37,45 @@ def process (builders : List Builder) (regs : Registrations) (request : Request)
     fun key => if key = request.pubkey then some request.material else regs key
   else regs
 
+/-- **Authorized registration**
+
+*Natural property.* The current owner can set registration material for its builder key.
+
+*Formal statement.* When the registry lookup returns the request’s source address, the result at `r.pubkey` is `some r.material`.
+-/
 theorem authorized_write (builders : List Builder) (regs : Registrations) (r : Request)
     (h : ownerAtProcessing builders r.pubkey = some r.sourceAddress) :
     process builders regs r r.pubkey = some r.material := by
   simp [process, authorized, h]
 
+/-- **Unauthorized request**
+
+*Natural property.* An absent builder key or a source address that does not match the current owner leaves every registration unchanged.
+
+*Formal statement.* If the lookup differs from `some r.sourceAddress`, then `process builders regs r = regs`.
+-/
 theorem unauthorized_unchanged (builders : List Builder) (regs : Registrations) (r : Request)
     (h : ownerAtProcessing builders r.pubkey ≠ some r.sourceAddress) :
     process builders regs r = regs := by
   simp [process, authorized, h]
 
+/-- **Isolation between builder keys**
+
+*Natural property.* A request for one key preserves the registration at every other key.
+
+*Formal statement.* For every `key ≠ r.pubkey`, the result at `key` equals `regs key`.
+-/
 theorem other_key_unchanged (builders : List Builder) (regs : Registrations) (r : Request)
     (key : Nat) (h : key ≠ r.pubkey) : process builders regs r key = regs key := by
   unfold process
   split <;> simp [h]
 
-/-- A queued request survives a slot replacement. Reading the replacement builder's
-registration gives exactly its previous value, including an existing registration. -/
+/-- **Registration isolation across index reuse**
+
+*Natural property.* A queued request for a former occupant preserves the replacement builder’s registration when their public keys differ.
+
+*Formal statement.* If index `i` held `old` and the request names `old.pubkey ≠ newBuilder.pubkey`, processing after `before.set i newBuilder` leaves the value at `newBuilder.pubkey` equal to `regs newBuilder.pubkey`.
+-/
 theorem delayed_registration_after_reuse (before : List Builder) (i : Nat) (old newBuilder : Builder)
     (regs : Registrations) (r : Request) (_occupied : before[i]? = some old)
     (queuedFor : r.pubkey = old.pubkey) (distinct : old.pubkey ≠ newBuilder.pubkey) :
