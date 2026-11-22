@@ -877,4 +877,100 @@ def calltree_t6_midframe_gas_cabi (schedId entryGas postCreateExec : UInt64) (ap
   | some fm => fm.meter.gasLeft.toUInt64
   | none => 0
 
+/-! ## 5. Dynamic EIP-8038 Warm-Set Tracking & Child-Revert Rollback (`vm/instructions/storage.py:37-66`) -/
+
+/-- `CallFrameMeter` paired with dynamic EIP-2929 / EIP-8038 warm storage keys and addresses. -/
+structure WarmCallFrame where
+  fm : CallFrameMeter
+  warmSlots : List StorageKey := []
+  warmAddrs : List Address := []
+  deriving Repr, DecidableEq, BEq
+
+/-- Dynamic `SLOAD` charging `GAS_COLD_STORAGE_ACCESS` (`2,100`) on first access and
+`GAS_WARM_ACCESS` (`100`) on subsequent accesses in the same frame, adding `key` to `warmSlots`. -/
+def exec_sload_warm (wf : WarmCallFrame) (key : StorageKey) : Option WarmCallFrame :=
+  let isCold := !(wf.warmSlots.contains key)
+  let cost := if isCold then GAS_COLD_STORAGE_ACCESS else GAS_WARM_ACCESS
+  match frame_charge_exec wf.fm cost with
+  | none => none
+  | some fm' =>
+    let newWarm := if isCold then key :: wf.warmSlots else wf.warmSlots
+    some { wf with fm := fm', warmSlots := newWarm }
+
+/-- Merge a returning child `WarmCallFrame` into its parent:
+- On `.success`, adopts `child.warmSlots` and `child.warmAddrs`.
+- On `.revert` or `.halt`, rolls back the warm sets to `parentWithheld` (matching `restore_tx_state`). -/
+def exit_child_warm (sched : ForkSchedule) (parentWithheld child : WarmCallFrame)
+    (status : ChildStatus) : WarmCallFrame :=
+  let mergedFm := exit_child_frame sched parentWithheld.fm child.fm status
+  match status with
+  | .success =>
+    { fm := mergedFm, warmSlots := child.warmSlots, warmAddrs := child.warmAddrs }
+  | .revert | .halt =>
+    { fm := mergedFm, warmSlots := parentWithheld.warmSlots, warmAddrs := parentWithheld.warmAddrs }
+
+/--
+**Dynamic EIP-8038 warm/cold `SLOAD` pricing and revert isolation (T-8038-WARM-COLD-DYNAMIC)**
+- *Natural property:* Reading a cold storage key twice in the same frame pays `GAS_COLD_STORAGE_ACCESS` (`2,100`) on the first `SLOAD` and `GAS_WARM_ACCESS` (`100`) on the second (`2,200 < 2 × 2,100`). If a child frame warms that key and reverts or halts, the key stays cold in the parent frame and the parent still pays `2,100`.
+- *Formal statement:* When `key ∉ wf.warmSlots` and `wf.fm.meter.gasLeft ≥ 2200`, two consecutive `exec_sload_warm` calls succeed and reduce `gasLeft` by `2,200` (`2,100 + 100`). For any `status ∈ {.revert, .halt}`, `exit_child_warm sched parent childWarmed status` preserves `key ∉ warmSlots`, so the parent's subsequent `exec_sload_warm` charges `2,100`.
+- *Scope note:* Dynamic `warmSlots` tracking over `CallFrameMeter` (`vm/instructions/storage.py:37-66`, `vm/__init__.py:188-245`).
+-/
+theorem t_8038_warm_cold_dynamic_and_revert_isolation
+    (sched : ForkSchedule) (wf : WarmCallFrame) (key : StorageKey)
+    (h_cold : wf.warmSlots.contains key = false)
+    (h_gas : wf.fm.meter.gasLeft ≥ GAS_COLD_STORAGE_ACCESS + GAS_WARM_ACCESS) :
+    (∃ wf1 wf2,
+      exec_sload_warm wf key = some wf1 ∧
+      exec_sload_warm wf1 key = some wf2 ∧
+      wf1.fm.meter.gasLeft = wf.fm.meter.gasLeft - GAS_COLD_STORAGE_ACCESS ∧
+      wf2.fm.meter.gasLeft = wf.fm.meter.gasLeft - (GAS_COLD_STORAGE_ACCESS + GAS_WARM_ACCESS) ∧
+      wf2.warmSlots.contains key = true) ∧
+    (∀ (childWarmed : WarmCallFrame) (status : ChildStatus),
+      (status = .revert ∨ status = .halt) →
+      let parentPost := exit_child_warm sched wf childWarmed status
+      parentPost.warmSlots.contains key = false ∧
+      (parentPost.fm.meter.gasLeft ≥ GAS_COLD_STORAGE_ACCESS →
+        ∃ pAfter,
+          exec_sload_warm parentPost key = some pAfter ∧
+          pAfter.fm.meter.gasLeft = parentPost.fm.meter.gasLeft - GAS_COLD_STORAGE_ACCESS)) := by
+  constructor
+  · have h_ge1 : ¬ (wf.fm.meter.gasLeft < GAS_COLD_STORAGE_ACCESS) := by
+      dsimp [GAS_COLD_STORAGE_ACCESS, GAS_WARM_ACCESS] at *; omega
+    have h_ge2 : ¬ (wf.fm.meter.gasLeft - GAS_COLD_STORAGE_ACCESS < GAS_WARM_ACCESS) := by
+      dsimp [GAS_COLD_STORAGE_ACCESS, GAS_WARM_ACCESS] at *; omega
+    refine ⟨
+      { wf with
+        fm := { wf.fm with meter := { wf.fm.meter with gasLeft := wf.fm.meter.gasLeft - GAS_COLD_STORAGE_ACCESS } }
+        warmSlots := key :: wf.warmSlots },
+      { wf with
+        fm := { wf.fm with meter := { wf.fm.meter with gasLeft := wf.fm.meter.gasLeft - GAS_COLD_STORAGE_ACCESS - GAS_WARM_ACCESS } }
+        warmSlots := key :: wf.warmSlots },
+      ?_, ?_, rfl, by dsimp only; omega, by simp⟩
+    · simp only [exec_sload_warm, frame_charge_exec, charge_gas_from_meter,
+        h_cold, Bool.not_false, ↓reduceIte, h_ge1]
+    · simp only [exec_sload_warm, frame_charge_exec, charge_gas_from_meter,
+        List.contains_cons, beq_self_eq_true, Bool.true_or, Bool.not_true,
+        Bool.false_eq_true, ↓reduceIte, h_ge2]
+  · intro childWarmed status h_fail
+    have h_post :
+        exit_child_warm sched wf childWarmed status =
+          { fm := exit_child_frame sched wf.fm childWarmed.fm status
+            warmSlots := wf.warmSlots
+            warmAddrs := wf.warmAddrs } := by
+      rcases h_fail with rfl | rfl <;> rfl
+    rw [h_post]
+    refine ⟨h_cold, fun h_pg => ?_⟩
+    have h_not_lt :
+        ¬ ((exit_child_frame sched wf.fm childWarmed.fm status).meter.gasLeft < GAS_COLD_STORAGE_ACCESS) := by
+      dsimp only at h_pg; omega
+    refine ⟨
+      { fm := { (exit_child_frame sched wf.fm childWarmed.fm status) with
+                meter := { (exit_child_frame sched wf.fm childWarmed.fm status).meter with
+                           gasLeft := (exit_child_frame sched wf.fm childWarmed.fm status).meter.gasLeft - GAS_COLD_STORAGE_ACCESS } }
+        warmSlots := key :: wf.warmSlots
+        warmAddrs := wf.warmAddrs },
+      ?_, rfl⟩
+    simp only [exec_sload_warm, frame_charge_exec, charge_gas_from_meter,
+      h_cold, Bool.not_false, ↓reduceIte, h_not_lt]
+
 end Glamsterdam.Gas.CallTree

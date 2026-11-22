@@ -1033,4 +1033,409 @@ theorem t_8037_c13_fixed_budget_subcall_tx_gas_dependent :
       (fun o => (o.txSuccess, o.subcallSuccess)) = some (true, true) := by
   exact ⟨by decide, by decide⟩
 
+/-! ## 8. Multi-Transaction Block Gas Accounting (`check_block_gas_capacity` + `settle_transaction_gas`) -/
+
+/-- Cumulative block-level gas usage across the three EIP-8037 / EIP-4844 dimensions. -/
+structure BlockGasState where
+  blockGasUsed : Nat := 0
+  blockStateGasUsed : Nat := 0
+  blobGasUsed : Nat := 0
+  deriving Repr, DecidableEq, BEq
+
+/-- Per-transaction settlement inputs for block-level dual gas accounting. -/
+structure BlockTxGas where
+  txGas : Nat
+  calldataFloor : Nat
+  gasLeft : Nat
+  stateGasLeft : Nat
+  refundCounter : Nat
+  stateGasUsed : Nat
+  txBlobGas : Nat := 0
+  deriving Repr, DecidableEq, BEq
+
+/-- Apply one transaction to the cumulative block gas counters:
+1. Verify `check_block_gas_capacity` against the symbolic `blockGasLimit`.
+2. Settle the transaction via `settle_transaction_gas` and check execution/state settlement bounds
+   (`s.executionGasUsed ≤ min TX_MAX_GAS_LIMIT tx.txGas` and `s.stateGasUsed ≤ tx.txGas`).
+3. Accumulate `executionGasUsed`, `stateGasUsed`, and `txBlobGas`. -/
+def apply_tx_block_gas (blockGasLimit : Nat) (st : BlockGasState) (tx : BlockTxGas) :
+    Option BlockGasState :=
+  if check_block_gas_capacity blockGasLimit st.blockGasUsed st.blockStateGasUsed
+      st.blobGasUsed tx.txGas tx.txBlobGas then
+    let s := settle_transaction_gas tx.txGas tx.calldataFloor tx.gasLeft
+      tx.stateGasLeft tx.refundCounter tx.stateGasUsed
+    if s.executionGasUsed ≤ min TX_MAX_GAS_LIMIT tx.txGas ∧ s.stateGasUsed ≤ tx.txGas then
+      some
+        { blockGasUsed := st.blockGasUsed + s.executionGasUsed
+          blockStateGasUsed := st.blockStateGasUsed + s.stateGasUsed
+          blobGasUsed := st.blobGasUsed + tx.txBlobGas }
+    else
+      none
+  else
+    none
+
+/-- Fold `apply_tx_block_gas` over a list of transactions in a block. -/
+def run_block_gas_accounting (blockGasLimit : Nat) :
+    List BlockTxGas → BlockGasState → Option BlockGasState
+  | [], st => some st
+  | tx :: rest, st =>
+    match apply_tx_block_gas blockGasLimit st tx with
+    | none => none
+    | some st' => run_block_gas_accounting blockGasLimit rest st'
+
+private theorem apply_tx_block_gas_refund_indep (blockGasLimit : Nat) (st : BlockGasState)
+    (tx : BlockTxGas) (altRefund : Nat) :
+    apply_tx_block_gas blockGasLimit st { tx with refundCounter := altRefund } =
+      apply_tx_block_gas blockGasLimit st tx := by
+  unfold apply_tx_block_gas settle_transaction_gas
+  rfl
+
+/--
+**Multi-transaction block dual gas cap and refund invariance for any block gas limit (T-7778-8037-BLOCK-GAS-INVARIANT)**
+- *Natural property:* For any symbolic `blockGasLimit`, folding any sequence of valid transactions through `check_block_gas_capacity` and `settle_transaction_gas` keeps both `blockGasUsed` and `blockStateGasUsed` within `blockGasLimit` (and `blobGasUsed ≤ MAX_BLOB_GAS_PER_BLOCK`), and changing every transaction's `refundCounter` leaves the block gas state completely unchanged.
+- *Formal statement:* Under initial capacity bounds on `st0`, `run_block_gas_accounting blockGasLimit txs st0 = some stFinal` implies `stFinal.blockGasUsed ≤ blockGasLimit ∧ stFinal.blockStateGasUsed ≤ blockGasLimit ∧ stFinal.blobGasUsed ≤ MAX_BLOB_GAS_PER_BLOCK`, and mapping `refundCounter` via any function `f` yields the identical `Option BlockGasState`.
+- *Scope note:* Multi-transaction block gas fold over `vm/gas.py:1038-1089, 1163-1228` with symbolic `blockGasLimit`.
+-/
+theorem t_7778_8037_block_gas_cap_and_refund_invariance
+    (blockGasLimit : Nat) (txs : List BlockTxGas) (st0 : BlockGasState)
+    (h_exec0 : st0.blockGasUsed ≤ blockGasLimit)
+    (h_state0 : st0.blockStateGasUsed ≤ blockGasLimit)
+    (h_blob0 : st0.blobGasUsed ≤ MAX_BLOB_GAS_PER_BLOCK) :
+    (∀ stFinal, run_block_gas_accounting blockGasLimit txs st0 = some stFinal →
+      stFinal.blockGasUsed ≤ blockGasLimit ∧
+      stFinal.blockStateGasUsed ≤ blockGasLimit ∧
+      stFinal.blobGasUsed ≤ MAX_BLOB_GAS_PER_BLOCK) ∧
+    (∀ f : Nat → Nat,
+      run_block_gas_accounting blockGasLimit
+        (txs.map (fun tx => { tx with refundCounter := f tx.refundCounter })) st0 =
+      run_block_gas_accounting blockGasLimit txs st0) := by
+  induction txs generalizing st0 with
+  | nil =>
+    refine ⟨?_, fun _ => rfl⟩
+    intro stFinal h
+    simp only [run_block_gas_accounting, Option.some.injEq] at h
+    subst h
+    exact ⟨h_exec0, h_state0, h_blob0⟩
+  | cons tx rest ih =>
+    constructor
+    · intro stFinal h
+      dsimp only [run_block_gas_accounting] at h
+      cases h_step : apply_tx_block_gas blockGasLimit st0 tx with
+      | none => rw [h_step] at h; contradiction
+      | some st1 =>
+        rw [h_step] at h
+        unfold apply_tx_block_gas at h_step
+        split at h_step
+        · rename_i h_cap
+          dsimp only at h_step
+          split at h_step
+          · rename_i h_bounds
+            simp only [Option.some.injEq] at h_step
+            subst h_step
+            unfold check_block_gas_capacity at h_cap
+            simp only [Bool.and_eq_true, decide_eq_true_eq] at h_cap
+            have h_exec1 :
+                st0.blockGasUsed +
+                  (settle_transaction_gas tx.txGas tx.calldataFloor tx.gasLeft
+                    tx.stateGasLeft tx.refundCounter tx.stateGasUsed).executionGasUsed ≤
+                  blockGasLimit := by omega
+            have h_state1 :
+                st0.blockStateGasUsed +
+                  (settle_transaction_gas tx.txGas tx.calldataFloor tx.gasLeft
+                    tx.stateGasLeft tx.refundCounter tx.stateGasUsed).stateGasUsed ≤
+                  blockGasLimit := by omega
+            have h_blob1 : st0.blobGasUsed + tx.txBlobGas ≤ MAX_BLOB_GAS_PER_BLOCK := by omega
+            exact (ih _ h_exec1 h_state1 h_blob1).1 stFinal h
+          · contradiction
+        · contradiction
+    · intro f
+      dsimp only [List.map, run_block_gas_accounting]
+      rw [apply_tx_block_gas_refund_indep]
+      cases h_step : apply_tx_block_gas blockGasLimit st0 tx with
+      | none => rfl
+      | some st1 =>
+        unfold apply_tx_block_gas at h_step
+        split at h_step
+        · rename_i h_cap
+          dsimp only at h_step
+          split at h_step
+          · rename_i h_bounds
+            simp only [Option.some.injEq] at h_step
+            subst h_step
+            unfold check_block_gas_capacity at h_cap
+            simp only [Bool.and_eq_true, decide_eq_true_eq] at h_cap
+            exact (ih _ (by dsimp only; omega) (by dsimp only; omega) (by dsimp only; omega)).2 f
+          · contradiction
+        · contradiction
+
+/-- Reachable two-transaction 60M-gas block witness: a 45M contract deployment (2M execution gas,
+38M state gas) and a 15M pure-compute transaction fit together under the dual block cap. -/
+theorem t_7778_8037_block_gas_witness :
+    let deployTx : BlockTxGas :=
+      { txGas := 45000000, calldataFloor := 100000, gasLeft := 0, stateGasLeft := 5000000,
+        refundCounter := 10000, stateGasUsed := 38000000 }
+    let computeTx : BlockTxGas :=
+      { txGas := 15000000, calldataFloor := 21000, gasLeft := 0, stateGasLeft := 0,
+        refundCounter := 50000, stateGasUsed := 0 }
+    run_block_gas_accounting 60000000 [deployTx, computeTx] {} =
+      some ⟨17000000, 38000000, 0⟩ := by
+  decide
+
+/-! ## 9. Real Child-Rollback Bridge & Multi-Slot `SSTORE` Refund Trace -/
+
+/-- Execute a `List SstoreTraceStep` while explicitly running every `.revertedChild` sub-trace
+on a child frame starting at `child.refundCounter = 0` and rolling back via `restore_state_gas`
+and `restore_tx_state`. -/
+def run_sstore_refund_trace_with_child_exec (origVal : Nat) :
+    List SstoreTraceStep → Nat × Int → Nat × Int
+  | [], st => st
+  | (.sstore isCold newVal) :: rest, (currVal, r) =>
+    let d := (price_sstore isCold origVal currVal newVal).refundDelta
+    run_sstore_refund_trace_with_child_exec origVal rest (newVal, r + d)
+  | (.revertedChild childWrites) :: rest, (currVal, r) =>
+    let (_, childRefund) := childWrites.foldl
+      (fun (cv, cr) (isCold, nv) => (nv, cr + (price_sstore isCold origVal cv nv).refundDelta))
+      (currVal, (0 : Int))
+    let childMeterAfter : GasMeter :=
+      { gasLeft := 0, stateGasLeft := 0, stateGasBaseline := 0, refundCounter := childRefund }
+    let childRestored := restore_state_gas childMeterAfter
+    run_sstore_refund_trace_with_child_exec origVal rest (currVal, r + childRestored.refundCounter)
+
+/-- Equivalence showing explicit child execution + `restore_state_gas` rollback equals the abstract
+`run_sstore_refund_trace` transition. -/
+theorem run_sstore_refund_trace_with_child_exec_eq (origVal : Nat) (trace : List SstoreTraceStep)
+    (st : Nat × Int) :
+    run_sstore_refund_trace_with_child_exec origVal trace st =
+      run_sstore_refund_trace origVal trace st := by
+  induction trace generalizing st with
+  | nil => rfl
+  | cons step rest ih =>
+    cases st with
+    | mk currVal r =>
+      cases step with
+      | sstore isCold newVal =>
+        dsimp only [run_sstore_refund_trace_with_child_exec, run_sstore_refund_trace]
+        exact ih (newVal, r + (price_sstore isCold origVal currVal newVal).refundDelta)
+      | revertedChild childWrites =>
+        dsimp only [run_sstore_refund_trace_with_child_exec, run_sstore_refund_trace, restore_state_gas]
+        simpa only [Int.add_zero] using ih (currVal, r)
+
+/-- Multi-slot execution step interleaving `SSTORE` across arbitrary storage keys, pure compute
+opcodes (`execOp`), and nested reverting child frames (`revertedChild`). -/
+inductive MultiSlotTraceStep where
+  | sstore (key : StorageKey) (isCold : Bool) (newVal : Nat)
+  | execOp (gasCost : Nat)
+  | revertedChild (childSteps : List MultiSlotTraceStep)
+  deriving Repr, BEq
+
+/-- Update a storage map at a single key. -/
+def updateSlot (m : StorageKey → Nat) (k : StorageKey) (v : Nat) : StorageKey → Nat :=
+  fun k' => if k' == k then v else m k'
+
+/-- Execute a multi-slot trace with explicit child-frame execution and `restore_state_gas` rollback. -/
+def run_multislot_refund_trace (origMap : StorageKey → Nat) :
+    List MultiSlotTraceStep → (StorageKey → Nat) × Int → (StorageKey → Nat) × Int
+  | [], st => st
+  | (.sstore key isCold newVal) :: rest, (currMap, r) =>
+    let d := (price_sstore isCold (origMap key) (currMap key) newVal).refundDelta
+    run_multislot_refund_trace origMap rest (updateSlot currMap key newVal, r + d)
+  | (.execOp _) :: rest, st =>
+    run_multislot_refund_trace origMap rest st
+  | (.revertedChild childSteps) :: rest, (currMap, r) =>
+    let (_, childRefund) := run_multislot_refund_trace origMap childSteps (currMap, 0)
+    let childRestored := restore_state_gas
+      { gasLeft := 0, stateGasLeft := 0, stateGasBaseline := 0, refundCounter := childRefund }
+    run_multislot_refund_trace origMap rest (currMap, r + childRestored.refundCounter)
+
+/-- Sum of `sstore_clear_potential` across a duplicate-free list of storage keys. -/
+def multi_slot_potential (origMap currMap : StorageKey → Nat) : List StorageKey → Int
+  | [] => 0
+  | k :: ks => sstore_clear_potential (origMap k) (currMap k) + multi_slot_potential origMap currMap ks
+
+private theorem multi_slot_potential_nonneg (origMap currMap : StorageKey → Nat) (ks : List StorageKey) :
+    multi_slot_potential origMap currMap ks ≥ 0 := by
+  induction ks with
+  | nil => simp [multi_slot_potential]
+  | cons k ks ih =>
+    dsimp only [multi_slot_potential]
+    have hk := (t_8038_sstore_refund_delta_potential false (origMap k) (currMap k) (currMap k)).2.2.1
+    omega
+
+private theorem multi_slot_potential_orig_zero (origMap : StorageKey → Nat) (ks : List StorageKey) :
+    multi_slot_potential origMap origMap ks = 0 := by
+  induction ks with
+  | nil => rfl
+  | cons k ks ih =>
+    dsimp only [multi_slot_potential]
+    have hk := (t_8038_sstore_refund_delta_potential false (origMap k) (origMap k) (origMap k)).2.2.2
+    omega
+
+private theorem multi_slot_potential_update_not_mem (origMap currMap : StorageKey → Nat)
+    (key : StorageKey) (newVal : Nat) (ks : List StorageKey) (h_not : key ∉ ks) :
+    multi_slot_potential origMap (updateSlot currMap key newVal) ks =
+      multi_slot_potential origMap currMap ks := by
+  induction ks with
+  | nil => rfl
+  | cons k ks ih =>
+    have h_ne : k ≠ key := fun h_eq => h_not (by simp [h_eq])
+    have h_not_tl : key ∉ ks := fun h_mem => h_not (List.mem_cons_of_mem k h_mem)
+    have h_beq : (k == key) = false := beq_false_of_ne h_ne
+    dsimp only [multi_slot_potential, updateSlot]
+    rw [h_beq]
+    simp only [Bool.false_eq_true, ↓reduceIte]
+    rw [ih h_not_tl]
+
+private theorem multi_slot_potential_update_mem (origMap currMap : StorageKey → Nat)
+    (key : StorageKey) (newVal : Nat) (ks : List StorageKey)
+    (h_nodup : ks.Nodup) (h_mem : key ∈ ks) :
+    multi_slot_potential origMap (updateSlot currMap key newVal) ks -
+      multi_slot_potential origMap currMap ks =
+    sstore_clear_potential (origMap key) newVal -
+      sstore_clear_potential (origMap key) (currMap key) := by
+  induction ks with
+  | nil => contradiction
+  | cons k ks ih =>
+    rw [List.nodup_cons] at h_nodup
+    rcases h_nodup with ⟨h_k_not_in, h_ks_nodup⟩
+    cases List.mem_cons.mp h_mem with
+    | inl h_eq =>
+      subst h_eq
+      dsimp only [multi_slot_potential]
+      have h_tl := multi_slot_potential_update_not_mem origMap currMap key newVal ks h_k_not_in
+      have h_at : updateSlot currMap key newVal key = newVal := by simp [updateSlot]
+      rw [h_at, h_tl]
+      omega
+    | inr h_in_tl =>
+      have h_ne : k ≠ key := fun h_eq => h_k_not_in (h_eq ▸ h_in_tl)
+      have h_beq : (k == key) = false := beq_false_of_ne h_ne
+      dsimp only [multi_slot_potential]
+      have h_at : updateSlot currMap key newVal k = currMap k := by simp [updateSlot, h_beq]
+      rw [h_at]
+      have h_rec := ih h_ks_nodup h_in_tl
+      omega
+
+/-- All storage keys written at top-level steps of a `MultiSlotTraceStep` list belong to `ks`. -/
+def MultiSlotKeysIn (ks : List StorageKey) : List MultiSlotTraceStep → Prop
+  | [] => True
+  | (.sstore key _ _) :: rest => key ∈ ks ∧ MultiSlotKeysIn ks rest
+  | (.execOp _) :: rest => MultiSlotKeysIn ks rest
+  | (.revertedChild _) :: rest => MultiSlotKeysIn ks rest
+
+theorem t_8038_multislot_refund_trace_inv
+    (origMap : StorageKey → Nat) (ks : List StorageKey) (h_nodup : ks.Nodup)
+    (trace : List MultiSlotTraceStep) (h_keys : MultiSlotKeysIn ks trace)
+    (currMap : StorageKey → Nat) (r : Int)
+    (h_inv : r ≥ multi_slot_potential origMap currMap ks) :
+    (run_multislot_refund_trace origMap trace (currMap, r)).2 ≥
+      multi_slot_potential origMap (run_multislot_refund_trace origMap trace (currMap, r)).1 ks ∧
+    multi_slot_potential origMap (run_multislot_refund_trace origMap trace (currMap, r)).1 ks ≥ 0 := by
+  induction trace generalizing currMap r with
+  | nil =>
+    simp only [run_multislot_refund_trace]
+    exact ⟨h_inv, multi_slot_potential_nonneg origMap currMap ks⟩
+  | cons step rest ih =>
+    cases step with
+    | sstore key isCold newVal =>
+      rcases h_keys with ⟨h_mem, h_rest⟩
+      simp only [run_multislot_refund_trace]
+      have h_step := t_8038_sstore_refund_delta_potential isCold (origMap key) (currMap key) newVal
+      have h_pot := multi_slot_potential_update_mem origMap currMap key newVal ks h_nodup h_mem
+      apply ih h_rest (updateSlot currMap key newVal)
+        (r + (price_sstore isCold (origMap key) (currMap key) newVal).refundDelta)
+      omega
+    | execOp _ =>
+      simp only [run_multislot_refund_trace]
+      exact ih h_keys currMap r h_inv
+    | revertedChild _ =>
+      simp only [run_multislot_refund_trace, restore_state_gas, Int.add_zero]
+      exact ih h_keys currMap r h_inv
+
+/--
+**Multi-slot root refund-counter non-negativity with interleaved compute and child rollbacks (T-8038-REFUND-MULTISLOT-NONNEG)**
+- *Natural property:* Starting from any pre-transaction storage map `origMap` with `refundCounter = 0`, any finite multi-slot sequence of `SSTORE` writes across arbitrary keys, interleaved pure compute opcodes, and nested reverting child frames ends with a non-negative root `refundCounter`.
+- *Formal statement:* For any duplicate-free key set `ks` covering top-level `SSTORE` keys, `(run_multislot_refund_trace origMap trace (origMap, 0)).2 ≥ 0`.
+- *Scope note:* Multi-slot `SSTORE` + pure compute + `restore_state_gas` child-rollback trace model.
+-/
+theorem t_8038_multislot_refund_trace_root_nonneg
+    (origMap : StorageKey → Nat) (ks : List StorageKey) (h_nodup : ks.Nodup)
+    (trace : List MultiSlotTraceStep) (h_keys : MultiSlotKeysIn ks trace) :
+    (run_multislot_refund_trace origMap trace (origMap, 0)).2 ≥ 0 := by
+  have h0 : (0 : Int) ≥ multi_slot_potential origMap origMap ks := by
+    rw [multi_slot_potential_orig_zero]
+    omega
+  have h_inv := t_8038_multislot_refund_trace_inv origMap ks h_nodup trace h_keys origMap 0 h0
+  omega
+
+/-! ## 10. EIP-7702 Set-Then-Clear Committed Charge & `INV-8` Mined-OOG Replay -/
+
+/-- Apply one EIP-7702 authorization entry (`vm/eoa_delegation.py:231-321`):
+charges `STATE_GAS_AUTH_BASE` (`35,190`) plus `STATE_GAS_NEW_ACCOUNT` (`183,600`) when the
+authority is not yet alive, then commits state gas via `commit_state_gas` regardless of whether
+`target = 0` (clear) or `target ≠ 0` (set). -/
+def apply_delegation_entry (m : GasMeter) (_target : Address) (alreadyAlive : Bool) : Option GasMeter :=
+  let charge := STATE_GAS_AUTH_BASE + (if alreadyAlive then 0 else STATE_GAS_NEW_ACCOUNT)
+  (charge_state_gas_from_meter m charge).map commit_state_gas
+
+private theorem charge_state_gas_commit_delta (m m' : GasMeter) (c : Nat)
+    (h : charge_state_gas_from_meter m c = some m') :
+    let mc := commit_state_gas m'
+    (mc.stateGasCommittedSpill : Int) - (mc.stateGasBaseline : Int) =
+      (m.stateGasCommittedSpill : Int) + (m.stateGasSpilled : Int) - (m.stateGasLeft : Int) + (c : Int) ∧
+    mc.stateGasSpilled = 0 ∧
+    mc.stateGasLeft = mc.stateGasBaseline := by
+  unfold charge_state_gas_from_meter at h
+  by_cases h1 : m.stateGasLeft ≥ c
+  · simp only [h1, ↓reduceIte, Option.some.injEq] at h
+    subst h
+    dsimp only [commit_state_gas]
+    refine ⟨by omega, rfl, rfl⟩
+  · by_cases h2 : m.stateGasLeft + m.gasLeft ≥ c
+    · simp only [h1, h2, ↓reduceIte, Option.some.injEq] at h
+      subst h
+      dsimp only [commit_state_gas]
+      refine ⟨by omega, rfl, rfl⟩
+    · simp only [h1, h2, ↓reduceIte, reduceCtorEq] at h
+
+/--
+**EIP-7702 delegation set-then-clear retains committed state-gas charge (T-8037-7702-SET-CLEAR-KEEPS-CHARGE)**
+- *Natural property:* Setting an EIP-7702 delegation and then clearing it (`target = 0`) in the same transaction keeps the full committed state-gas charge, and a subsequent EVM body `REVERT` (`restore_state_gas`) does not refund it.
+- *Formal statement:* Starting at entry (`stateGasLeft = reservoir, stateGasSpilled = 0, stateGasCommittedSpill = 0`), after `apply_delegation_entry m0 target false = some m1`, `apply_delegation_entry m1 0 true = some m2`, and `restore_state_gas m2`, `tx_state_gas_used (restore_state_gas m2) reservoir = (STATE_GAS_AUTH_BASE + STATE_GAS_NEW_ACCOUNT + STATE_GAS_AUTH_BASE : Int)`.
+- *Scope note:* Confirms the second intended corner case locked during scoping (`vm/eoa_delegation.py:231-321`, `vm/gas.py:459-517`).
+-/
+theorem t_8037_7702_set_then_clear_keeps_charge
+    (m0 m1 m2 : GasMeter) (reservoir : Nat) (target : Address)
+    (h_left : m0.stateGasLeft = reservoir)
+    (h_spilled : m0.stateGasSpilled = 0)
+    (h_comm : m0.stateGasCommittedSpill = 0)
+    (h1 : apply_delegation_entry m0 target false = some m1)
+    (h2 : apply_delegation_entry m1 0 true = some m2) :
+    tx_state_gas_used (restore_state_gas m2) reservoir =
+      (STATE_GAS_AUTH_BASE + STATE_GAS_NEW_ACCOUNT + STATE_GAS_AUTH_BASE : Int) := by
+  unfold apply_delegation_entry at h1 h2
+  simp only [Bool.false_eq_true, ↓reduceIte, Nat.add_zero, Option.map_eq_some_iff] at h1 h2
+  rcases h1 with ⟨m1', hc1, rfl⟩
+  rcases h2 with ⟨m2', hc2, rfl⟩
+  have hd1 := charge_state_gas_commit_delta m0 m1' (STATE_GAS_AUTH_BASE + STATE_GAS_NEW_ACCOUNT) hc1
+  have hd2 := charge_state_gas_commit_delta (commit_state_gas m1') m2' STATE_GAS_AUTH_BASE hc2
+  dsimp only [restore_state_gas, tx_state_gas_used]
+  omega
+
+/--
+**EIP-7702 `INV-8` mined-OOG rollback leaves authorization replayable (F-8037-7702-INV8-REPLAY-AFTER-OOG)**
+- *Natural property:* When a top-level EIP-7702 transaction runs out of gas during `set_delegation`, the transaction halts (forfeiting execution gas while restoring the state-gas reservoir) and rolls back the authority's state, allowing the same signed delegation to be replayed and succeed in a later transaction with sufficient gas.
+- *Formal statement:* At `gasLeft = 10000, stateGasLeft = 0`, `top_level_delegation_v16898000 0xaa 0xbb STATE_GAS_NEW_ACCOUNT` returns `.err` with `gasLeft = 0`, whereas replaying the same `(0xaa, 0xbb, STATE_GAS_NEW_ACCOUNT)` with `gasLeft = 200000` returns `.ok` with `0xaa` and `0xbb` recorded.
+- *Scope note:* Two-transaction `INV-8` replay witness over `top_level_delegation_v16898000` (`vm/interpreter.py:133-288`).
+-/
+theorem t_8037_7702_inv8_mined_oog_replay :
+    let sLow : TopLevelDelegationState :=
+      { meter := { gasLeft := 10000, stateGasLeft := 0, stateGasBaseline := 0 }, accountReads := [] }
+    let sHigh : TopLevelDelegationState :=
+      { meter := { gasLeft := 200000, stateGasLeft := 0, stateGasBaseline := 0 }, accountReads := [] }
+    let r1 := top_level_delegation_v16898000 0xaa 0xbb STATE_GAS_NEW_ACCOUNT sLow
+    let r2 := top_level_delegation_v16898000 0xaa 0xbb STATE_GAS_NEW_ACCOUNT sHigh
+    r1.isErr = true ∧ r1.state.meter.gasLeft = 0 ∧ r1.state.meter.stateGasLeft = 0 ∧
+    r2.isErr = false ∧ r2.state.accountReads.contains 0xaa = true ∧
+      r2.state.accountReads.contains 0xbb = true := by
+  decide
+
 end Glamsterdam.Gas.Spec
