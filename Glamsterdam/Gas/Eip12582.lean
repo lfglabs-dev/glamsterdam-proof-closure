@@ -87,6 +87,12 @@ def compute_legacy_share (stateGasCharge preForkCost execGasCharge : Nat) : Nat 
 @[inline] def LEGACY_SHARE_CREATE : Nat :=
   compute_legacy_share STATE_GAS_NEW_ACCOUNT PRE_FORK_GAS_CREATE Spec.GAS_CREATE_ACCESS
 
+/--
+**Derived EIPs#12581 / #12582 legacy execution-gas shares**
+- *Natural property:* Under `CPSB = 1,530`, `STORAGE_WRITE = 10,000`, and `CREATE_ACCESS = 12,000`, `compute_legacy_share` assigns `10,000` to fresh `SSTORE`, `25,000` to `NEW_ACCOUNT`, and `20,000` to `CREATE`/`CREATE2`.
+- *Formal statement:* `LEGACY_SHARE_STORAGE_SET = 10000 ∧ LEGACY_SHARE_NEW_ACCOUNT = 25000 ∧ LEGACY_SHARE_CREATE = 20000`.
+- *Scope note:* Constant-schedule evaluation for `ethereum/EIPs#12581` and `#12582`.
+-/
 theorem t_12582_legacy_share_values :
     LEGACY_SHARE_STORAGE_SET = 10000 ∧
     LEGACY_SHARE_NEW_ACCOUNT = 25000 ∧
@@ -421,12 +427,12 @@ theorem apply_frame_ops_preserves_active_counters (ops : List FrameGasOp) :
     · rw [ha, hb] at h_step
       exact ih _ _ h_step
 
-/-- **Property 1 (`t_12582_prop1_delegatecall_frame_invariance`)**:
-Under normative `ethereum/EIPs#12582` (`.d13a_normative`), refactoring any sequence of execution
-charges, state charges (storage sets, account creations, code deposits), and state refills into a
-`DELEGATECALL` or `CALLCODE` library frame (when forwarding the parent's remaining `gasLeft` after
-`callCost` and returning `.success`) produces the **exact same** `D13AMeter` as executing those
-operations directly in the parent frame after `charge_exec_d13a parent callCost`! -/
+/--
+**DELEGATECALL and CALLCODE inline frame-invariance under EIPs#12582**
+- *Natural property:* Under normative `EIPs#12582`, running any sequence of execution charges, state charges, and state refills inside a `DELEGATECALL` or `CALLCODE` frame that forwards all remaining `gasLeft` after the call cost and succeeds leaves the exact same `D13AMeter` state as running those operations inline in the caller.
+- *Formal statement:* For `kind.inheritsCeiling = true`, `enter_child_d13a .d13a_normative kind parentAfterCost parentAfterCost.gasLeft parentAfterCost.gasLeft = some (childInit, parentWithheld)`, `apply_frame_ops childInit ops = some childDone`, and `apply_frame_ops parentAfterCost ops = some inlineDone` imply `exit_child_d13a parentWithheld childDone .success = inlineDone`.
+- *Scope note:* Arbitrary intra-frame `List FrameGasOp` sequences when `100%` of post-cost `gasLeft` is forwarded; under EIP-150 `63/64` withholding, `1/64` stays in `parentWithheld.gasLeft` until merge while `stateGasCeiling` is still inherited unchanged.
+-/
 theorem t_12582_prop1_delegatecall_frame_invariance
     (kind : CallFrameKind) (h_inh : kind.inheritsCeiling = true)
     (parentAfterCost parentWithheld childInit childDone inlineDone : D13AMeter)
@@ -518,16 +524,12 @@ def run_proxied_factory_four_max_creates (mode : AllowanceMode) : Option (D13AMe
     | some (implFinal, count) =>
       some (exit_child_d13a topWithheld implFinal .success, count)
 
-/-- **Property 1b (`t_12582_prop1b_nethermind15187_proxied_factory_divergence`)**:
-When a top-level proxy contract `DELEGATECALL`s a factory implementation (`16,500,000` forwarded gas,
-`160,000,000` reservoir) to deploy four `24,576`-byte contracts (`4 × 37,784,880 = 151,139,520`
-total state gas):
-1. Under `#12581` (`.d13r_unlimited`) and normative `#12582` (`.d13a_normative`), the `DELEGATECALL`
-   frame inherits `stateGasCeiling = none`, so all **4 out of 4** deployments succeed!
-2. Under `NethermindEth/nethermind#15187` (`.d13a_nethermind15187`), because `CreateChildFrameGas`
-   imposes `StateGasAllowance = 16,500,000 * 1530 / 200 = 126,225,000` on the `DELEGATECALL` frame,
-   only **3 out of 4** deployments succeed (`113,174,640` drawn) and the 4th deployment (`37,601,280`
-   code deposit) fails OOG because the `DELEGATECALL` ceiling caps the create frame's allowance! -/
+/--
+**Nethermind #15187 prototype divergence on DELEGATECALL proxy factories**
+- *Natural property:* A top-level proxy forwarding `16,500,000` gas via `DELEGATECALL` with a `160,000,000` reservoir deploys all `4` maximum-size (`24,576`-byte) contracts under `#12581` and normative `#12582`, whereas Nethermind `#15187` (`76ce18c734`) caps the `DELEGATECALL` allowance at `126,225,000` so the `4`th deployment fails OOG.
+- *Formal statement:* `(run_proxied_factory_four_max_creates mode).map Prod.snd` equals `some 4` for `.d13r_unlimited` and `.d13a_normative`, and `some 3` for `.d13a_nethermind15187`.
+- *Scope note:* Source-derived model comparison against `NethermindEth/nethermind#15187` (`76ce18c734`); live client test execution has not yet been re-run.
+-/
 theorem t_12582_prop1b_nethermind15187_proxied_factory_divergence :
     (run_proxied_factory_four_max_creates .d13r_unlimited).map Prod.snd = some 4 ∧
     (run_proxied_factory_four_max_creates .d13a_normative).map Prod.snd = some 4 ∧
@@ -536,10 +538,12 @@ theorem t_12582_prop1b_nethermind15187_proxied_factory_divergence :
 
 /-! ## 4. Property 2: `gas_left` Non-Increasing Within a Frame & Across Calls (No `T2` Bug) -/
 
-/-- **Property 2 (`t_12582_prop2_gas_left_non_increasing_in_frame`)**:
-Within any frame under `#12582` (`D13AMeter`), execution charges, state charges (under any ceiling),
-and state refills NEVER increase `gasLeft`; in particular, `refill_state_d13a` leaves `gasLeft`
-strictly unchanged (`(refill_state_d13a m amount).gasLeft = m.gasLeft`). -/
+/--
+**Monotone non-increasing execution gas within a frame under EIPs#12582**
+- *Natural property:* Within any `D13AMeter` frame, execution charges and state charges never increase `gasLeft`, and state-gas refills credit only `stateGasReservoir` while leaving `gasLeft` unchanged.
+- *Formal statement:* `(charge_exec_d13a m amount = some post → post.gasLeft ≤ m.gasLeft) ∧ (charge_state_with_ceiling_d13a m amount legacyShare ceilingOpt = some post → post.gasLeft ≤ m.gasLeft) ∧ (refill_state_d13a m amount).gasLeft = m.gasLeft`.
+- *Scope note:* Intra-frame `D13AMeter` operations; call-boundary monotonicity is proved in `t_12582_prop2b_child_exit_bounded_by_child_gas_left`.
+-/
 theorem t_12582_prop2_gas_left_non_increasing_in_frame
     (m post : D13AMeter) (amount legacyShare : Nat) (ceilingOpt : Option Nat) :
     (charge_exec_d13a m amount = some post → post.gasLeft ≤ m.gasLeft) ∧
@@ -563,14 +567,12 @@ theorem t_12582_prop2_gas_left_non_increasing_in_frame
       dsimp only
       omega
 
-/-- **Property 2b (`t_12582_prop2b_child_exit_bounded_by_child_gas_left`)**:
-Across any call boundary (`enter_child_d13a` followed by `exit_child_d13a` under `.success`,
-`.revert`, or `.halt`), if the child frame's `gasLeft` never rose above its initial grant `childGas`
-(`childDone.gasLeft ≤ childInit.gasLeft`) and `childGas ≤ callCost` (as holds for all call and create
-opcodes where `callCost ≥ childGas - stipend`), then:
-1. `(exit_child_d13a parentWithheld childDone status).gasLeft ≤ parentWithheld.gasLeft + childDone.gasLeft`, and
-2. When `childGas ≤ callCost`, `(exit_child_d13a parentWithheld childDone status).gasLeft ≤ parent.gasLeft`
-   (the parent's `gas_left` after the call is never larger than before the call!). -/
+/--
+**Parent execution gas never increases across child calls**
+- *Natural property:* Across any child call (`success`, `revert`, or `halt`) whose intra-frame `gasLeft` did not exceed its initial grant `childGas`, the merged parent `gasLeft` is bounded by `parentWithheld.gasLeft + childDone.gasLeft`, and whenever `childGas ≤ callCost` it never exceeds the pre-call `parent.gasLeft`.
+- *Formal statement:* Given `enter_child_d13a ... = some (childInit, parentWithheld)` and `childDone.gasLeft ≤ childInit.gasLeft`, `(exit_child_d13a ...).gasLeft ≤ parentWithheld.gasLeft + childDone.gasLeft` and `(childGas ≤ callCost → (exit_child_d13a ...).gasLeft ≤ parent.gasLeft)`.
+- *Scope note:* Call-boundary `D13AMeter` transition across all `AllowanceMode`, `CallFrameKind`, and `ChildStatus` cases (`childGas ≤ callCost` holds on all call/create opcodes, including value `CALL`s since `GAS_CALL_VALUE = 11,300 > GAS_CALL_STIPEND = 2,300`).
+-/
 theorem t_12582_prop2b_child_exit_bounded_by_child_gas_left
     (mode : AllowanceMode) (kind : CallFrameKind)
     (parent childInit parentWithheld childDone : D13AMeter)
@@ -667,13 +669,12 @@ theorem frame_ops_preserve_drawn_within_ceiling (ops : List FrameGasOp) :
       rw [hop] at h_step
       exact ih m' post (frame_op_preserves_drawn_within_ceiling m m' op h_inv hop) h_step
 
-/-- **Property 3 (`t_12582_prop3_subcall_ceiling_bounded`)**:
-When a non-inheriting subcall (`CALL`, `STATICCALL`, `CREATE`, `CREATE2`) is spawned under
-normative `#12582` (`.d13a_normative`) with forwarded gas `childGas = g` from a parent satisfying
-`DrawnWithinCeiling parent`, the child frame `childInit` has a concrete ceiling `some c` satisfying:
-1. `DrawnWithinCeiling childInit`,
-2. `c ≤ parent.stateGasDrawn + g * COST_PER_STATE_BYTE / LEGACY_GAS_PER_STATE_BYTE`, and
-3. If `parent.stateGasCeiling = some pCeil`, then `c ≤ pCeil`. -/
+/--
+**Per-frame state-gas ceiling bound on CALL, STATICCALL, CREATE, and CREATE2**
+- *Natural property:* Spawning a non-inheriting subcall (`CALL`, `STATICCALL`, `CREATE`, `CREATE2`) with forwarded execution gas `g` installs a concrete `stateGasCeiling` bounded by both `parent.stateGasDrawn + ⌊g × 1530 / 200⌋` and any active ancestor ceiling.
+- *Formal statement:* For `kind.inheritsCeiling = false` and `DrawnWithinCeiling parent`, `childInit.stateGasCeiling = some c` with `DrawnWithinCeiling childInit`, `c ≤ parent.stateGasDrawn + g * COST_PER_STATE_BYTE / LEGACY_GAS_PER_STATE_BYTE`, and `c ≤ pCeil` whenever `parent.stateGasCeiling = some pCeil`.
+- *Scope note:* Child-entry ceiling derivation under normative `#12582`; full child-execution drain bound is proved in `t_12582_prop3b_untrusted_callee_reservoir_drain_bound`.
+-/
 theorem t_12582_prop3_subcall_ceiling_bounded
     (kind : CallFrameKind) (h_sub : kind.inheritsCeiling = false)
     (parent childInit parentWithheld : D13AMeter) (callCost g : Nat)
@@ -714,15 +715,12 @@ theorem t_12582_prop3_subcall_ceiling_bounded
         ⟨Nat.le_refl _, Nat.le_min.mpr ⟨h_pceil, Nat.le_add_right pDrawn _⟩⟩,
         Nat.min_le_right _ _, Nat.min_le_left _ _⟩
 
-/-- **Property 3b (`t_12582_prop3b_untrusted_callee_reservoir_drain_bound`)**:
-For any non-inheriting subcall (`CALL`, `STATICCALL`, `CREATE`, `CREATE2`) spawned with forwarded
-gas `g` under `#12582`, after ANY sequence of state charges, SSTORE `1 -> 0` refills, and
-execution charges inside the child (`apply_frame_ops childInit ops = some childDone`) and for ANY
-termination status (`.success`, `.revert`, `.halt`), the net increase in `stateGasDrawn` in the
-parent after `exit_child_d13a` is bounded by `⌊g × COST_PER_STATE_BYTE / LEGACY_GAS_PER_STATE_BYTE⌋`
-(`⌊g × 1530 / 200⌋`):
-`postParent.stateGasDrawn - parent.stateGasDrawn ≤ g * COST_PER_STATE_BYTE / LEGACY_GAS_PER_STATE_BYTE`,
-and `DrawnWithinCeiling postParent` is preserved! -/
+/--
+**Untrusted callee reservoir drain bounded by ⌊g × 1530 / 200⌋**
+- *Natural property:* Across arbitrary state charges, `SSTORE` refills, and execution charges inside a non-inheriting subcall granted `g` execution gas—and under any exit status (`success`, `revert`, or `halt`)—the net additional reservoir draw charged to the caller is at most `⌊g × 1,530 / 200⌋`.
+- *Formal statement:* For `postParent := exit_child_d13a parentWithheld childDone status`, `parent.stateGasDrawn ≤ postParent.stateGasDrawn ∧ postParent.stateGasDrawn - parent.stateGasDrawn ≤ g * COST_PER_STATE_BYTE / LEGACY_GAS_PER_STATE_BYTE ∧ DrawnWithinCeiling postParent`.
+- *Scope note:* Arbitrary intra-child `List FrameGasOp` sequences under normative `#12582`; lifts inductively across nested subcalls because `exit_child_d13a` preserves `DrawnWithinCeiling`.
+-/
 theorem t_12582_prop3b_untrusted_callee_reservoir_drain_bound
     (kind : CallFrameKind) (h_sub : kind.inheritsCeiling = false)
     (parent childInit parentWithheld childDone : D13AMeter)
@@ -823,21 +821,12 @@ def run_sstore_set_clear_loop (m : D13AMeter) : Nat → Option D13AMeter
           let m4 := refill_state_d13a m3 STATE_GAS_STORAGE_SET
           run_sstore_set_clear_loop m4 n
 
-/-- **Property 4a (`t_12582_prop4_revert_vs_refill_drawn_asymmetry`)**:
-1. **Refills never restore allowance**: A `50,000`-gas child frame (`allowance = 382,500`) that
-   repeatedly sets and clears the same warm storage slot (`0 -> 1 -> 0`) draws `87,920` from the
-   reservoir on each of the first `4` iterations (`4 × 87,920 = 351,680 ≤ 382,500`, spending only
-   `20,200` execution gas per cycle? No: wait — with `200,000` gas, `allowance = 1,530,000`; with
-   `50,000` gas and `300,000` pre-drawn, remaining allowance is `82,500`). Specifically, when a
-   `200,000`-gas child frame has already drawn `1,450,000` of its `1,530,000` allowance (`80,000`
-   allowance remaining), `1` cycle of `SSTORE 0 -> 1 -> 0` draws `80,000` from the reservoir and
-   spills `7,920` + `10,000` legacy share from `gasLeft` (exhausting the `1,530,000` ceiling) and
-   refills `97,920` into the reservoir, leaving `remaining_allowance = some 0`; a `2`nd cycle of
-   `SSTORE 0 -> 1 -> 0` draws **`0`** from the reservoir and pays the full `97,920` state gas from
-   `gasLeft`!
-2. **Reverts DO restore allowance**: By contrast, if a child frame draws `87,920` from the
-   reservoir and then `REVERT`s, `exit_child_d13a` restores `stateGasDrawn` to `drawnSnapshot`, so
-   the parent retains 100% of its allowance! -/
+/--
+**Asymmetry between child revert and SSTORE 0 -> 1 -> 0 refill on state-gas allowance**
+- *Natural property:* Reverting a child frame restores `stateGasDrawn` to its pre-call snapshot (returning the allowance to the caller), whereas setting and clearing a slot (`0 -> 1 -> 0`) refills `stateGasReservoir` without reducing `stateGasDrawn`, so repeated set-clear cycles eventually exhaust the frame's allowance and spill into `gasLeft`.
+- *Formal statement:* On a `200,000`-gas frame with `80,000` remaining allowance (`1,450,000 / 1,530,000`), iteration 1 of `run_sstore_set_clear_loop` exhausts the allowance (`remaining_allowance = some 0`, `gasLeft = 171880`) and iteration 2 pays the full `97,920` from `gasLeft` (`gasLeft = 63760`), while a reverting child restores `stateGasDrawn = 0`.
+- *Scope note:* Concrete `D13AMeter` witness trace under normative `#12582`.
+-/
 theorem t_12582_prop4_revert_vs_refill_drawn_asymmetry :
     let top := init_top_meter 1000000 10000000
     let child200k : D13AMeter :=
@@ -863,13 +852,12 @@ theorem t_12582_prop4_revert_vs_refill_drawn_asymmetry :
     revertChild.map (fun m => m.stateGasDrawn) = some 0 := by
   decide
 
-/-- **Property 4b (`t_12582_prop4b_clean_trace_single_charge_monotone`)**:
-For any state-gas charge `(amount, legacyShare)` and any two frame meters `m1` and `m2` that have
-the same `stateGasDrawn` and `stateGasCeiling` with `m1.gasLeft ≤ m2.gasLeft` and
-`m1.stateGasReservoir ≤ m2.stateGasReservoir` (as occurs on any clean trace when `tx.gas` increases),
-if the state charge succeeds on `m1` (`charge_state_d13a m1 amount legacyShare = some post1`), then
-it also succeeds on `m2` (`∃ post2, charge_state_d13a m2 amount legacyShare = some post2`) with
-`post1.gasLeft ≤ post2.gasLeft`, and the reservoir draw on `m2` is at least as large as on `m1`! -/
+/--
+**Monotonicity of single state-gas charges under larger gas and reservoir budgets**
+- *Natural property:* Between two frames sharing the same `stateGasDrawn` and `stateGasCeiling`, increasing `gasLeft` and `stateGasReservoir` preserves success of any state-gas charge and leaves at least as much remaining `gasLeft` and cumulative reservoir draw.
+- *Formal statement:* If `m1.gasLeft ≤ m2.gasLeft`, `m1.stateGasReservoir ≤ m2.stateGasReservoir`, `m1.stateGasDrawn = m2.stateGasDrawn`, `m1.stateGasCeiling = m2.stateGasCeiling`, and `charge_state_d13a m1 amount legacyShare = some post1`, then `∃ post2, charge_state_d13a m2 amount legacyShare = some post2 ∧ post1.gasLeft ≤ post2.gasLeft ∧ post1.stateGasDrawn ≤ post2.stateGasDrawn`.
+- *Scope note:* Single-step monotonicity on `D13AMeter` when prior `stateGasDrawn` and `stateGasCeiling` match.
+-/
 theorem t_12582_prop4b_clean_trace_single_charge_monotone
     (m1 m2 post1 : D13AMeter) (amount legacyShare : Nat)
     (h_gas : m1.gasLeft ≤ m2.gasLeft)
@@ -899,49 +887,12 @@ theorem t_12582_prop4b_clean_trace_single_charge_monotone
     simp only [h_ok2, ↓reduceIte]
     refine ⟨_, rfl, by dsimp only; omega, by dsimp only; omega⟩
 
-/-- **Property 4c (`t_12582_prop4c_nethermind_15187_six_regression_cases`)**:
-Machine-checked verification of the 6 core regression scenarios from `NethermindEth/nethermind#15187`
-and the normative test table of `ethereum/EIPs#12582`:
-1. **Case 1 (`Eip8037_callee_pays_from_gas_left_when_its_ancestor_used_the_allowance`)**:
-   A `400,000`-gas frame (`allowance = 3,060,000`) deploys an `1,800`-byte contract (`163,600`
-   account-creation reservoir draw + `1,800 × 1,530 = 2,754,000` deposit draw = `2,917,600` drawn,
-   leaving `142,400` allowance), then calls a `230,000`-gas callee that writes two cold slots
-   (`2 × 87,920 = 175,840` non-legacy state gas). The callee draws `142,400` from the reservoir,
-   spills the remaining `33,440` (plus `2 × 22,100 = 44,200` execution + legacy share) from its
-   own `gasLeft` (`230,000 - 77,640 = 152,360`), and succeeds!
-2. **Case 2 (`Eip8037_large_code_deposit_fails_only_the_create_of_a_gas_limited_callee`)**:
-   A `50,000`-gas callee (`allowance = 382,500`) runs `CREATE` whose initcode returns `24,576` bytes
-   (`37,601,280` deposit). Even with a `40,000,000` reservoir, the code deposit is capped by the
-   create frame's ceiling, so only the `CREATE` fails (`ok = false`) while the caller retains its
-   reservoir and succeeds.
-3. **Case 3 (`Eip8037_callee_cannot_drain_the_reservoir_of_a_later_callee`)**:
-   With `reservoir = 87,920 + 163,600 + 1,024 × 1,530 + 10,000 = 1,828,240`, Callee 1 (`100,000` gas)
-   writes a cold slot (`87,920` drawn, leaving `1,740,320`), Callee 2 (`100,000` gas, `765,000`
-   allowance) attempts to deploy `1,024` bytes (`1,566,720` deposit):
-   - Under `#12581` (`.d13r_unlimited`), Callee 2's deployment succeeds and drains the reservoir to
-     `10,000`, causing Callee 3 (`100,000` gas, writing 1 cold slot needing `110,020` without
-     reservoir) to halt OOG (`none`)!
-   - Under `#12582` (`.d13a_normative`), Callee 2's deployment fails its code deposit, restoring
-     the reservoir to `1,740,320`, so Callee 3 succeeds (`some 77900`)!
-4. **Case 4 (`Code_deposit_above_the_create_frame_allowance_pays_the_rest_from_gas_left`)**:
-   A `50,000`-gas create frame (`allowance = 382,500`) under a `100,000`-gas parent (`allowance = 765,000`,
-   with `50,000` remaining in parent) deposits `251` bytes (`251 × 1,530 = 384,030` state gas,
-   `48` exec gas). `finish_create_code_deposit_d13a` draws `382,500` from the reservoir and pays
-   `1,530 + 48 = 1,578` from the merged `gasLeft` (`100,000 - 1,578 = 98,422`), leaving
-   `stateGasReservoir = 9,617,500` and `stateGasDrawn = 382,500`!
-5. **Case 5 (`Code_deposit_halt_returns_the_child_draws_to_the_parent_allowance`)**:
-   When a `50,000`-gas create child draws its full `382,500` allowance during initcode and then
-   fails the code deposit (e.g., `24,576` bytes), `finish_create_code_deposit_d13a` (`RevertRefundToHalt`)
-   restores `parent.stateGasDrawn = 0`, so the `100,000`-gas parent can still draw its full
-   `765,000` allowance from the reservoir!
-6. **Case 6 (`CALL` with value to a cold non-existent account charge ordering before `63/64`,
-   `EIPS/eip-8037.md:341-348`)**:
-   Starting from `gasLeft = 1,000,000`, charging `COLD_ACCOUNT_ACCESS + CALL_VALUE = 14,300` exec
-   gas and `STATE_GAS_NEW_ACCOUNT = 183,600` (`legacyShare = 25,000`) BEFORE `max_message_call_gas`:
-   - When `reservoir = 1,000,000`: charges `39,300` from `gasLeft` (`960,700` remaining), forwards
-     `max_message_call_gas 960700 = 945,690`, retains `15,010`, and draws `158,600` from reservoir.
-   - When `reservoir = 0`: charges `197,900` from `gasLeft` (`802,100` remaining), forwards
-     `max_message_call_gas 802100 = 789,568`, and retains `12,532`. -/
+/--
+**Verification of the six EIPs#12582 and Nethermind #15187 multi-frame regression vectors**
+- *Natural property:* Confirms all six reference test scenarios from `EIPs#12582` and `NethermindEth/nethermind#15187`: (1) ancestor allowance exhaustion spilling to callee `gasLeft`, (2) oversized `CREATE` code-deposit containment, (3) sibling reservoir protection under `#12582` vs. `#12581`, (4) partial code-deposit spill into `gasLeft`, (5) `RevertRefundToHalt` allowance restoration on code-deposit OOG, and (6) value-`CALL` `NEW_ACCOUNT` charge ordering before the `63/64` cap.
+- *Formal statement:* Six-conjunct kernel-checked (`by decide`) trace equality over `enter_child_d13a`, `charge_state_d13a`, `finish_create_code_deposit_d13a`, and `max_message_call_gas`.
+- *Scope note:* Concrete multi-frame `D13AMeter` regression vectors pinned to `ethereum/EIPs#12582` (`19d788c896`).
+-/
 theorem t_12582_prop4c_nethermind_15187_six_regression_cases :
     -- Case 1: Ancestor uses 2,917,600 of 3,060,000 allowance; 230,000-gas child writes 2 cold slots and succeeds
     (let top1 := init_top_meter 1000000 10000000

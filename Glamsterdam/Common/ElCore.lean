@@ -1006,6 +1006,27 @@ def incorporate_child_on_error (parent child : EvmGasFrame) : EvmGasFrame :=
     gasLeft := parent.gasLeft + child.gasLeft
     stateGasReservoir := child.stateGasReservoir }
 
+/--
+**Equivalence between `EvmGasFrame` and `GasMeter` child-frame incorporation (T-COMMON-INCORPORATE-EQUIV-METER)**
+- *Natural property:* When a parent has drained its reservoir into a child frame and neither frame carries unmerged state-gas spill, `incorporate_child_on_success` and `incorporate_child_on_error` on `EvmGasFrame` agree exactly with `incorporate_child_meter` on the full 6-field `GasMeter`.
+- *Formal statement:* For `pM` with `stateGasLeft = 0, stateGasSpilled = 0` and `cM` with `stateGasSpilled = 0`, `(incorporate_child_meter pM cM false)` matches `incorporate_child_on_success` on `(gasLeft, stateGasLeft, refundCounter)`, and when `cM.refundCounter = 0`, `(incorporate_child_meter pM cM true)` matches `incorporate_child_on_error`.
+- *Scope note:* Completes the `EvmGasFrame` → `GasMeter` refinement bridge alongside `charge_gas_equiv_meter`.
+-/
+theorem incorporate_child_equiv_meter (parent child : EvmGasFrame) :
+    let pM : GasMeter := ⟨parent.gasLeft, 0, parent.stateGasReservoir, parent.refundCounter, 0, 0⟩
+    let cM : GasMeter := ⟨child.gasLeft, child.stateGasReservoir, child.stateGasReservoir, child.refundCounter, 0, 0⟩
+    let cMErr : GasMeter := ⟨child.gasLeft, child.stateGasReservoir, child.stateGasReservoir, 0, 0, 0⟩
+    let succM := incorporate_child_meter pM cM false
+    let succF := incorporate_child_on_success { parent with stateGasReservoir := 0 } child
+    let errM := incorporate_child_meter pM cMErr true
+    let errF := incorporate_child_on_error { parent with stateGasReservoir := 0 } child
+    (succM.gasLeft, succM.stateGasLeft, succM.refundCounter) =
+      (succF.gasLeft, succF.stateGasReservoir, (succF.refundCounter : Int)) ∧
+    (errM.gasLeft, errM.stateGasLeft, errM.refundCounter) =
+      (errF.gasLeft, errF.stateGasReservoir, (errF.refundCounter : Int)) := by
+  simp [incorporate_child_meter, repay_state_gas_spill,
+    incorporate_child_on_success, incorporate_child_on_error, Int.natCast_add]
+
 @[inline, export glamsterdam_charge_gas_ok_cabi]
 def charge_gas_ok_cabi (gasLeft reservoir regularGas stateGas : UInt64) : Bool :=
   (charge_gas ⟨gasLeft.toNat, reservoir.toNat, 0⟩ regularGas.toNat stateGas.toNat).isSome
